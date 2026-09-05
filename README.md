@@ -123,8 +123,8 @@ to CPU — so long-running servers stay flat.
 - The assistant's audio and the mic must share the browser's audio context
   (they do). **Headphones or a lower speaker volume** help Chrome's AEC lock.
 - First mic use initializes the ASR backend (one-time load + model download;
-  ~460 MB for `small`). **Keep `ASR_MODEL=small` and `ASR_LANG=hi`** — `small`
-  is the smallest size that transcribes Hindi correctly (`base`/`tiny` mangle
+  ~460 MB for `small`). **Keep `ASR_MODEL=large-v3-turbo` and `ASR_LANG=hi`** — turbo is the
+  accuracy/speed sweet spot for Hindi/Hinglish (`small`/`base`/`tiny` mangle
   it), and forcing `hi` is both faster and accurate for Hindi/Hinglish.
 - **Switchable backend (`ASR_BACKEND`)** — `auto` (default) uses **mlx-whisper
   on Apple Silicon** (Neural Engine, ~10x faster than CPU Whisper on an M4;
@@ -141,7 +141,7 @@ to CPU — so long-running servers stay flat.
 ```ini
 # .env — voice input
 ASR_BACKEND=auto      # auto | mlx (Apple Silicon only) | faster-whisper
-ASR_MODEL=small       # tiny | base | small (default) | medium
+ASR_MODEL=large-v3-turbo  # best Hindi/Hinglish accuracy you can run realtime; or small for a smaller download
 ASR_LANG=hi           # hi = Hindi/Hinglish (fast, accurate); empty = auto-detect any language
 ASR_DEVICE=           # auto: cuda on NVIDIA, cpu elsewhere (fw backend)
 ASR_COMPUTE=          # auto: float16 (CUDA) / int8 (CPU) (fw backend)
@@ -149,6 +149,7 @@ ASR_FINAL_BEAM=5      # fw only: beam width for the final transcript
 VOICE_ASR_PARTIAL_NEW_SECONDS=0.45   # live-caption cadence
 VOICE_ASR_PARTIAL_GAP_SECONDS=0.9
 VOICE_ASR_SPECULATIVE=1              # 1 = fast greedy transcript fires the reply before the beam final (lower latency)
+VOICE_MIN_WINDOW_CHARS=24            # min chars a non-final TTS window must have (stops tiny 2-3 word chunks)
 VOICE_SPECULATIVE_MS=5000            # how long the client waits for the final before releasing the mic anyway
 VOICE_AUTO_SEND_MS=280               # end-of-speech silence tail before the utterance is sent (lower = snappier turns)
 ```

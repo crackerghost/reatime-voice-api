@@ -134,6 +134,30 @@ export default function App() {
   const playBlob = useCallback(async (blob) => {
     const ctx = engine.unlock();
     const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+    let src;
+    try {
+      src = ctx.createBufferSource();
+      src.buffer = buf;
+      engine.connectSpeak(src);
+      if (typeof src.start === "function") src.start(); // legacy WebKit fallback
+      else src.noteOn(0);
+      currentSourceRef.current = src;
+      return new Promise((resolve) => {
+        src.onended = () => {
+          currentSourceRef.current = null;
+          try { src.disconnect(); } catch { /* noop */ } // free the audio graph — every frame adds nodes
+          resolve();
+        };
+      });
+    } catch {
+      try { src && src.disconnect(); } catch { /* noop */ }
+      throw new Error("audio play failure");
+    }
+  }, []);
+
+  /* ---- play an already-decoded buffer (drain prefetches decodes) ---- */
+  const playBuf = useCallback((buf) => {
+    const ctx = engine.unlock();
     return new Promise((resolve) => {
       const src = ctx.createBufferSource();
       src.buffer = buf;
@@ -141,7 +165,7 @@ export default function App() {
       currentSourceRef.current = src;
       src.onended = () => {
         currentSourceRef.current = null;
-        try { src.disconnect(); } catch { /* noop */ } // free the audio graph — every frame adds nodes
+        try { src.disconnect(); } catch { /* noop */ } // free the audio graph
         resolve();
       };
       src.start();
@@ -149,21 +173,35 @@ export default function App() {
   }, []);
 
   const drain = useCallback(async () => {
+    const ctx = engine.unlock();
+    let nxt = null; // AudioBuffer prefetched for the next frame (decoded while current plays)
     while (pendingRef.current.length > 0) {
       if (dropRef.current) {
         pendingRef.current.length = 0;
         return;
       }
       const blob = pendingRef.current.shift();
-      try {
-        await playBlob(blob);
-      } catch {
-        /* ignore one bad frame */
+      // decode the NEXT queued frame in parallel with playing this one, so
+      // the handoff is gapless instead of "play -> stop -> decode -> play"
+      const pre = (pendingRef.current.length > 0)
+        ? ctx.decodeAudioData(await pendingRef.current[0].arrayBuffer()).catch(() => null)
+        : Promise.resolve(null);
+      let buf = nxt;
+      nxt = null;
+      if (!buf) {
+        try {
+          buf = await ctx.decodeAudioData(await blob.arrayBuffer());
+        } catch {
+          await pre.catch(() => null); // drop the bad frame, keep the prefetch warm
+          continue;
+        }
       }
+      await playBuf(buf);
+      nxt = await pre; // cache for the next iteration
     }
     speakingRef.current = false;
     setSpeaking(false);
-  }, [playBlob]);
+  }, [playBuf]);
 
   /* ---- hard stop: instant audio cut + server cancel (barge-in) ---- */
   const hardStop = useCallback(() => {
@@ -222,18 +260,61 @@ export default function App() {
     toggleMic: () => micToggleRef.current && micToggleRef.current(),
   };
 
+  /* ---------- ASR readiness: server preloads Whisper at boot ---------- */
+  const [asrReady, setAsrReady] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    let t = 0;
+    const check = () => {
+      fetch(CONFIG_URL)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((c) => {
+          if (alive && c && c.asr_ready) {
+            setAsrReady(true);
+            clearInterval(t);
+          }
+        })
+        .catch(() => {});
+    };
+    check();
+    t = setInterval(check, 3000); // re-poll until the warmup finishes
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
   /* ---------- WebSocket ---------- */
   useEffect(() => {
     let closed = false;
+    let ttsAttempts = 0;
+    let ttsHb = 0;
+    let ttsLastPong = 0;
     const connect = () => {
       const ws = new WebSocket(WS_URL);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        ttsAttempts = 0;
+        ttsLastPong = Date.now();
+        setConnected(true);
+        // heartbeat: detect a dead connection in ~15s instead of uvicorn's 40s
+        ttsHb = setInterval(() => {
+          try {
+            ws.send(JSON.stringify({ type: "ping" }));
+          } catch { /* closed — onclose handles it */ }
+          if (Date.now() - ttsLastPong > 15000) {
+            try { ws.close(); } catch { /* noop */ } // force reconnect
+          }
+        }, 5000);
+      };
       ws.onerror = () => setConnected(false);
       ws.onclose = () => {
         setConnected(false);
-        if (!closed) setTimeout(connect, CFG.wsReconnectMs);
+        if (ttsHb) { clearInterval(ttsHb); ttsHb = 0; }
+        if (!closed) {
+          ttsAttempts += 1;
+          // exponential backoff, capped: 1.5s -> 3s -> 6s -> 12s -> 15s
+          const delay = Math.min(CFG.wsReconnectMs * 2 ** Math.min(ttsAttempts - 1, 3), 15000);
+          setTimeout(connect, delay);
+        }
       };
       ws.onmessage = (ev) => {
         const api = apiRef.current;
@@ -242,6 +323,10 @@ export default function App() {
           try {
             m = JSON.parse(ev.data);
           } catch {
+            return;
+          }
+          if (m.type === "pong") { // heartbeat reply
+            ttsLastPong = Date.now();
             return;
           }
           if (m.type === "start") {
@@ -338,11 +423,36 @@ export default function App() {
     let pcmTimer = 0;
     let closingAsr = false;
     let asrClosedCount = 0;
+    let asrAttempts = 0;
+    let asrHb = 0;
+    let asrLastPong = 0;
     let asrWarned = false;
     let pcmBuf = []; // Float32Array pieces waiting to be flushed to /ws/asr
     let pcmLen = 0;
     let lastPartial = ""; // most recent live caption (fallback if final is empty)
     let specSentFor = ""; // text already submitted speculatively (guards double-send)
+    // Pre-roll ring buffer: ALWAYS keep the last ~350 ms of non-echo mic PCM.
+    // When the VAD opens an utterance (~250 ms sustain delay) we replay this
+    // first, so the first 2-3 words are never eaten by the open latency.
+    const PRE_ROLL_LEN = Math.floor(16000 * 0.35); // 350 ms @ 16 kHz
+    let preRoll = new Float32Array(PRE_ROLL_LEN);
+    let preRollPos = 0;
+    let preRollLen = 0;
+    const preRollPush = (arr) => {
+      for (let i = 0; i < arr.length; i++) {
+        preRoll[preRollPos] = arr[i];
+        preRollPos = (preRollPos + 1) % PRE_ROLL_LEN;
+        if (preRollLen < PRE_ROLL_LEN) preRollLen += 1;
+      }
+    };
+    const preRollRead = () => {
+      if (!preRollLen) return null;
+      const out = new Float32Array(preRollLen);
+      const start = preRollLen === PRE_ROLL_LEN ? preRollPos : 0;
+      for (let i = 0; i < preRollLen; i++) out[i] = preRoll[(start + i) % PRE_ROLL_LEN];
+      return out;
+    };
+    const preRollClear = () => { preRollLen = 0; };
 
     const asrSendJson = (obj) => {
       const ws = asrWsRef.current;
@@ -371,6 +481,17 @@ export default function App() {
       ws.onopen = () => {
         asrOpenRef.current = true;
         asrClosedCount = 0;
+        asrAttempts = 0;
+        asrLastPong = Date.now();
+        // heartbeat: detect a dead ASR socket in ~15s
+        asrHb = setInterval(() => {
+          try {
+            ws.send(JSON.stringify({ type: "ping" }));
+          } catch { /* closed — onclose handles it */ }
+          if (Date.now() - asrLastPong > 15000) {
+            try { ws.close(); } catch { /* noop */ }
+          }
+        }, 5000);
       };
       ws.onclose = () => {
         asrOpenRef.current = false;
@@ -378,15 +499,19 @@ export default function App() {
         streamingRef.current = false;
         pcmBuf = [];
         pcmLen = 0;
+        if (asrHb) { clearInterval(asrHb); asrHb = 0; }
         if (listeningRef.current && !closingAsr) {
           asrClosedCount += 1;
+          asrAttempts += 1;
           // The /ws/asr endpoint only exists on a server running the current
           // code — tell the user to restart it instead of failing silently.
           if (asrClosedCount >= 4 && !asrWarned) {
             asrWarned = true;
             showError("वॉयस इंजन (Whisper) से कनेक्ट नहीं हो पा रहा — कृपया सर्वर रीस्टार्ट करें (python voice_api.py)।");
           }
-          setTimeout(connectAsr, CFG.wsReconnectMs);
+          // exponential backoff, capped: 1.5s -> 3s -> 6s -> 12s -> 15s
+          const delay = Math.min(CFG.wsReconnectMs * 2 ** Math.min(asrAttempts - 1, 3), 15000);
+          setTimeout(connectAsr, delay);
         }
       };
       ws.onmessage = (ev) => {
@@ -397,6 +522,10 @@ export default function App() {
           return;
         }
         const v = vadRef.current;
+        if (m.type === "pong") { // heartbeat reply
+          asrLastPong = Date.now();
+          return;
+        }
         if (m.type === "partial") {
           // live caption from Whisper; also confirms real speech for barge-in
           const t = (m.text || "").trim();
@@ -466,9 +595,20 @@ export default function App() {
        ringing out) the frames are dropped — belt-and-suspenders over Chrome's
        AEC so the assistant's own voice can never reach the transcriber. */
     const onFrame = (arr) => {
-      if (!streamingRef.current) return;
       const v = vadRef.current;
-      if (speakingRef.current || performance.now() - v.lastSpeakAt <= CFG.speakTailMs) return;
+      const now = performance.now();
+      // Echo guard: drop mic frames while OUR audio is playing. In the
+      // silence tail after it, only drop while no user utterance is open —
+      // once the utterance IS open the user is definitely talking, and
+      // cutting the tail there would swallow their first words.
+      const echo = speakingRef.current ||
+        (!streamingRef.current && now - v.lastSpeakAt <= CFG.speakTailMs);
+      if (echo) {
+        preRollClear(); // never replay our own voice as ASR input
+        return;
+      }
+      preRollPush(arr); // always keep the rolling pre-roll (first words)
+      if (!streamingRef.current) return;
       pcmBuf.push(arr);
       pcmLen += arr.length;
     };
@@ -524,6 +664,14 @@ export default function App() {
         v.voiceSilentSince = 0;
         specSentFor = ""; // new utterance: drop any stale speculative-turn guard
         asrSendJson({ type: "start" });
+        // Replay the pre-roll right after "start" so the ~250 ms the VAD
+        // needed to open the utterance is NOT lost from the transcript.
+        const pr = preRollRead();
+        if (pr) {
+          pcmBuf.unshift(pr);
+          pcmLen += pr.length;
+        }
+        preRollClear();
       }
 
       // ---- BARGE-IN (real sustained speech cuts the assistant) --------
@@ -596,6 +744,7 @@ export default function App() {
       asrBusyRef.current = false;
       asrWarned = false;
       lastPartial = "";
+      preRollClear(); // fresh pre-roll per listening session — no stale audio
       setInterim("");
       listeningRef.current = true;
       setListening(true);
@@ -675,7 +824,7 @@ export default function App() {
             }`}
           >
             <span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-emerald-500" : "bg-rose-500"}`} />
-            {connected ? (listening ? "सुन रहा हूँ" : "तैयार") : "जुड़ रहा हूँ…"}
+            {connected ? (listening ? (asrReady ? "सुन रहा हूँ" : "वॉर्म-अप…") : "तैयार") : "जुड़ रहा हूँ…"}
           </span>
         </header>
 

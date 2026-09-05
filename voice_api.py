@@ -225,6 +225,10 @@ LLM_SYSTEM_PROMPT = (
     "कोई चिह्न या फ़ॉर्मेटिंग मत लिखो — न तारांकन (*), न रेखा (---), न क्रमांक "
     "(1., २.), न मोटा अक्षर (**), न बुलेट (-), न इमोजी — पूरी तरह साधारण बोलचाल "
     "के वाक्यों में लिखो, जैसे कोई सुनकर समझे। "
+    "आखिरी नियम — आवाज़ के लिए: हर वाक्य कम से कम ६-८ शब्दों का लिखो; "
+    "बहुत छोटे २-३ शब्दों के वाक्य मत लिखो, वरना आवाज़ कट-कट जाती है। "
+    "हर वाक्य को नई लाइन से शुरू करो (एक लाइन में एक पूरा वाक्य) ताकि बोलते "
+    "वक्त सही जगह रुके और फिर से सहज शुरू हो। "
 )
 # Optional override: point VOICE_PROMPT_FILE at a text file whose contents
 # replace the whole system prompt above (tune the persona without editing code).
@@ -510,21 +514,28 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             out_q.put(("text", sent))  # text streams live, never behind TTS
             # Bound window sizes with clause pieces so one long run-on sentence
             # never delays the first frame (units get re-joined inside a window).
+            # Whole sentences feed the audio windows — the LLM decides where
+            # a sentence ends and we never cut mid-thought. Windows ship on
+            # CHARACTER thresholds, never on piece-counts, so short sentences
+            # group into one continuous utterance instead of tiny 2-3 word
+            # chunks that keep interrupting the flow.
             for piece in _clause_units(sent):
                 if window and window_chars + len(piece) > WINDOW_CHAR_CAP:
-                    # this piece would overflow -> ship what we have first
+                    # would overflow -> ship what we have first
                     steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
                     win_q.put({"text": " ".join(window), "steps": steps})
                     window, window_chars = [], 0
                     emitted_audio = True
                 window.append(piece)
                 window_chars += len(piece)
-                # First window stays small for a fast first frame; later
-                # windows group STREAM_WINDOW pieces into one flowing utterance.
                 if not emitted_audio:
-                    ready = window_chars >= FIRST_WINDOW_CHARS or len(window) >= 2
+                    # first window: wait until it's a real sentence big enough
+                    # to speak (fast start, but never a fragment)
+                    ready = window_chars >= FIRST_WINDOW_CHARS
                 else:
-                    ready = len(window) >= STREAM_WINDOW or window_chars >= WINDOW_CHAR_CAP
+                    # later windows: group until there's enough text for a
+                    # smooth frame (~2-4 short sentences), never a scrap
+                    ready = window_chars >= MIN_WINDOW_CHARS * 2
                 if ready:
                     steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
                     win_q.put({"text": " ".join(window), "steps": steps})
@@ -597,6 +608,10 @@ async def lifespan(_app: FastAPI):
     _app.state.voice_prompt = voice_prompt
     _app.state.gen_lock = asyncio.Lock()  # serialize heavy generation across clients
 
+    # Preload the ASR model in the background so the first utterance isn't
+    # delayed by the model download/load (up to minutes on slow links).
+    threading.Thread(target=_warmup_asr, daemon=True).start()
+
     yield
 
 
@@ -635,10 +650,12 @@ def api_config():
         "asr_final_beam": ASR_FINAL_BEAM,
         "asr_speculative": ASR_SPECULATIVE,
         "speculative_ms": ASR_SPECULATIVE_MS,
+        "asr_ready": _asr_ready,  # True once the warmup finished loading Whisper
         # chat reply shaping
         "first_step": FIRST_WINDOW_STEP,
         "stream_window": STREAM_WINDOW,
         "window_chars": WINDOW_CHAR_CAP,
+        "min_window_chars": MIN_WINDOW_CHARS,
         "max_sentences": MAX_CHAT_SENTENCES,
         "greeting_max": GREETING_MAX,
         # LLM
@@ -741,6 +758,10 @@ STREAM_WINDOW = max(1, int(os.environ.get("VOICE_STREAM_WINDOW", "2")))
 # Max text chars per audio window and per clause piece — keeps every frame to
 # ~4-5s of speech so a reply starts fast and an interrupt tail stays tiny.
 WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "90"))
+# Never ship a TTS audio window smaller than this (except the final tail).
+# Stops the LLM's short sentences from becoming tiny 2-3 word audio chunks
+# that keep breaking the flow — windows only go out once they're worth speaking.
+MIN_WINDOW_CHARS = int(os.environ.get("VOICE_MIN_WINDOW_CHARS", "24"))
 _PIECE_MAX = max(40, min(120, WINDOW_CHAR_CAP))  # single unit fed to TTS
 # Hard ceiling on sentences per chat reply (the LLM is told 3-4 but can ramble;
 # this bounds worst-case latency so a turn never turns into a monologue).
@@ -911,6 +932,12 @@ async def ws_tts(websocket: WebSocket):
                 except (ValueError, AttributeError):
                     data = None
                 mtype = data.get("type") if isinstance(data, dict) else None
+                if mtype == "ping":  # client heartbeat — reply to keep it alive
+                    try:
+                        await websocket.send_text(json.dumps({"type": "pong"}))
+                    except Exception:
+                        pass
+                    continue
                 if mtype == "stop":
                     stop_evt.set()  # explicit user interrupt
                     continue
@@ -1145,6 +1172,7 @@ def _pick_asr_backend() -> str:
 
 _asr_backend = None   # one loaded backend object, reused for every call
 _asr_lock = threading.Lock()  # one Whisper call at a time (single device)
+_asr_ready = False    # True once the ASR backend finished its warmup load
 
 
 class _MlxAsr:
@@ -1210,7 +1238,20 @@ def _get_asr():
         chosen = _pick_asr_backend()
         log.info("Loading ASR backend '%s' (model '%s')...", chosen, ASR_MODEL)
         _asr_backend = _MlxAsr() if chosen == "mlx" else _FasterWhisperAsr()
+        global _asr_ready
+        _asr_ready = True
+        log.info("ASR backend '%s' ready (model '%s').", chosen, ASR_MODEL)
     return _asr_backend
+
+
+def _warmup_asr():
+    """Background warmup: preload the ASR model at startup so the FIRST
+    utterance isn't delayed by the model download/load. Never crashes boot."""
+    try:
+        _get_asr()
+        log.info("ASR warmup complete.")
+    except Exception as e:  # noqa: BLE001 — warmup must never kill the server
+        log.error("ASR warmup failed (will retry lazily on first use): %s", e)
 
 
 def _collapse_repeats(text: str) -> str:
@@ -1308,6 +1349,12 @@ async def ws_asr(websocket: WebSocket):
                     except (ValueError, AttributeError):
                         msg = None
                     mtype = msg.get("type") if isinstance(msg, dict) else None
+                    if mtype == "ping":  # client heartbeat — reply to keep the socket alive
+                        try:
+                            await websocket.send_text(json.dumps({"type": "pong"}))
+                        except Exception:
+                            pass
+                        continue
                     ctrl_q.put(mtype or "__close__" if mtype in ("start", "end", "cancel") else "__noop__")
         except Exception:
             ctrl_q.put("__close__")
