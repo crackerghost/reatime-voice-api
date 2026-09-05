@@ -1,0 +1,1255 @@
+"""Realtime Hindi TTS API in Rahul's voice (OmniVoice).
+
+Loads the k2-fsa/OmniVoice checkpoint once at startup, encodes my_voice.wav
+into a cached voice-clone prompt, then answers every request by voice cloning
+through that prompt — the same flow as the official Kaggle realtime demo
+(OmniVoice.from_pretrained -> create_voice_clone_prompt -> generate).
+
+Run:
+    cd Voice_Cloning && ./omnivoice-env/bin/python voice_api.py
+
+Example:
+    curl -X POST http://127.0.0.1:8000/tts \\
+         -H "Content-Type: application/json" \\
+         -d '{"text": "आपका दिन शुभ हो।"}' -o speech.wav
+"""
+
+import asyncio
+import io
+import json
+import logging
+import os
+import queue
+import re
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+# huggingface_hub's hf_xet chunked CDN stalls on this network (and cdn-lfs DNS
+# is blocked), so force the classic HTTP download path for model weights.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+import httpx
+import numpy as np
+import soundfile as sf
+import torch
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
+from omnivoice import OmniVoice
+from pydantic import BaseModel, Field, model_validator
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("voice_api")
+
+HERE = Path(__file__).resolve().parent
+
+
+def _load_dotenv(path: Path) -> None:
+    """Minimal .env loader (no dependency): KEY=VALUE lines, comments ignored.
+
+    Trailing inline comments are stripped ("K=V  # note" -> "V"), and quoted
+    values keep their content until the closing quote.
+    """
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        raw = value.strip()
+        if raw[:1] in ('"', "'"):
+            q = raw[0]
+            end = raw.find(q, 1)
+            value = raw if end < 0 else raw[: end + 1]
+        else:
+            value = raw.split("#", 1)[0]
+        value = value.strip().strip('"').strip("'")
+        if key and value:  # blank values are treated as unset -> code defaults apply
+            os.environ.setdefault(key, value)
+
+
+# Everything below is overridable via env vars (or a .env file next to this
+# script) — see .env.example for the full documented list.
+_load_dotenv(HERE / ".env")
+
+# ---------- Fixed voice: reference clip + its exact transcript ----------
+REF_AUDIO = Path(os.environ.get("VOICE_REF_AUDIO", HERE / "my_voice.wav")).expanduser()
+if not REF_AUDIO.is_absolute():
+    REF_AUDIO = HERE / REF_AUDIO
+REF_TEXT = os.environ.get(
+    "VOICE_REF_TEXT",
+    "मेरा नाम राहुल है और मैं आज एक नया एआई प्रोजेक्ट टेस्ट कर रहा हूँ।।",
+)
+
+# ---------- Model: OmniVoice (k2-fsa/OmniVoice), 24 kHz output ----------
+OMNIVOICE_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
+SAMPLE_RATE = int(os.environ.get("VOICE_SAMPLE_RATE", "24000"))  # OmniVoice always outputs 24 kHz
+NUM_STEP = int(os.environ.get("VOICE_NUM_STEP", "16"))           # diffusion steps; lower = faster
+TEMPERATURE = float(os.environ.get("VOICE_TEMPERATURE", "0.3"))  # Kaggle demo default
+DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.0"))      # rate when a request omits speed
+# Allowed diffusion-step range and the first-window / greeting caps below are
+# all env-tunable (used by /tts, the WebSocket, and TTSRequest validation).
+STEP_MIN = int(os.environ.get("VOICE_STEP_MIN", "4"))
+STEP_MAX = int(os.environ.get("VOICE_STEP_MAX", "64"))
+GREETING_MAX = int(os.environ.get("VOICE_GREETING_MAX", "2"))  # sentences for small-talk replies
+FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "55"))  # chars in 1st audio window
+
+# MPS (Apple Silicon) / CUDA run best in fp16; CPU falls back to fp32.
+# Override with VOICE_API_DEVICE=cpu|mps|cuda and VOICE_API_DTYPE=fp16|fp32.
+DEVICE = (
+    os.environ.get("VOICE_API_DEVICE", "").strip().lower()
+    or ("mps" if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available()
+        else "cpu")
+)
+# IMPORTANT: torch 2.14 segfaults in its MPS fp16 copy/cast kernel while
+# loading weights on Apple Silicon ("Python quit unexpectedly"). fp32 is the
+# safe MPS/CPU default; fp16 stays the CUDA default. Override at your own risk
+# with VOICE_API_DTYPE=fp16.
+DTYPE_ENV = os.environ.get("VOICE_API_DTYPE", "").strip().lower()
+DTYPE = (
+    torch.float16 if DTYPE_ENV in ("fp16", "float16")
+    else torch.float32 if DTYPE_ENV in ("fp32", "float32")
+    else torch.float16 if DEVICE.startswith("cuda")
+    else torch.float32
+)
+
+# Reject ASCII letters: this model speaks Devanagari only
+# Greeting/small-talk inputs -> server enforces a short natural reply
+GREETING_RE = re.compile(
+    r"^(नमस्ते|हेलो|हाय|हैलो|नमस्कार|कैसे\s+हो|क्या\s+हाल|क्या\s+चल|हाय\s+|तुम\s+कौन|तुम्हारा\s+नाम|तुम्हारे\s+बारे|क्या\s+कर\s+सकते|क्या\s+कर\s+सकता|क्या\s+कर\s+सकती|hello|hi|hey|good\s+(morning|afternoon|evening|night)|how\s+are\s+you|who\s+are\s+you|what\s+can\s+you\s+do)",
+    re.IGNORECASE,
+)
+
+# Sentence enders used to cut the STREAMED LLM reply into clean TTS chunks
+# (the LLM decides where sentences break, instead of byte-splitting after the
+# fact). The reply is never fully generated before audio starts.
+SENT_END_RE = re.compile(r"[।?!.\n]")
+
+
+def _short_greeting(reply: str, max_sentences: int | None = None) -> str:
+    """Cut a greeting reply to the first few sentences (no rambling)."""
+    limit = max_sentences if max_sentences is not None else GREETING_MAX
+    if limit <= 1:
+        return reply
+    stops = ["?", "!", "।", "."]
+    positions = sorted(p for s in stops if s in reply for p in [reply.find(s)] if p >= 0)
+    if not positions:
+        return reply
+    last = positions[min(limit - 1, len(positions) - 1)]
+    return reply[: last + 1].strip()
+
+
+# ------- expressive pacing (OmniVoice v1 has no real emotion control, so the
+# delivery "life" comes from text energy + per-sentence speed variation) -------
+_EXCITED_RE = re.compile(r"[!]{1,}|(?:वाह|अरे|ओहो|कमाल|हा\s*हा)")
+_DRAMATIC_RE = re.compile(r"\.\.\.|…")
+# Multipliers applied when a sentence is excited / dramatic / long, plus the
+# length threshold and the clamp range. All env-tunable.
+SPEED_EXCITED = float(os.environ.get("VOICE_EXCITED_SPEED", "1.12"))
+SPEED_DRAMATIC = float(os.environ.get("VOICE_DRAMATIC_SPEED", "0.92"))
+SPEED_LONG = float(os.environ.get("VOICE_LONG_SPEED", "0.96"))
+SPEED_LONG_CHARS = int(os.environ.get("VOICE_LONG_CHARS", "110"))
+SPEED_MIN = float(os.environ.get("VOICE_SPEED_MIN", "0.3"))
+SPEED_MAX = float(os.environ.get("VOICE_SPEED_MAX", "2.0"))
+
+
+def _pick_speed(sent: str, base: float = 1.0) -> float:
+    """Per-sentence pace: excited lines speed up, thoughtful lines slow down.
+
+    Combined with the LLM's punctuation/expression cues ('!', '...', 'वाह!')
+    this makes replies sound less flat — OmniVoice v1 clones one prosody from
+    the reference clip, so energy must come from text + pacing.
+    """
+    s = float(base)
+    if _EXCITED_RE.search(sent):
+        s *= SPEED_EXCITED
+    if _DRAMATIC_RE.search(sent):
+        s *= SPEED_DRAMATIC
+    if len(sent) > SPEED_LONG_CHARS:
+        s *= SPEED_LONG  # long sentences a touch slower for clarity
+    return max(SPEED_MIN, min(SPEED_MAX, round(s, 3)))
+
+
+# ---------- LLM: Mistral ministral-8b-latest ----------
+LLM_MODEL = os.environ.get("LLM_MODEL", "ministral-8b-latest")
+LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "450"))
+MISTRAL_URL = os.environ.get("MISTRAL_URL", "https://api.mistral.ai/v1/chat/completions")
+LLM_STREAM_TIMEOUT = float(os.environ.get("VOICE_LLM_TIMEOUT", "120.0"))  # httpx stream read timeout (s)
+
+LLM_SYSTEM_PROMPT = (
+    "तुम एक मस्त और चिल हिंदी टीचर हो जो हर चीज़ एकदम सिंपल तरीके से और "
+    "एग्ज़ाम्पल देकर समझाता है — जैसे कोई जेन-ज़ी दोस्त बात कर रहा हो। "
+    "सबसे ज़रूरी नियम: शुद्ध / फॉर्मल संस्कृतनिष्ठ हिंदी कभी मत लिखो। "
+    "जवाब हमेशा पूरी तरह देवनागरी लिपि में लिखो — एक भी अंग्रेज़ी अक्षर "
+    "(a-z, A-Z) मत लिखो। अंग्रेज़ी शब्दों को भी देवनागरी में लिखो, जैसे: एआई, "
+    "ऐप, गेम, कूल, बेसिकली, लाइक, सिंपल, फन, डेटा, क्लिक, कोड, वेबसाइट, बटन, "
+    "मैसेज, टेंशन, सीन, चिल, स्मार्ट, थिंक, लर्न। "
+    "जेन-ज़ी जैसे कैज़ुअल शब्द इस्तेमाल करो (सब देवनागरी में): मतलब, यार, भाई, "
+    "बस, एकदम, वैसे, ऐसे, वाला, ना, क्या सीन है, चिल, टेंशन मत लो, ईज़ी है, "
+    "सिंपल है, फन है, बेस्ट है। "
+    "एग्ज़ाम्पल — सुध है ❌: 'कंप्यूटर को मानव की तरह सोचने और काम करने की क्षमता देना।' "
+    "एग्ज़ाम्पल — जेन-ज़ी है ✅: 'एआई का मतलब है कंप्यूटर को इतना स्मार्ट बनाना "
+    "कि वो खुद सोच सके — बेसिकली एक सुपर-स्मार्ट दोस्त जैसा।' "
+    "ऐसे ही बात करो: छोटे वाक्य, आसान शब्द, जैसे व्हाट्सऐप पर दोस्त को लिखते हो। "
+    "कठिन या औपचारिक शब्द मत लिखो — 'क्षमता' नहीं, 'पावर या कैपेबिलिटी'; "
+    "'आवश्यकता' नहीं, 'ज़रूरत'; 'उदाहरण' की जगह 'एग्ज़ाम्पल'; 'जानकारी' की जगह "
+    "'इंफो या जानकारी'। "
+    "जरूरी नियम (सबसे पहले याद रखो): अगर उपयोगकर्ता सिर्फ अभिवादन या हालचाल पूछ "
+    "रहा है (जैसे 'नमस्ते', 'हेलो', 'हाय', 'कैसे हो', 'क्या चल रहा है', 'क्या हाल', "
+    "'hello', 'hi', 'how are you'), तो सिर्फ १-२ वाक्य का सीधा, स्वाभाविक जवाब दो "
+    "जैसे 'मैं बहुत अच्छा हूँ यार, तुम कैसे हो?' — कोई एग्ज़ाम्पल मत दो, कोई सवाल "
+    "मत जोड़ो, बहुत ज़्यादा मत बोलो। एग्ज़ाम्पल सिर्फ तब दो जब कोई चीज़ या विषय "
+    "समझाना हो, और सवाल सिर्फ तब पूछो जब उपयोगकर्ता कुछ सीख रहा हो। "
+    "जवाब की शैली: पहले एक लाइन में सीधा जवाब, फिर सिर्फ एक आसान रोज़मर्रा "
+    "एग्ज़ाम्पल जैसे 'जैसे-...', और अंत में पूछो कि 'क्या और समझना चाहते हो?' "
+    "हाँ/नहीं वाले या छोटे सवालों (जैसे 'मज़ा आता है क्या?', 'तुम कौन हो?') का जवाब "
+    "सिर्फ १-२ वाक्य में दो — लंबा लेक्चर मत दो। लंबा समझाना सिर्फ तब जब वो सिखाने के "
+    "लिए पूछे (जैसे 'समझाओ', 'क्या है', 'कैसे', 'सिखाओ') — तब भी सिर्फ ३-४ छोटे वाक्य। "
+    "कभी कोष्ठक ( ) या डैश (— या -) मत लिखो, और एक वाक्य में एक ही विराम चिह्न हो — "
+    "'!!' या '?!' जैसा दोहरा विराम मत लिखो। "
+    "आवाज़ में जान लाने के लिए जहाँ सही लगे वहाँ '!' या '...' या '?' इस्तेमाल करो। "
+    "खुशी, उत्साह या हैरानी दिखानी हो तो बोलचाल वाले एक्सप्रेशन जोड़ सकते हो — "
+    "जैसे 'अरे वाह!', 'वाह!', 'ओहो!', 'हा हा', 'सच में?', 'कमाल है!', 'ज़रूर!' — "
+    "लेकिन ज़्यादा मत करो: हर जवाब में ज़्यादा से ज़्यादा १-२ ही जगह, वहीं जहाँ "
+    "सच में फिट बैठे। कुछ गंभीरता या सोच-समझकर बताना हो तो 'देख यार...', 'सुन...' "
+    "जैसी शुरुआत कर सकते हो। ऐसा नहीं कि हर वाक्य एक्साइटेड लगे — बीच-बीच में "
+    "नॉर्मल टोन भी रखो, वरना रोबोटिक लगेगा। "
+    "कोई चिह्न या फ़ॉर्मेटिंग मत लिखो — न तारांकन (*), न रेखा (---), न क्रमांक "
+    "(1., २.), न मोटा अक्षर (**), न बुलेट (-), न इमोजी — पूरी तरह साधारण बोलचाल "
+    "के वाक्यों में लिखो, जैसे कोई सुनकर समझे। "
+)
+# Optional override: point VOICE_PROMPT_FILE at a text file whose contents
+# replace the whole system prompt above (tune the persona without editing code).
+_PROMPT_FILE = os.environ.get("VOICE_PROMPT_FILE", "")
+if _PROMPT_FILE:
+    _pf = Path(_PROMPT_FILE).expanduser()
+    if _pf.is_file():
+        LLM_SYSTEM_PROMPT = _pf.read_text(encoding="utf-8").strip()
+
+
+def _speechify(text: str) -> str:
+    """Strip markdown/symbols/emoji and flatten to plain spoken sentences."""
+    text = re.sub(r"<[^>]+>", " ", text)                    # <tag> leftovers
+    text = re.sub(r"[\"'\u201c\u201d\u2018\u2019]+", "", text)  # quotes
+    text = re.sub(r"[()\[\]{}]+", " ", text)                 # ( ) [ ] { } break the spoken flow
+    text = re.sub(r"\*+|_+|`+|#+", "", text)                # *, _, `, #
+    text = re.sub(r"^\s*[-=~]{3,}\s*$", " ", text, flags=re.M)  # --- lines
+    text = re.sub(r"^\s*(?:[-•]|\d+[.)]|[१२३४५६७८९०]+[.)])\s*", " ", text, flags=re.M)  # bullets/numbers
+    text = re.sub(
+        r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u2190-\u21FF\u2B00-\u2BFF]+",
+        " ",
+        text,
+    )  # emoji/symbols
+    text = re.sub(r"[\r\n]+", " ", text)                   # newlines -> space
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
+
+
+# English words the LLM may still slip into -> Devanagari, so the TTS keeps the
+# Hindi voice/accent everywhere (Latin letters would be read English-accented).
+HINGLISH_TO_DEVANAGARI = {
+    "ai": "एआई", "app": "ऐप", "apps": "ऐप्स", "game": "गेम", "games": "गेम्स",
+    "cool": "कूल", "basically": "बेसिकली", "like": "लाइक", "simple": "सिंपल",
+    "fun": "फन", "data": "डेटा", "click": "क्लिक", "code": "कोड",
+    "website": "वेबसाइट", "button": "बटन", "message": "मैसेज", "messages": "मैसेज",
+    "tension": "टेंशन", "scene": "सीन", "chill": "चिल", "smart": "स्मार्ट",
+    "think": "थिंक", "learn": "लर्न", "decision": "डिसीज़न", "example": "एग्ज़ाम्पल",
+    "friend": "फ्रेंड", "google": "गूगल", "siri": "सिरी", "assistant": "असिस्टेंट",
+    "question": "क्वेश्चन", "answer": "आंसर", "computer": "कंप्यूटर",
+    "internet": "इंटरनेट", "online": "ऑनलाइन", "photo": "फोटो", "type": "टाइप",
+    "search": "सर्च", "program": "प्रोग्राम", "programming": "प्रोग्रामिंग",
+    "best": "बेस्ट", "easy": "ईज़ी", "yaar": "यार", "bhai": "भाई",
+    "na": "ना", "bas": "बस", "matlab": "मतलब", "info": "इंफो",
+    "power": "पावर", "capability": "कैपेबिलिटी", "super": "सुपर",
+}
+
+# Letter-by-letter fallback so ANY leftover Latin text still sounds Hindi.
+LATIN_TO_DEVANAGARI = {
+    "a": "अ", "b": "ब", "c": "क", "d": "ड", "e": "ए", "f": "फ", "g": "ग",
+    "h": "ह", "i": "इ", "j": "ज", "k": "क", "l": "ल", "m": "म", "n": "न",
+    "o": "ओ", "p": "प", "q": "क", "r": "र", "s": "स", "t": "ट", "u": "उ",
+    "v": "व", "w": "व", "x": "एक्स", "y": "य", "z": "ज़",
+}
+
+
+HAS_LATIN = re.compile(r"[A-Za-z]")
+
+
+def _devanagari_only(text: str) -> str:
+    """Rewrite leftover Latin words as Devanagari so speech keeps the Hindi accent."""
+    def repl(m):
+        low = m.group(0).lower()
+        if low in HINGLISH_TO_DEVANAGARI:
+            return HINGLISH_TO_DEVANAGARI[low]
+        return "".join(LATIN_TO_DEVANAGARI.get(ch, "") for ch in low)
+
+    return re.sub(r"[A-Za-z]+", repl, text) if HAS_LATIN.search(text) else text
+
+
+# Serve the built React/Tailwind UI (web/ui/dist). Rebuild with:
+#   cd web/ui && npm run build
+WEB_DIR = HERE / "web" / "ui" / "dist"
+
+
+def _llm_api_key() -> str:
+    key = os.environ.get("MISTRAL_API_KEY", "").strip()
+    if not key:
+        env_file = HERE / ".env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith("MISTRAL_API_KEY="):
+                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    return key
+
+
+def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, max_tokens: int | None = None):
+    """Stream Mistral tokens and yield complete Devanagari sentences as they finish.
+
+    The LLM effectively does the chunking: each yielded sentence is a TTS
+    chunk, so the first sentence can be spoken while the model is still
+    writing the rest of the reply (kills the "whole reply first, then audio"
+    lag).
+    """
+    payload = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens or LLM_MAX_TOKENS,
+        "stream": True,
+    }
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    try:
+        with httpx.stream("POST", MISTRAL_URL, headers=headers, json=payload, timeout=LLM_STREAM_TIMEOUT) as r:
+            if r.status_code != 200:
+                raise RuntimeError(f"Mistral API {r.status_code}: {r.read()[:300]!r}")
+            buf = ""
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(data)["choices"][0]["delta"].get("content") or ""
+                except (KeyError, IndexError, ValueError):
+                    continue
+                if not delta:
+                    continue
+                buf += delta
+                # flush every complete sentence that has finished streaming
+                while True:
+                    m = SENT_END_RE.search(buf)
+                    if not m:
+                        break
+                    sent = buf[: m.end()].strip()
+                    buf = buf[m.end():]
+                    if sent:
+                        yield sent
+                if len(buf) > 200:  # pathological run with no punctuation yet
+                    yield buf.strip()
+                    buf = ""
+        tail = buf.strip()
+        if tail:
+            yield tail
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Mistral stream failed: {e}") from e
+
+
+def _speech_sentence(sent: str) -> str:
+    """Make one streamed sentence speakable (strip markup, Devanagari accent)."""
+    sent = _speechify(sent)
+    sent = _devanagari_only(sent)
+    if not sent:
+        return ""
+    if sent[-1] not in "।?!.":
+        sent += "।" if any("\u0900" <= ch <= "\u097F" for ch in sent) else "."
+    return sent
+
+
+def _clause_units(sent: str) -> list[str]:
+    """Split text into TTS-window-sized pieces (hard cap, word boundaries).
+
+    Every returned piece is <= _PIECE_MAX chars, so no single audio window can
+    grow into a long uninterruptible frame (the #1 thing that kills the
+    realtime feel — one giant run-on sentence used to stall TTS for 10s+).
+    Cuts land at clause punctuation first, then at spaces; short sentences
+    pass through untouched.
+    """
+    if len(sent) <= _PIECE_MAX:
+        return [sent]
+    out: list[str] = []
+    # first cut at clause punctuation so seams sit at natural pauses
+    seps = [m.start() for m in re.finditer(r"[,;—–]", sent)]
+    if seps:
+        last = 0
+        for p in seps:
+            if p - last > _PIECE_MAX:
+                out.append(sent[last : p + 1].strip())
+                last = p + 1
+        tail = sent[last:].strip()
+        if tail:
+            out.append(tail)
+    else:
+        out.append(sent)
+    # then hard-split anything still too long at word boundaries
+    final: list[str] = []
+    for u in out:
+        if len(u) <= _PIECE_MAX:
+            final.append(u)
+            continue
+        words = u.split(" ")
+        cur = ""
+        for w in words:
+            cand = ((cur + " " + w) if cur else w).strip()
+            if len(cand) <= _PIECE_MAX:
+                cur = cand
+                continue
+            if cur:
+                final.append(cur)
+                cur = w
+        if cur:
+            final.append(cur)
+    return [p for p in final if p]
+
+
+def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt):
+    """3-thread pipeline: LLM producer -> text/windowing -> audio synth.
+
+    Pipeline (all three run concurrently, so nothing serializes):
+
+      1. llm_producer thread  — streams Mistral, yields cleaned sentences
+         onto sent_q. Pure network I/O, never blocked by the GPU.
+      2. main thread (here)   — pulls sentences, emits a ("text", sent)
+         event to the browser IMMEDIATELY, and groups sentences into audio
+         windows on win_q. Text typing is never stalled behind TTS.
+      3. audio thread         — pulls finished windows off win_q and runs the
+         OmniVoice generate() calls. The GPU works while the LLM is still
+         writing later sentences.
+
+    Text events therefore stream live at LLM speed (first one lands ~0.5-1s),
+    while the first audio window is synthesized at FIRST_WINDOW_STEP (fast
+    start) and later windows at the requested num_step, each window a single
+    continuous intonation arc instead of choppy per-sentence restarts.
+
+    Events on out_q, in order: ("text", sentence)... then ("audio", wav) per
+    window, ending with ("done", None) or ("error", msg).
+    """
+    # Small talk stays short (same rule as /api/chat): stop after 2 sentences
+    last_user = messages[-1]["content"] if messages else ""
+    is_greeting = bool(GREETING_RE.search(last_user))
+    sent_count = 0
+
+    # ---- producer: read the LLM stream continuously ---------------------
+    sent_q: queue.Queue = queue.Queue()
+    win_q: queue.Queue = queue.Queue()
+    llm_error: list[str] = []
+    audio_done = threading.Event()
+
+    def llm_producer():
+        try:
+            for raw in _llm_stream_sentences(key, messages, temperature):
+                if stop_evt is not None and stop_evt.is_set():
+                    return
+                sent = _speech_sentence(raw)
+                if not sent or len(sent) <= 2:  # junk like "." or ")." from stray punctuation
+                    continue
+                sent_q.put(sent)
+        except Exception as e:  # noqa: BLE001 — reported at the consumer end
+            llm_error.append(f"{type(e).__name__}: {e}")
+        finally:
+            sent_q.put(None)  # end-of-stream sentinel
+
+    def audio_synth():
+        """Drain win_q and generate audio. Keeps the GPU busy in parallel
+        with the LLM stream and the browser text events."""
+        try:
+            while True:
+                win = win_q.get()
+                if win is None:
+                    return
+                if stop_evt is not None and stop_evt.is_set():
+                    continue  # drop windows queued after an interrupt
+                w = _generate(state.ov_model, state.voice_prompt, win["text"],
+                              win["steps"], _pick_speed(win["text"], speed),
+                              TEMPERATURE)
+                w = _insert_pauses(w, SAMPLE_RATE, win["text"])
+                out_q.put(("audio", _wav_bytes(w, SAMPLE_RATE)))
+        except Exception as e:  # noqa: BLE001 — reported by the main thread
+            llm_error.append(f"audio: {type(e).__name__}: {e}")
+        finally:
+            audio_done.set()
+
+    threading.Thread(target=llm_producer, daemon=True).start()
+    threading.Thread(target=audio_synth, daemon=True).start()
+
+    try:
+        window = []          # sentences buffered for the next audio window
+        window_chars = 0
+        emitted_audio = False
+        while True:
+            sent = sent_q.get()
+            if sent is None:
+                break  # LLM stream ended (or was stopped)
+            if stop_evt is not None and stop_evt.is_set():
+                break
+            sent_count += 1
+            if sent_count > MAX_CHAT_SENTENCES:
+                break  # hard ceiling — never let one turn become a monologue
+            out_q.put(("text", sent))  # text streams live, never behind TTS
+            # Bound window sizes with clause pieces so one long run-on sentence
+            # never delays the first frame (units get re-joined inside a window).
+            for piece in _clause_units(sent):
+                if window and window_chars + len(piece) > WINDOW_CHAR_CAP:
+                    # this piece would overflow -> ship what we have first
+                    steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
+                    win_q.put({"text": " ".join(window), "steps": steps})
+                    window, window_chars = [], 0
+                    emitted_audio = True
+                window.append(piece)
+                window_chars += len(piece)
+                # First window stays small for a fast first frame; later
+                # windows group STREAM_WINDOW pieces into one flowing utterance.
+                if not emitted_audio:
+                    ready = window_chars >= FIRST_WINDOW_CHARS or len(window) >= 2
+                else:
+                    ready = len(window) >= STREAM_WINDOW or window_chars >= WINDOW_CHAR_CAP
+                if ready:
+                    steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
+                    win_q.put({"text": " ".join(window), "steps": steps})
+                    window, window_chars = [], 0
+                    emitted_audio = True
+            if is_greeting and sent_count >= GREETING_MAX:
+                if stop_evt is not None:
+                    stop_evt.set()  # tell the producer to stop too
+                break
+            if sent_count >= MAX_CHAT_SENTENCES:
+                if stop_evt is not None:
+                    stop_evt.set()  # tell the producer to stop too
+                break
+        if window and not (stop_evt is not None and stop_evt.is_set()):
+            steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
+            win_q.put({"text": " ".join(window), "steps": steps})  # final tail window
+        win_q.put(None)  # stop the audio thread
+        audio_done.wait(timeout=180)
+        if llm_error:
+            raise RuntimeError(llm_error[0])
+        out_q.put(("done", None))
+    except Exception as e:  # noqa: BLE001 — report to the client
+        log.exception("WS chat synthesis failed")
+        out_q.put(("error", f"{type(e).__name__}: {e}"))
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Text to speak (Devanagari, Hinglish or English)")
+    speed: float = Field(DEFAULT_SPEED, ge=0.3, le=2.0)
+    nfe_step: int | None = Field(None, ge=STEP_MIN, le=STEP_MAX,
+                                 description=f"Diffusion steps / num_step ({STEP_MIN}-{STEP_MAX}). Lower = faster, lower quality.")
+    nstep: int | None = Field(None, ge=STEP_MIN, le=STEP_MAX, description="Alias for nfe_step")
+
+    @model_validator(mode="after")
+    def _resolve_nfe_step(self):
+        # Accept either nfe_step or its alias nstep; nfe_step wins if both given
+        if self.nstep is not None:
+            if self.nfe_step is not None and self.nfe_step != self.nstep:
+                raise ValueError("nfe_step and nstep disagree; send only one")
+            self.nfe_step = self.nstep
+        if self.nfe_step is None:
+            self.nfe_step = NUM_STEP
+        return self
+
+
+class ChatMsg(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., min_length=1)
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMsg] = Field(..., min_length=1)
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+
+
+# ---------- Load once at startup ----------
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    log.info("Device: %s | dtype: %s", DEVICE, DTYPE)
+
+    # Kaggle demo load: OmniVoice.from_pretrained(..., device_map=..., dtype=...)
+    ov_model = OmniVoice.from_pretrained(OMNIVOICE_MODEL, device_map=DEVICE, dtype=DTYPE)
+
+    # Kaggle demo "OPTIMIZATION 1": encode the reference voice once and cache
+    # the prompt — every request bypasses raw audio re-processing.
+    voice_prompt = ov_model.create_voice_clone_prompt(ref_audio=str(REF_AUDIO), ref_text=REF_TEXT)
+    log.info("OmniVoice loaded + voice prompt cached from %s", REF_AUDIO.name)
+
+    _app.state.ov_model = ov_model
+    _app.state.voice_prompt = voice_prompt
+    _app.state.gen_lock = asyncio.Lock()  # serialize heavy generation across clients
+
+    yield
+
+
+app = FastAPI(title="Voice API — Hindi TTS (Rahul's voice)", lifespan=lifespan)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "device": DEVICE}
+
+
+@app.get("/api/config")
+def api_config():
+    """Every env-tunable knob, in one JSON blob.
+
+    The web UI fetches this once at startup and drives its chat step, history
+    length, reconnect/restart timers, VAD (barge-in) thresholds, and the
+    auto-send delay from it — so tuning happens in .env, never in code.
+    """
+    return {
+        # model / quality
+        "model": OMNIVOICE_MODEL,
+        "num_step": NUM_STEP,
+        "step_min": STEP_MIN,
+        "step_max": STEP_MAX,
+        "temperature": TEMPERATURE,
+        "speed": DEFAULT_SPEED,
+        "sample_rate": SAMPLE_RATE,
+        "device": DEVICE,
+        "dtype": str(DTYPE).replace("torch.", ""),
+        # local streaming ASR (voice input)
+        "asr_model": ASR_MODEL,
+        "asr_lang": ASR_LANG or "",
+        "asr_device": ASR_DEVICE,
+        # chat reply shaping
+        "first_step": FIRST_WINDOW_STEP,
+        "stream_window": STREAM_WINDOW,
+        "window_chars": WINDOW_CHAR_CAP,
+        "max_sentences": MAX_CHAT_SENTENCES,
+        "greeting_max": GREETING_MAX,
+        # LLM
+        "llm_model": LLM_MODEL,
+        "llm_temperature": LLM_TEMPERATURE,
+        "llm_max_tokens": LLM_MAX_TOKENS,
+        # browser-side conversation behaviour (read by web/ui/src/App.jsx)
+        "chat_step": int(os.environ.get("VOICE_CHAT_STEP", "12")),  # nfe_step the UI sends
+        "max_history": int(os.environ.get("VOICE_MAX_HISTORY", "12")),
+        "ws_reconnect_ms": int(os.environ.get("VOICE_WS_RECONNECT_MS", "1500")),
+        "rec_restart_ms": int(os.environ.get("VOICE_REC_RESTART_MS", "400")),
+        "vad_tick_ms": int(os.environ.get("VOICE_VAD_TICK_MS", "50")),
+        "auto_send_ms": int(os.environ.get("VOICE_AUTO_SEND_MS", "450")),
+        "send_min_chars": int(os.environ.get("VOICE_SEND_MIN_CHARS", "2")),
+        # VAD energy gates (ms of sustained energy etc.)
+        "vad_noise_floor": float(os.environ.get("VOICE_VAD_NOISE", "0.005")),
+        "vad_threshold_min": float(os.environ.get("VOICE_VAD_THRESHOLD_MIN", "0.014")),
+        "vad_gate_mult": float(os.environ.get("VOICE_VAD_GATE_MULT", "3.4")),
+        "vad_sustain_ms": int(os.environ.get("VOICE_VAD_SUSTAIN_MS", "250")),  # real voice = ~250ms energy
+        "vad_text_ms": int(os.environ.get("VOICE_VAD_TEXT_MS", "150")),  # …or words heard + ~150ms
+        "vad_failsafe_ms": int(os.environ.get("VOICE_VAD_FAILSAFE_MS", "900")),
+        "speak_tail_ms": int(os.environ.get("VOICE_SPEAK_TAIL_MS", "700")),  # ignore recognition this long after our speaker audio stops
+        "vad_rec_active_ms": int(os.environ.get("VOICE_VAD_REC_ACTIVE_MS", "400")),
+        "barge_idle_ms": int(os.environ.get("VOICE_BARGE_IDLE_MS", "900")),  # recognizer-idle send safety net
+    }
+
+
+@app.post("/tts")
+def tts(req: TTSRequest, request: Request):
+    state = request.app.state
+    start = time.perf_counter()
+    try:
+        wav = _generate(state.ov_model, state.voice_prompt, req.text, req.nfe_step, req.speed, TEMPERATURE)
+    except Exception as e:  # noqa: BLE001 — surface model errors to the client
+        log.exception("Inference failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    wav = _insert_pauses(wav, SAMPLE_RATE, req.text)
+    elapsed = time.perf_counter() - start
+    log.info("Generated %.1fs of audio in %.2fs", wav.shape[-1] / SAMPLE_RATE, elapsed)
+
+    buf = io.BytesIO()
+    sf.write(buf, wav, SAMPLE_RATE, format="WAV")
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav",
+        headers={"Content-Disposition": 'attachment; filename="speech.wav"'},
+    )
+
+
+# ---------- WebSocket realtime TTS ----------
+#
+# Protocol (one connection = one conversation):
+#   client ->  {"type": "chat", "text": ..., "history": [...], "nfe_step"?: 8}
+#              streams the LLM reply: one {"type":"text", "text": <sentence>}
+#              per sentence (the LLM does the chunking), followed by a WAV
+#              frame per sentence as it is synthesized — first audio arrives
+#              while the model is still writing the rest of the reply.
+#   client ->  {"text": "आपका दिन शुभ हो।", "nfe_step"?: 16, "speed"?: 1.0, ...}
+#              plain TTS (no LLM) with server-side sentence chunking.
+#   server ->  {"type": "start", "sample_rate": 24000}
+#              {"type": "text", "text": <sentence>}   (chat only)
+#              <binary>  one or more WAV frames (playable, in order)
+#              {"type": "done", "frames": n, "elapsed": s}
+#   errors  ->  {"type": "error", "message": ...}
+#   client may send {"type": "stop"} anytime to abort the current utterance.
+
+
+def _wav_bytes(samples: np.ndarray, sr: int) -> bytes:
+    buf = io.BytesIO()
+    sf.write(buf, samples, sr, format="WAV")
+    return buf.getvalue()
+
+
+# Punctuation -> natural speech breaks (pause durations in seconds). Each
+# pause can be tuned via env (VOICE_PAUSE_COMM A/SEMI/FULL/QUESTION/EXCLAM/
+# DANDA) and VOICE_PAUSE_SCALE multiplies them all.
+
+
+def _pause_for(key: str, dflt: float) -> float:
+    return float(os.environ.get(f"VOICE_PAUSE_{key}", str(dflt)))
+
+
+PAUSE_SECONDS = {
+    ",": _pause_for("COMMA", 0.15),
+    ";": _pause_for("SEMI", 0.2),
+    ".": _pause_for("FULL", 0.3),
+    "?": _pause_for("QUESTION", 0.35),
+    "!": _pause_for("EXCLAM", 0.4),
+    "।": _pause_for("DANDA", 0.35),
+}
+PAUSE_SCALE = float(os.environ.get("VOICE_PAUSE_SCALE", "1.0"))
+PAUSE_SECONDS = {k: round(v * PAUSE_SCALE, 3) for k, v in PAUSE_SECONDS.items()}
+
+# Streaming chunk size in utf-8 bytes (~25 Devanagari chars = one sentence).
+STREAM_MAX_CHARS = int(os.environ.get("VOICE_STREAM_MAX_CHARS", "75"))
+# Chat audio is synthesized in windows of this many sentences per generate()
+# call so prosody flows across the window (1 = old choppy per-sentence mode).
+STREAM_WINDOW = max(1, int(os.environ.get("VOICE_STREAM_WINDOW", "2")))
+# Max text chars per audio window and per clause piece — keeps every frame to
+# ~4-5s of speech so a reply starts fast and an interrupt tail stays tiny.
+WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "90"))
+_PIECE_MAX = max(40, min(120, WINDOW_CHAR_CAP))  # single unit fed to TTS
+# Hard ceiling on sentences per chat reply (the LLM is told 3-4 but can ramble;
+# this bounds worst-case latency so a turn never turns into a monologue).
+MAX_CHAT_SENTENCES = int(os.environ.get("VOICE_MAX_SENTENCES", "8"))
+# The FIRST audio window uses at most this many diffusion steps (faster start,
+# like a human replying quickly); later windows use the requested num_step.
+# Set equal to the normal num_step to disable.
+FIRST_WINDOW_STEP = max(4, min(32, int(os.environ.get("VOICE_FIRST_STEP", "6"))))
+
+
+def _stream_chunks(text: str, max_bytes: int) -> list[str]:
+    """Split text into small speakable chunks at sentence boundaries (incl. ।),
+    hard-splitting anything longer than max_bytes at word/char level."""
+    clauses = re.split(r"(?<=[।?!.])\s*", text)
+    chunks, cur = [], ""
+    for clause in clauses:
+        clause = clause.strip()
+        if not clause:
+            continue
+        if len((cur + clause).encode("utf-8")) <= max_bytes:
+            cur += clause
+            continue
+        if cur:
+            chunks.append(cur)
+            cur = ""
+        for word in clause.split(" "):
+            word = word.strip()
+            if not word:
+                continue
+            cand = (cur + " " + word).strip() if cur else word
+            if len(cand.encode("utf-8")) <= max_bytes:
+                cur = cand
+                continue
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            buf = ""
+            for ch in word:
+                if len((buf + ch).encode("utf-8")) <= max_bytes:
+                    buf += ch
+                else:
+                    chunks.append(buf)
+                    buf = ch
+            cur = buf
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _insert_pauses(wav: np.ndarray, sr: int, text: str) -> np.ndarray:
+    """Insert short silences at punctuation marks so speech isn't flat/robotic."""
+    total = len(wav)
+    if total == 0 or not text:
+        return wav
+    n_chars = max(len(text), 1)
+    parts = []
+    start = 0
+    for i, ch in enumerate(text):
+        pause = PAUSE_SECONDS.get(ch)
+        if pause is None:
+            continue
+        est = int(total * (i + 1) / n_chars)
+        if est <= start or est > total:
+            continue
+        seg = wav[start:est]
+        if len(seg) > 0:
+            parts.append(seg)
+        parts.append(np.zeros(int(pause * sr), dtype=wav.dtype))
+        start = est
+    if start < total:
+        parts.append(wav[start:])
+    if not parts:
+        return wav
+    return np.concatenate(parts)
+
+
+def _generate(model, voice_prompt, text, num_step, speed, temperature):
+    """One OmniVoice voice-clone call -> float32 mono samples at SAMPLE_RATE.
+
+    Mirrors the Kaggle demo: generate(text=..., voice_clone_prompt=<cached>,
+    num_step=..., temperature=...). The installed omnivoice (0.2.x) merges
+    extra kwargs into OmniVoiceGenerationConfig and silently drops unknown
+    keys, so the demo's `temperature` is mapped to `class_temperature` (token-
+    sampling temperature; 0 = greedy) to stay effective.
+    """
+    kwargs = {"text": text, "voice_clone_prompt": voice_prompt, "num_step": num_step}
+    if speed is not None:
+        kwargs["speed"] = speed
+    if temperature is not None:
+        kwargs["class_temperature"] = temperature
+    # Workaround for the upstream VRAM leak (k2-fsa/OmniVoice issue #199):
+    # each generate() leaks/fragments GPU memory that the caching allocator
+    # doesn't reclaim on its own, so a long-running server eventually OOMs
+    # (fastest on small-VRAM cards). Draining the allocator right before AND
+    # after every call, plus pulling outputs onto the CPU, keeps usage flat.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    with torch.inference_mode():
+        outs = model.generate(**kwargs)
+    if not outs:
+        raise RuntimeError("OmniVoice returned no audio")
+    # Move outputs off the GPU before converting so nothing GPU-side lingers.
+    segs = []
+    for s in outs:
+        if hasattr(s, "detach"):
+            s = s.detach()
+        if hasattr(s, "cpu"):
+            s = s.cpu()
+        segs.append(np.asarray(s, dtype=np.float32))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return segs[0] if len(segs) == 1 else np.concatenate(segs)
+
+
+def _stream_batches(state, text, num_step, speed, stop_evt):
+    """Yield playable WAV bytes per generated sentence chunk, in order.
+
+    The worker thread (see _synth_worker) pulls from this generator as fast as
+    the model produces frames, while the websocket sender streams each frame
+    to the client — so chunk n+1 is already being generated while chunk n is
+    playing (true prefetch). The only bottleneck is single-device inference
+    speed: on this M4/MPS at num_step=8 one sentence takes ~2.5s to make, so
+    frames arrive every ~2.5s and the browser plays them back-to-back.
+
+    Batched generate([...]) was tried for the tail sentences but returns only
+    when the whole batch finishes (no per-item speedup on one device), which
+    clumps frames and leaves a long silence after frame 1 — so streaming stays
+    one sentence per call for a steady cadence.
+    """
+    batches = _stream_chunks(text, STREAM_MAX_CHARS)
+    if not batches:
+        return
+    first = True
+    for gen_text in batches:
+        if stop_evt is not None and stop_evt.is_set():
+            return
+        steps = min(num_step, FIRST_WINDOW_STEP) if first else num_step
+        first = False
+        w = _generate(state.ov_model, state.voice_prompt, gen_text, steps, _pick_speed(gen_text, speed), TEMPERATURE)
+        w = _insert_pauses(w, SAMPLE_RATE, gen_text)
+        yield _wav_bytes(w, SAMPLE_RATE)
+
+
+def _synth_worker(state, text, num_step, speed, out_q, stop_evt):
+    try:
+        for chunk in _stream_batches(state, text, num_step, speed, stop_evt):
+            out_q.put(("audio", chunk))
+        out_q.put(("done", None))
+    except Exception as e:  # noqa: BLE001 — report to the client
+        log.exception("WS synthesis failed")
+        out_q.put(("error", f"{type(e).__name__}: {e}"))
+
+
+@app.websocket("/ws/tts")
+async def ws_tts(websocket: WebSocket):
+    await websocket.accept()
+    state = websocket.app.state
+    stop_evt = threading.Event()
+    ctrl: asyncio.Queue = asyncio.Queue()
+    busy = [False]  # a generation/chat is currently streaming to this client
+
+    async def reader():
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    data = json.loads(raw)
+                except (ValueError, AttributeError):
+                    data = None
+                mtype = data.get("type") if isinstance(data, dict) else None
+                if mtype == "stop":
+                    stop_evt.set()  # explicit user interrupt
+                    continue
+                if busy[0] and (mtype == "chat" or data.get("text")):
+                    # barge-in: a new request while one is streaming cuts the
+                    # current reply short (it will run next, in order)
+                    stop_evt.set()
+                await ctrl.put(raw)
+        except Exception:
+            await ctrl.put(None)
+
+    reader_task = asyncio.create_task(reader())
+    try:
+        while True:
+            raw = await ctrl.get()
+            if raw is None:
+                break
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}))
+                continue
+
+            if data.get("type") == "chat":
+                text = str(data.get("text", "")).strip()
+                if not text:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "text is required"}))
+                    continue
+                try:
+                    nfe = int(data.get("nfe_step", data.get("nstep", NUM_STEP)))
+                    num_step = max(STEP_MIN, min(STEP_MAX, nfe))
+                    speed = float(data.get("speed", DEFAULT_SPEED))
+                    temperature = float(data.get("temperature", LLM_TEMPERATURE))
+                except (TypeError, ValueError):
+                    await websocket.send_text(json.dumps({"type": "error", "message": "bad numeric params"}))
+                    continue
+                key = _llm_api_key()
+                if not key:
+                    await websocket.send_text(
+                        json.dumps({"type": "error", "message": "MISTRAL_API_KEY not configured"})
+                    )
+                    continue
+                history = [
+                    {"role": m["role"], "content": str(m["content"])}
+                    for m in (data.get("history") or [])
+                    if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                ]
+                if not history or history[-1]["role"] != "user":
+                    history.append({"role": "user", "content": text})
+                messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}, *history]
+
+                stop_evt.clear()
+                start = time.perf_counter()
+                log.info("WS chat request: %s", text[:50])
+                busy[0] = True
+                async with state.gen_lock:
+                    out_q: queue.Queue = queue.Queue()
+                    threading.Thread(
+                        target=_chat_worker,
+                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt),
+                        daemon=True,
+                    ).start()
+
+                    await websocket.send_text(
+                        json.dumps({"type": "start", "sample_rate": SAMPLE_RATE, "text": text})
+                    )
+                    frames = 0
+                    while True:
+                        kind, payload = await asyncio.get_running_loop().run_in_executor(None, out_q.get)
+                        if kind == "text":
+                            await websocket.send_text(json.dumps({"type": "text", "text": payload}))
+                        elif kind == "audio":
+                            frames += 1
+                            try:
+                                await websocket.send_bytes(payload)
+                            except Exception:
+                                stop_evt.set()
+                                return
+                        elif kind == "done":
+                            elapsed = round(time.perf_counter() - start, 2)
+                            log.info("WS chat done: %d frame(s) in %.2fs", frames, elapsed)
+                            await websocket.send_text(json.dumps({"type": "done", "frames": frames, "elapsed": elapsed}))
+                            break
+                        else:  # error
+                            log.error("WS chat error: %s", payload)
+                            await websocket.send_text(json.dumps({"type": "error", "message": payload}))
+                            break
+                busy[0] = False
+                continue
+
+            text = str(data.get("text", "")).strip()
+            if not text:
+                await websocket.send_text(json.dumps({"type": "error", "message": "text is required"}))
+                continue
+            try:
+                nfe = int(data.get("nfe_step", data.get("nstep", NUM_STEP)))
+                num_step = max(STEP_MIN, min(STEP_MAX, nfe))
+                speed = float(data.get("speed", DEFAULT_SPEED))
+            except (TypeError, ValueError):
+                await websocket.send_text(json.dumps({"type": "error", "message": "bad numeric params"}))
+                continue
+
+            stop_evt.clear()
+            start = time.perf_counter()
+            log.info("WS synth request: %s (num_step=%d, speed=%.2f)", text[:50], num_step, speed)
+            busy[0] = True
+            async with state.gen_lock:
+                out_q: queue.Queue = queue.Queue()
+                threading.Thread(
+                    target=_synth_worker,
+                    args=(state, text, num_step, speed, out_q, stop_evt),
+                    daemon=True,
+                ).start()
+
+                await websocket.send_text(
+                    json.dumps({"type": "start", "sample_rate": SAMPLE_RATE, "text": text})
+                )
+                frames = 0
+                while True:
+                    kind, payload = await asyncio.get_running_loop().run_in_executor(None, out_q.get)
+                    if kind == "audio":
+                        frames += 1
+                        try:
+                            await websocket.send_bytes(payload)
+                        except Exception:
+                            stop_evt.set()
+                            return
+                    elif kind == "done":
+                        elapsed = round(time.perf_counter() - start, 2)
+                        log.info("WS synth done: %d frame(s) in %.2fs", frames, elapsed)
+                        await websocket.send_text(json.dumps({"type": "done", "frames": frames, "elapsed": elapsed}))
+                        break
+                    else:  # error
+                        log.error("WS synth error: %s", payload)
+                        await websocket.send_text(json.dumps({"type": "error", "message": payload}))
+                        break
+            busy[0] = False
+    except WebSocketDisconnect:
+        pass
+    finally:
+        reader_task.cancel()
+
+
+# ---------- Streaming ASR (faster-whisper) — the voice-input path ----------
+# The browser streams the AEC-processed 16 kHz mic PCM here over /ws/asr and
+# we transcribe it locally — the same pattern OpenAI/Gemini realtime use:
+# recognize the getUserMedia stream AFTER the browser's acoustic echo
+# canceller has removed the assistant's own output, instead of the Web Speech
+# API (whose separate capture path never gets that echo reference). Partial
+# transcripts stream back as live captions; the client signals utterance
+# boundaries with "start" / "end" JSON messages.
+ASR_MODEL = os.environ.get("ASR_MODEL", "small")  # faster-whisper size: tiny|base|small|medium
+ASR_LANG = os.environ.get("ASR_LANG", "hi") or None
+ASR_DEVICE = (os.environ.get("ASR_DEVICE", "").strip().lower()
+              or ("cuda" if torch.cuda.is_available() else "cpu"))
+ASR_COMPUTE = (os.environ.get("ASR_COMPUTE", "").strip().lower()
+               or ("float16" if ASR_DEVICE.startswith("cuda") else "int8"))
+ASR_SR = 16000
+# Whisper partials cost ~linear in buffered audio, so only re-run when this
+# much NEW audio arrived since the last partial AND at least this long passed.
+ASR_PARTIAL_MIN_NEW = float(os.environ.get("VOICE_ASR_PARTIAL_NEW_SECONDS", "0.45"))
+ASR_PARTIAL_MIN_GAP = float(os.environ.get("VOICE_ASR_PARTIAL_GAP_SECONDS", "0.9"))
+
+_asr_model = None
+_asr_lock = threading.Lock()  # one Whisper call at a time (single device)
+
+
+def _get_asr():
+    global _asr_model
+    if _asr_model is None:
+        from faster_whisper import WhisperModel  # lazy: non-voice users never load it
+        log.info("Loading faster-whisper '%s' on %s (%s)...", ASR_MODEL, ASR_DEVICE, ASR_COMPUTE)
+        _asr_model = WhisperModel(ASR_MODEL, device=ASR_DEVICE, compute_type=ASR_COMPUTE)
+    return _asr_model
+
+
+def _whisper_text(samples: np.ndarray) -> str:
+    """Transcribe one utterance buffer -> trimmed text (Whisper calls serialized)."""
+    model = _get_asr()
+    with _asr_lock:
+        segs, _info = model.transcribe(
+            samples, language=ASR_LANG, beam_size=1,
+            condition_on_previous_text=False, vad_filter=False,
+        )
+        return "".join(s.text for s in segs).strip()
+
+
+@app.websocket("/ws/asr")
+async def ws_asr(websocket: WebSocket):
+    """Streaming local transcription of the AEC-cleaned browser mic.
+
+    client -> {"type": "start"}             begin an utterance (clears the buffer)
+    client -> {"type": "end"}               end it -> authoritative final transcript
+    client -> {"type": "cancel"}            discard the current utterance
+    client -> <binary>                        float32 mono PCM @ 16 kHz while talking
+    server -> {"type": "partial", "text"}   live caption (throttled by new-audio / gap)
+    server -> {"type": "final", "text"}     transcript after "end" ("" if nothing said)
+    """
+    await websocket.accept()
+    ctrl_q: queue.Queue = queue.Queue()   # "start" / "end" / "cancel" / "__close__"
+    pcm_q: queue.Queue = queue.Queue()    # float32 sample arrays from the reader
+    out_q: queue.Queue = queue.Queue()    # (kind, text) results -> websocket
+    stop_evt = threading.Event()
+
+    async def reader():
+        try:
+            while True:
+                raw = await websocket.receive()
+                if raw.get("bytes") is not None:
+                    arr = np.frombuffer(raw["bytes"], dtype=np.float32).copy()
+                    if arr.size:
+                        pcm_q.put(arr)
+                elif raw.get("text") is not None:
+                    try:
+                        msg = json.loads(raw["text"])
+                    except (ValueError, AttributeError):
+                        msg = None
+                    mtype = msg.get("type") if isinstance(msg, dict) else None
+                    ctrl_q.put(mtype or "__close__" if mtype in ("start", "end", "cancel") else "__noop__")
+        except Exception:
+            ctrl_q.put("__close__")
+
+    def worker():
+        """Owns all blocking Whisper work; results go to out_q for the sender."""
+        buf: list = []       # np arrays of the current utterance
+        total = 0            # total samples buffered
+        new_since = 0.0      # seconds of audio since the last partial run
+        last_partial = 0.0   # monotonic time of the last partial run
+        open_utt = False
+        while not stop_evt.is_set():
+            try:
+                ctl = ctrl_q.get(timeout=0.05)
+            except queue.Empty:
+                ctl = None
+            # always drain whatever audio arrived (may accompany a control msg)
+            while True:
+                try:
+                    arr = pcm_q.get_nowait()
+                except queue.Empty:
+                    break
+                if open_utt:
+                    buf.append(arr)
+                    total += len(arr)
+                    new_since += len(arr) / ASR_SR
+            if ctl == "__close__":
+                return
+            if ctl == "start":
+                buf.clear(); total = 0; new_since = 0.0; open_utt = True
+                last_partial = time.monotonic()
+                continue
+            if ctl == "cancel":
+                buf.clear(); total = 0; new_since = 0.0; open_utt = False
+                continue
+            if ctl == "end":
+                open_utt = False
+                samples = np.concatenate(buf) if total else np.zeros(0, dtype=np.float32)
+                buf.clear(); total = 0; new_since = 0.0
+                # ignore sub-250 ms buffers (pure noise blips)
+                text = _whisper_text(samples) if len(samples) >= int(0.25 * ASR_SR) else ""
+                out_q.put(("final", text))
+                continue
+            if (ctl == "__noop__" or ctl is None) and open_utt and total >= int(0.5 * ASR_SR) \
+                    and new_since >= ASR_PARTIAL_MIN_NEW \
+                    and time.monotonic() - last_partial >= ASR_PARTIAL_MIN_GAP:
+                new_since = 0.0
+                last_partial = time.monotonic()
+                samples = np.concatenate(buf)
+                out_q.put(("partial", _whisper_text(samples)))
+
+    reader_task = asyncio.create_task(reader())
+    threading.Thread(target=worker, daemon=True).start()
+    try:
+        while not reader_task.done():
+            try:
+                kind, text = out_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.05)
+                continue
+            await websocket.send_text(json.dumps({"type": kind, "text": text}))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        stop_evt.set()
+        reader_task.cancel()
+
+
+# ---------- LLM chat (keeps the API key server-side) ----------
+@app.post("/api/chat")
+def chat(req: ChatRequest):
+    key = _llm_api_key()
+    if not key:
+        raise HTTPException(
+            status_code=503,
+            detail="MISTRAL_API_KEY not configured. Create Voice_Cloning/.env with MISTRAL_API_KEY=...",
+        )
+
+    def _call(messages: list[dict]) -> str:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "temperature": req.temperature,
+            "max_tokens": LLM_MAX_TOKENS,
+        }
+        try:
+            r = httpx.post(
+                MISTRAL_URL,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=60.0,
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"Mistral request failed: {e}") from e
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Mistral API {r.status_code}: {r.text[:300]}")
+        try:
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, ValueError) as e:
+            raise HTTPException(status_code=502, detail=f"Unexpected Mistral response: {e}") from e
+
+    history = [{"role": m.role, "content": m.content} for m in req.messages]
+    messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}, *history]
+    reply = _call(messages)
+
+    reply = _speechify(reply)
+    reply = _devanagari_only(reply)
+    # Never speak a half sentence — cut at the last complete sentence if truncated
+    if reply and reply[-1] not in "।?!.":
+        cut = max(reply.rfind("।"), reply.rfind("?"), reply.rfind("!"), reply.rfind("."))
+        if cut > 0:
+            reply = reply[: cut + 1]
+    # Small talk stays short — no examples/rambling, ever
+    last_user = history[-1]["content"] if history else ""
+    if GREETING_RE.search(last_user):
+        reply = _short_greeting(reply)
+    log.info("LLM reply: %s", reply[:80])
+    return {"reply": reply, "model": LLM_MODEL}
+
+
+# Serve the browser voice-chat panel at http://127.0.0.1:8000/
+if WEB_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+
+
+if __name__ == "__main__":
+    host = os.environ.get("VOICE_HOST", "0.0.0.0")
+    port = int(os.environ.get("VOICE_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port, log_level="info")

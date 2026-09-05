@@ -1,0 +1,32 @@
+# ============================================================
+# Voice_Cloning — Python dependencies
+# Install fresh in a virtualenv, per-platform (see README.md):
+#   uv venv --python 3.11 omnivoice-env
+#   uv pip install -r requirements.txt
+# NOTE: `torch` is intentionally unversioned so an existing
+# CUDA/MPS build on the host (e.g. Kaggle's preinstalled torch)
+# is left untouched. On a bare machine, plain `pip install torch`
+# pulls the CUDA-enabled wheel on Linux/Windows and the MPS build
+# on Apple Silicon.
+# ============================================================
+
+# --- Core: OmniVoice zero-shot voice-cloning TTS (k2-fsa) ---
+omnivoice>=0.2
+
+torch
+torchaudio
+
+# --- Web server (FastAPI + uvicorn + WebSockets) ---
+fastapi>=0.110
+uvicorn[standard]
+httpx
+python-multipart
+
+# --- Audio I/O + DSP (runtime, clean_voice.py, trim_voice.py) ---
+numpy
+soundfile
+scipy
+noisereduce
+
+# --- Voice-input ASR backend (/ws/asr streaming transcription) ---
+faster-whisper>=1.0
