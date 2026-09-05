@@ -180,7 +180,11 @@ def _pick_speed(sent: str, base: float = 1.0) -> float:
 # ---------- LLM: OpenAI-compatible chat endpoint (default Groq, gpt-oss-120b) ----------
 LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "450"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
+# gpt-oss models "think" before answering — reasoning tokens count against
+# max_tokens, so a small budget can end with EMPTY content (silent no-reply).
+# "low" keeps first-audio fast; set LLM_REASONING_EFFORT="" to omit the param.
+LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
 MISTRAL_URL = os.environ.get("MISTRAL_URL", "https://api.groq.com/openai/v1/chat/completions")
 LLM_STREAM_TIMEOUT = float(os.environ.get("VOICE_LLM_TIMEOUT", "120.0"))  # httpx stream read timeout (s)
 
@@ -335,6 +339,8 @@ def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, ma
         "max_tokens": max_tokens or LLM_MAX_TOKENS,
         "stream": True,
     }
+    if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
+        payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     try:
         with httpx.stream("POST", MISTRAL_URL, headers=headers, json=payload, timeout=LLM_STREAM_TIMEOUT) as r:
@@ -507,6 +513,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
         window = []          # sentences buffered for the next audio window
         window_chars = 0
         emitted_audio = False
+        emitted_text = False  # did the LLM produce ANY speakable sentence?
         while True:
             sent = sent_q.get()
             if sent is None:
@@ -517,6 +524,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             if sent_count > MAX_CHAT_SENTENCES:
                 break  # hard ceiling — never let one turn become a monologue
             out_q.put(("text", sent))  # text streams live, never behind TTS
+            emitted_text = True
             # Bound window sizes with clause pieces so one long run-on sentence
             # never delays the first frame (units get re-joined inside a window).
             # Whole sentences feed the audio windows — the LLM decides where
@@ -554,6 +562,14 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 if stop_evt is not None:
                     stop_evt.set()  # tell the producer to stop too
                 break
+        if not emitted_text and not (stop_evt is not None and stop_evt.is_set()):
+            # The LLM returned no speakable text (reasoning models can burn the
+            # whole token budget thinking before saying anything). Always answer
+            # out loud — silence reads as "the assistant is broken".
+            fallback = "माफ़ कीजिए, एक बार फिर से पूछिए।"
+            out_q.put(("text", fallback))
+            win_q.put({"text": fallback, "steps": min(num_step, FIRST_WINDOW_STEP)})
+            emitted_audio = True
         if window and not (stop_evt is not None and stop_evt.is_set()):
             steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
             win_q.put({"text": " ".join(window), "steps": steps})  # final tail window
@@ -1461,6 +1477,8 @@ def chat(req: ChatRequest):
             "temperature": req.temperature,
             "max_tokens": LLM_MAX_TOKENS,
         }
+        if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
+            payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
         try:
             r = httpx.post(
                 MISTRAL_URL,
