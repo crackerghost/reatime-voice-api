@@ -177,11 +177,11 @@ def _pick_speed(sent: str, base: float = 1.0) -> float:
     return max(SPEED_MIN, min(SPEED_MAX, round(s, 3)))
 
 
-# ---------- LLM: Mistral ministral-8b-latest ----------
-LLM_MODEL = os.environ.get("LLM_MODEL", "ministral-8b-latest")
+# ---------- LLM: OpenAI-compatible chat endpoint (default Groq, gpt-oss-120b) ----------
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "450"))
-MISTRAL_URL = os.environ.get("MISTRAL_URL", "https://api.mistral.ai/v1/chat/completions")
+MISTRAL_URL = os.environ.get("MISTRAL_URL", "https://api.groq.com/openai/v1/chat/completions")
 LLM_STREAM_TIMEOUT = float(os.environ.get("VOICE_LLM_TIMEOUT", "120.0"))  # httpx stream read timeout (s)
 
 LLM_SYSTEM_PROMPT = (
@@ -304,19 +304,24 @@ WEB_DIR = HERE / "web" / "ui" / "dist"
 
 
 def _llm_api_key() -> str:
-    key = os.environ.get("MISTRAL_API_KEY", "").strip()
-    if not key:
+    """LLM API key: GROQ_API_KEY (default provider now) -> LLM_API_KEY ->
+    MISTRAL_API_KEY (legacy fallback), from env or the .env file."""
+    for name in ("GROQ_API_KEY", "LLM_API_KEY", "MISTRAL_API_KEY"):
+        key = os.environ.get(name, "").strip()
+        if key:
+            return key
         env_file = HERE / ".env"
         if env_file.exists():
             for line in env_file.read_text(encoding="utf-8").splitlines():
-                if line.startswith("MISTRAL_API_KEY="):
+                if line.startswith(f"{name}="):
                     key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
-    return key
+                    if key:
+                        return key
+    return ""
 
 
 def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, max_tokens: int | None = None):
-    """Stream Mistral tokens and yield complete Devanagari sentences as they finish.
+    """Stream LLM tokens and yield complete Devanagari sentences as they finish.
 
     The LLM effectively does the chunking: each yielded sentence is a TTS
     chunk, so the first sentence can be spoken while the model is still
@@ -334,7 +339,7 @@ def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, ma
     try:
         with httpx.stream("POST", MISTRAL_URL, headers=headers, json=payload, timeout=LLM_STREAM_TIMEOUT) as r:
             if r.status_code != 200:
-                raise RuntimeError(f"Mistral API {r.status_code}: {r.read()[:300]!r}")
+                raise RuntimeError(f"LLM API {r.status_code}: {r.read()[:300]!r}")
             buf = ""
             for line in r.iter_lines():
                 if not line:
@@ -977,7 +982,7 @@ async def ws_tts(websocket: WebSocket):
                 key = _llm_api_key()
                 if not key:
                     await websocket.send_text(
-                        json.dumps({"type": "error", "message": "MISTRAL_API_KEY not configured"})
+                        json.dumps({"type": "error", "message": "LLM API key not configured (set GROQ_API_KEY or MISTRAL_API_KEY in .env)"})
                     )
                     continue
                 history = [
@@ -1446,7 +1451,7 @@ def chat(req: ChatRequest):
     if not key:
         raise HTTPException(
             status_code=503,
-            detail="MISTRAL_API_KEY not configured. Create Voice_Cloning/.env with MISTRAL_API_KEY=...",
+            detail="LLM API key not configured. Create Voice_Cloning/.env with GROQ_API_KEY=... (or legacy MISTRAL_API_KEY=...)",
         )
 
     def _call(messages: list[dict]) -> str:
@@ -1464,13 +1469,13 @@ def chat(req: ChatRequest):
                 timeout=60.0,
             )
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"Mistral request failed: {e}") from e
+            raise HTTPException(status_code=502, detail=f"LLM request failed: {e}") from e
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Mistral API {r.status_code}: {r.text[:300]}")
         try:
             return r.json()["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, ValueError) as e:
-            raise HTTPException(status_code=502, detail=f"Unexpected Mistral response: {e}") from e
+            raise HTTPException(status_code=502, detail=f"Unexpected LLM response: {e}") from e
 
     history = [{"role": m.role, "content": m.content} for m in req.messages]
     messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}, *history]

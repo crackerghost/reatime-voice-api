@@ -196,7 +196,7 @@ Notes:
 | Voice input does nothing | Chrome/Edge only; check `/api/config` shows `"asr_model"`; watch the server log for the whisper load line; allow a minute on first use |
 | Assistant still hears itself | Use headphones / lower volume (AEC needs a clear echo reference); confirm the reply is playing through the same tab's speakers |
 | No web UI after `git clone` | `web/ui/dist` is git-ignored — run `cd web/ui && npm install && npm run build` |
-| Chat says "MISTRAL_API_KEY not configured" | Add the key to `.env` (or export it) and restart the server |
+| Chat says "LLM API key not configured" | Add `GROQ_API_KEY` (consoles.groq.com) to `.env` and restart the server |
 | Generated speech sounds flat/robotic | Raise `VOICE_NUM_STEP`, and/or re-record a cleaner `my_voice.wav` with clear pauses |
 
 ## License & ethics
