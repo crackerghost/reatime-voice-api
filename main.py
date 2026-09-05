@@ -66,7 +66,7 @@ if not REF_AUDIO.is_absolute():
     REF_AUDIO = HERE / REF_AUDIO
 REF_TEXT = os.environ.get(
     "VOICE_REF_TEXT",
-    "मेरा नाम राहुल है और मैं आज एक नया एआई प्रोजेक्ट टेस्ट कर रहा हूँ।",
+    "कोडिंग में बहुत मज़ा आता है, बट समटाइम्स बग्स आर सो अनोइंग यार।",
 )
 OUTPUT = Path(os.environ.get("VOICE_OUTPUT", HERE / "output.wav")).expanduser()
 if not OUTPUT.is_absolute():

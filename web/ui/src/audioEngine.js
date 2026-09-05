@@ -87,6 +87,9 @@ export const engine = {
       micStream.getTracks().forEach((t) => t.stop());
       micStream = null;
     }
+    if (micSrc) {
+      try { micSrc.disconnect(); } catch { /* noop */ } // detach node too — mic re-enable rebuilds it
+    }
     micSrc = null;
   },
   /* Tap the AEC-cleaned mic stream as 16 kHz mono frames for streaming ASR. */
@@ -94,33 +97,26 @@ export const engine = {
     if (!micSrc) return false;
     if (tap) return true;
     try {
-      const worklet = `class PcmTap extends AudioWorkletProcessor {
-  constructor(opts) {
-    super();
-    const outRate = (opts && opts.processorOptions && opts.processorOptions.outRate) || 16000;
-    this.phase = 0;
-    this.step = outRate / sampleRate;
-  }
-  process(inputs) {
-    const ch = inputs[0] && inputs[0][0];
-    if (!ch || ch.length === 0) return true;
-    const out = [];
-    for (let i = 0; i < ch.length; i++) {
-      this.phase += this.step;
-      if (this.phase >= 1) {
-        this.phase -= 1;
-        out.push(ch[i]);
+      // Load the worklet from a real same-origin file (web/ui/public -> dist
+      // root). A Blob URL fallback is kept for setups where the file is
+      // missing — Chrome can refuse Blob worklet modules under some CSPs,
+      // which would otherwise silently kill STT.
+      const src =
+        "class PcmTap extends AudioWorkletProcessor{\n" +
+        "constructor(opts){super();const outRate=(opts&&opts.processorOptions&&opts.processorOptions.outRate)||16000;this.step=outRate/sampleRate;this.phase=0;}\n" +
+        "process(inputs){const ch=inputs[0]&&inputs[0][0];if(!ch||ch.length===0)return true;const out=[];for(let i=0;i<ch.length;i++){this.phase+=this.step;if(this.phase>=1){this.phase-=1;out.push(ch[i]);}}if(out.length)this.port.postMessage(new Float32Array(out));return true;}\n" +
+        "}\nregisterProcessor(\"pcm-tap\",PcmTap);";
+      let url = `${location.origin}/pcm-tap.js`;
+      try {
+        await ctx.audioWorklet.addModule(url);
+      } catch {
+        url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+        await ctx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
       }
-    }
-    if (out.length) this.port.postMessage(new Float32Array(out));
-    return true;
-  }
-}
-registerProcessor("pcm-tap", PcmTap);`;
-      const url = URL.createObjectURL(new Blob([worklet], { type: "application/javascript" }));
-      await ctx.audioWorklet.addModule(url);
-      URL.revokeObjectURL(url);
-      tap = new AudioWorkletNode(ctx, "pcm-tap");
+      tap = new AudioWorkletNode(ctx, "pcm-tap", {
+        processorOptions: { outRate: 16000 },
+      });
       tap.port.onmessage = (e) => onFrame(e.data);
       micSrc.connect(tap);
       return true;

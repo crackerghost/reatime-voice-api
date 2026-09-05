@@ -23,7 +23,7 @@ STEPS = [int(x) for x in os.environ.get("BENCH_STEPS", "16,24,32").split(",") if
 REF_AUDIO = os.environ.get("VOICE_REF_AUDIO", os.path.join(ROOT, "my_voice.wav"))
 REF_TEXT = os.environ.get(
     "VOICE_REF_TEXT",
-    "मेरा नाम राहुल है और मैं आज एक नया एआई प्रोजेक्ट टेस्ट कर रहा हूँ।",
+    "कोडिंग में बहुत मज़ा आता है, बट समटाइम्स बग्स आर सो अनोइंग यार।",
 )
 
 # main.py prints, e.g.:  Real-Time Factor (RTF): 0.2431

@@ -21,6 +21,7 @@ import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -83,7 +84,7 @@ if not REF_AUDIO.is_absolute():
     REF_AUDIO = HERE / REF_AUDIO
 REF_TEXT = os.environ.get(
     "VOICE_REF_TEXT",
-    "मेरा नाम राहुल है और मैं आज एक नया एआई प्रोजेक्ट टेस्ट कर रहा हूँ।।",
+    "कोडिंग में बहुत मज़ा आता है, बट समटाइम्स बग्स आर सो अनोइंग यार।",
 )
 
 # ---------- Model: OmniVoice (k2-fsa/OmniVoice), 24 kHz output ----------
@@ -97,7 +98,7 @@ DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.0"))      # rate when a r
 STEP_MIN = int(os.environ.get("VOICE_STEP_MIN", "4"))
 STEP_MAX = int(os.environ.get("VOICE_STEP_MAX", "64"))
 GREETING_MAX = int(os.environ.get("VOICE_GREETING_MAX", "2"))  # sentences for small-talk replies
-FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "55"))  # chars in 1st audio window
+FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "40"))  # chars in 1st audio window (small = fast first audio)
 
 # MPS (Apple Silicon) / CUDA run best in fp16; CPU falls back to fp32.
 # Override with VOICE_API_DEVICE=cpu|mps|cuda and VOICE_API_DTYPE=fp16|fp32.
@@ -627,9 +628,13 @@ def api_config():
         "device": DEVICE,
         "dtype": str(DTYPE).replace("torch.", ""),
         # local streaming ASR (voice input)
+        "asr_backend": _pick_asr_backend(),
         "asr_model": ASR_MODEL,
         "asr_lang": ASR_LANG or "",
         "asr_device": ASR_DEVICE,
+        "asr_final_beam": ASR_FINAL_BEAM,
+        "asr_speculative": ASR_SPECULATIVE,
+        "speculative_ms": ASR_SPECULATIVE_MS,
         # chat reply shaping
         "first_step": FIRST_WINDOW_STEP,
         "stream_window": STREAM_WINDOW,
@@ -646,7 +651,7 @@ def api_config():
         "ws_reconnect_ms": int(os.environ.get("VOICE_WS_RECONNECT_MS", "1500")),
         "rec_restart_ms": int(os.environ.get("VOICE_REC_RESTART_MS", "400")),
         "vad_tick_ms": int(os.environ.get("VOICE_VAD_TICK_MS", "50")),
-        "auto_send_ms": int(os.environ.get("VOICE_AUTO_SEND_MS", "450")),
+        "auto_send_ms": int(os.environ.get("VOICE_AUTO_SEND_MS", "280")),
         "send_min_chars": int(os.environ.get("VOICE_SEND_MIN_CHARS", "2")),
         # VAD energy gates (ms of sustained energy etc.)
         "vad_noise_floor": float(os.environ.get("VOICE_VAD_NOISE", "0.005")),
@@ -1049,7 +1054,7 @@ async def ws_tts(websocket: WebSocket):
         reader_task.cancel()
 
 
-# ---------- Streaming ASR (faster-whisper) — the voice-input path ----------
+# ---------- Streaming ASR — the voice-input path ----------
 # The browser streams the AEC-processed 16 kHz mic PCM here over /ws/asr and
 # we transcribe it locally — the same pattern OpenAI/Gemini realtime use:
 # recognize the getUserMedia stream AFTER the browser's acoustic echo
@@ -1057,40 +1062,218 @@ async def ws_tts(websocket: WebSocket):
 # API (whose separate capture path never gets that echo reference). Partial
 # transcripts stream back as live captions; the client signals utterance
 # boundaries with "start" / "end" JSON messages.
-ASR_MODEL = os.environ.get("ASR_MODEL", "small")  # faster-whisper size: tiny|base|small|medium
-ASR_LANG = os.environ.get("ASR_LANG", "hi") or None
+#
+# Two switchable local backends (ASR_BACKEND):
+#   * "mlx"            — mlx-whisper on Apple Silicon (Neural Engine). ~10x
+#                        faster than CPU Whisper on an M4. Apple-only.
+#   * "faster-whisper" — CTranslate2: CUDA fp16 (realtime — the Kaggle/NVIDIA
+#                        GPU path) or CPU int8.
+# ASR_BACKEND=auto picks mlx when running on Apple Silicon with mlx-whisper
+# installed, else faster-whisper — so this exact code runs on the M4 Mac AND
+# on Kaggle's Linux GPU with no edits.
+ASR_BACKEND = (os.environ.get("ASR_BACKEND", "") or "auto").strip().lower()
+# faster-whisper tuning (ignored by the mlx backend): device auto-selects CUDA
+# when available, else CPU; compute auto-follows.
 ASR_DEVICE = (os.environ.get("ASR_DEVICE", "").strip().lower()
               or ("cuda" if torch.cuda.is_available() else "cpu"))
 ASR_COMPUTE = (os.environ.get("ASR_COMPUTE", "").strip().lower()
                or ("float16" if ASR_DEVICE.startswith("cuda") else "int8"))
+# Model size (shared by both backends): "small" is the smallest Whisper size
+# that transcribes Hindi well (base/tiny mangle it). On CUDA small is
+# realtime; on the M4 the mlx backend makes it ~10x realtime.
+ASR_MODEL = os.environ.get("ASR_MODEL", "") or "small"
+# Spoken language: "hi" = Hindi/Hinglish, accurate and fast (no detection
+# pass). LEAVE EMPTY only for true multilingual mode — auto-detect is great
+# for English but routinely mislabels SHORT Hindi clips (es/ru/ur/si).
+ASR_LANG = os.environ.get("ASR_LANG", "hi") or None
 ASR_SR = 16000
+# faster-whisper only: the AUTHORITATIVE final after "end" gets a beam-search
+# decode + VAD trimming (better Hinglish accuracy for ~1.5x the cost of one
+# greedy pass, once per utterance). Live captions stay greedy/beam-1.
+# mlx-whisper 0.4.x has no beam decoder, so it always decodes greedily.
+ASR_FINAL_BEAM = int(os.environ.get("ASR_FINAL_BEAM", "5"))
+# Anti-repetition loops ("अगर अगर अगर…"): every transcript passes through
+# _collapse_repeats(), the mlx decoder keeps Whisper's temperature fallback
+# ladder (we used to force temperature=0.0, which DISABLED loop detection),
+# and faster-whisper additionally blocks repeated 3-word n-grams.
+ASR_NO_REPEAT_NGRAM = int(os.environ.get("VOICE_ASR_NO_REPEAT_NGRAM", "3"))  # fw only; 0 = off
+ASR_MAX_DUP = int(os.environ.get("VOICE_ASR_MAX_DUP", "2"))  # keep at most N identical neighbours
 # Whisper partials cost ~linear in buffered audio, so only re-run when this
 # much NEW audio arrived since the last partial AND at least this long passed.
 ASR_PARTIAL_MIN_NEW = float(os.environ.get("VOICE_ASR_PARTIAL_NEW_SECONDS", "0.45"))
 ASR_PARTIAL_MIN_GAP = float(os.environ.get("VOICE_ASR_PARTIAL_GAP_SECONDS", "0.9"))
+# Speculative turn trigger: at "end" we first decode GREEDY (fast) and send it
+# to the browser as a "speculative" transcript so the LLM reply starts right
+# away — the slower beam+VAD decode then follows as the authoritative "final"
+# and the client reconciles the two (replace only if they meaningfully differ).
+# This removes the beam decode (~0.3-1.5 s on CPU) from the front of the
+# reply latency. VOICE_SPECULATIVE_MS bounds how long the client waits for the
+# final before releasing the mic anyway.
+ASR_SPECULATIVE = os.environ.get("VOICE_ASR_SPECULATIVE", "1").strip().lower() not in ("0", "false", "no")
+ASR_SPECULATIVE_MS = int(os.environ.get("VOICE_SPECULATIVE_MS", "5000"))
 
-_asr_model = None
+# HF repo ids of the MLX-converted Whisper checkpoints per size. A full repo id
+# (containing "/") in ASR_MODEL is passed through untouched.
+_MLX_REPOS = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "turbo": "mlx-community/whisper-turbo",
+}
+
+
+def _mlx_repo(model_name: str) -> str:
+    if "/" in model_name:
+        return model_name
+    return _MLX_REPOS.get(model_name.lower(), f"mlx-community/whisper-{model_name}-mlx")
+
+
+def _pick_asr_backend() -> str:
+    """Which backend will run (no heavy imports): auto prefers mlx on the Mac."""
+    if ASR_BACKEND == "mlx":
+        return "mlx"
+    if ASR_BACKEND in ("faster-whisper", "faster_whisper", "fw"):
+        return "faster-whisper"
+    if sys.platform == "darwin":  # auto: Apple Silicon + mlx installed -> mlx
+        import importlib.util
+        if importlib.util.find_spec("mlx_whisper") is not None:
+            return "mlx"
+    return "faster-whisper"
+
+
+_asr_backend = None   # one loaded backend object, reused for every call
 _asr_lock = threading.Lock()  # one Whisper call at a time (single device)
 
 
-def _get_asr():
-    global _asr_model
-    if _asr_model is None:
+class _MlxAsr:
+    """mlx-whisper (Apple Neural Engine). Greedy decode only; the library caches
+    the loaded model in memory, so repeated calls stay fast."""
+
+    name = "mlx"
+
+    def __init__(self):
+        try:
+            import mlx_whisper  # noqa: F401 — Apple-only import
+        except ImportError:
+            raise RuntimeError(
+                "ASR_BACKEND=mlx needs mlx-whisper (Apple Silicon only): run "
+                "'uv pip install -p omnivoice-env/bin/python mlx-whisper'. "
+                "On Kaggle/NVIDIA leave ASR_BACKEND=auto to use faster-whisper on CUDA."
+            ) from None
+        self._transcribe = mlx_whisper.transcribe
+        self._repo = _mlx_repo(ASR_MODEL)
+
+    def transcribe(self, samples: np.ndarray, beam: int = 1, vad: bool = False) -> str:
+        # Keep mlx-whisper's temperature fallback ladder (we used to pin
+        # temperature=0.0, which disabled Whisper's own repetition-loop
+        # detection — the cause of "अगर अगर अगर…" transcripts).
+        kwargs: dict = {
+            "condition_on_previous_text": False,
+            "verbose": None,
+            "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        }
+        if ASR_LANG:
+            kwargs["language"] = ASR_LANG
+        try:
+            res = self._transcribe(samples, path_or_hf_repo=self._repo, **kwargs)
+        except TypeError:
+            # older mlx-whisper without the tuple-temperature API -> plain greedy
+            kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
+            res = self._transcribe(samples, path_or_hf_repo=self._repo, **kwargs)
+        return (res.get("text") or "").strip()
+
+
+class _FasterWhisperAsr:
+    """faster-whisper (CTranslate2): CUDA fp16 or CPU int8."""
+
+    name = "faster-whisper"
+
+    def __init__(self):
         from faster_whisper import WhisperModel  # lazy: non-voice users never load it
-        log.info("Loading faster-whisper '%s' on %s (%s)...", ASR_MODEL, ASR_DEVICE, ASR_COMPUTE)
-        _asr_model = WhisperModel(ASR_MODEL, device=ASR_DEVICE, compute_type=ASR_COMPUTE)
-    return _asr_model
+        self._model = WhisperModel(ASR_MODEL, device=ASR_DEVICE, compute_type=ASR_COMPUTE)
 
-
-def _whisper_text(samples: np.ndarray) -> str:
-    """Transcribe one utterance buffer -> trimmed text (Whisper calls serialized)."""
-    model = _get_asr()
-    with _asr_lock:
-        segs, _info = model.transcribe(
-            samples, language=ASR_LANG, beam_size=1,
-            condition_on_previous_text=False, vad_filter=False,
+    def transcribe(self, samples: np.ndarray, beam: int = 1, vad: bool = False) -> str:
+        segs, _info = self._model.transcribe(
+            samples, language=ASR_LANG, beam_size=beam,
+            condition_on_previous_text=False, vad_filter=vad,
+            no_repeat_ngram_size=max(0, ASR_NO_REPEAT_NGRAM),  # 0 disables (CTranslate2 convention)
         )
         return "".join(s.text for s in segs).strip()
+
+
+def _get_asr():
+    """Load (once) the backend selected by ASR_BACKEND and reuse it for all calls."""
+    global _asr_backend
+    if _asr_backend is None:
+        chosen = _pick_asr_backend()
+        log.info("Loading ASR backend '%s' (model '%s')...", chosen, ASR_MODEL)
+        _asr_backend = _MlxAsr() if chosen == "mlx" else _FasterWhisperAsr()
+    return _asr_backend
+
+
+def _collapse_repeats(text: str) -> str:
+    """Fix Whisper repetition loops: "अगर अगर अगर अगर…" -> "अगर".
+
+    Two passes:
+      1. an identical word repeated more than ASR_MAX_DUP times IN A ROW is
+         truncated (Hindi reduplication like "धीरे धीरे" still survives);
+      2. if a single word makes up >= 40% of the whole utterance (>= 4 times),
+         only its first two occurrences are kept — loops often RESTART mid-
+         sentence instead of staying adjacent.
+    Stray U+FFFD chars (truncated Devanagari tokens like "अ�") become spaces.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = t.replace("\ufffd", " ")
+    words = t.split()
+    out: list[str] = []
+    run_word, run_len = None, 0
+    for w in words:
+        if w == run_word:
+            run_len += 1
+            if run_len > max(1, ASR_MAX_DUP):
+                continue  # collapse the (N+1)-th identical neighbour
+        else:
+            run_word, run_len = w, 1
+        out.append(w)
+    if len(out) >= 4:
+        counts: dict[str, int] = {}
+        for w in out:
+            counts[w] = counts.get(w, 0) + 1
+        hot, n = max(counts.items(), key=lambda kv: kv[1])
+        if n >= 4 and n * 5 >= len(out) * 2:  # hot word is >= 40% of the utterance
+            seen, kept = 0, []
+            for w in out:
+                if w == hot:
+                    seen += 1
+                    if seen > 2:
+                        continue
+                kept.append(w)
+            out = kept
+    # loops often leave an orphan single-char Devanagari fragment ("अ") at the
+    # end — drop it (real standalone words are never 1 Devanagari char except न)
+    while len(out) >= 2 and len(out[-1]) == 1 and out[-1] != "न" \
+            and "\u0900" <= out[-1][0] <= "\u097F":
+        out.pop()
+    return " ".join(out)
+
+
+def _whisper_text(samples: np.ndarray, beam: int = 1, vad: bool = False) -> str:
+    """Transcribe one utterance buffer -> trimmed text (calls serialized).
+
+    beam>1 / vad=True are applied only by the faster-whisper backend for the
+    authoritative "final"; live partial captions stay greedy/raw everywhere.
+    The mlx backend has no beam decoder and ignores both.
+    """
+    if samples.size == 0:
+        return ""
+    asr = _get_asr()
+    with _asr_lock:
+        text = asr.transcribe(np.ascontiguousarray(samples, dtype=np.float32), beam=beam, vad=vad)
+    return _collapse_repeats(text)
 
 
 @app.websocket("/ws/asr")
@@ -1102,7 +1285,8 @@ async def ws_asr(websocket: WebSocket):
     client -> {"type": "cancel"}            discard the current utterance
     client -> <binary>                        float32 mono PCM @ 16 kHz while talking
     server -> {"type": "partial", "text"}   live caption (throttled by new-audio / gap)
-    server -> {"type": "final", "text"}     transcript after "end" ("" if nothing said)
+    server -> {"type": "speculative", "text"}  fast greedy transcript at "end" (if enabled)
+    server -> {"type": "final", "text"}     authoritative beam transcript after "end"
     """
     await websocket.accept()
     ctrl_q: queue.Queue = queue.Queue()   # "start" / "end" / "cancel" / "__close__"
@@ -1163,9 +1347,22 @@ async def ws_asr(websocket: WebSocket):
                 open_utt = False
                 samples = np.concatenate(buf) if total else np.zeros(0, dtype=np.float32)
                 buf.clear(); total = 0; new_since = 0.0
-                # ignore sub-250 ms buffers (pure noise blips)
-                text = _whisper_text(samples) if len(samples) >= int(0.25 * ASR_SR) else ""
-                out_q.put(("final", text))
+                # ignore sub-250 ms buffers (pure noise blips); the real turn
+                # gets the accurate beam-search + VAD-trimmed decode
+                if len(samples) < int(0.25 * ASR_SR):
+                    out_q.put(("final", ""))
+                    continue
+                # 1) SPECULATIVE: one fast greedy decode, sent before the beam
+                #    final so the browser can start the LLM turn immediately.
+                if ASR_SPECULATIVE:
+                    try:
+                        spec = _whisper_text(samples)
+                    except Exception:  # noqa: BLE001 — greedy is best-effort
+                        spec = ""
+                    if spec:
+                        out_q.put(("speculative", spec))
+                # 2) AUTHORITATIVE final: beam search + VAD trimming.
+                out_q.put(("final", _whisper_text(samples, beam=ASR_FINAL_BEAM, vad=True)))
                 continue
             if (ctl == "__noop__" or ctl is None) and open_utt and total >= int(0.5 * ASR_SR) \
                     and new_since >= ASR_PARTIAL_MIN_NEW \
@@ -1184,7 +1381,10 @@ async def ws_asr(websocket: WebSocket):
             except queue.Empty:
                 await asyncio.sleep(0.05)
                 continue
-            await websocket.send_text(json.dumps({"type": kind, "text": text}))
+            try:
+                await websocket.send_text(json.dumps({"type": kind, "text": text}))
+            except Exception:  # noqa: BLE001 — client vanished mid-decode; stop the worker too
+                break
     except WebSocketDisconnect:
         pass
     finally:

@@ -122,18 +122,35 @@ to CPU — so long-running servers stay flat.
 - Works in **Chrome / Edge** only (AudioWorklet + WebRTC AEC).
 - The assistant's audio and the mic must share the browser's audio context
   (they do). **Headphones or a lower speaker volume** help Chrome's AEC lock.
-- First mic use initializes faster-whisper (one-time load, plus model download
-  if not cached). On the M4 CPU, use `ASR_MODEL=base` or `tiny` for snappy
-  live captions; on NVIDIA CUDA (`float16`) `small`/`medium` are fast.
+- First mic use initializes the ASR backend (one-time load + model download;
+  ~460 MB for `small`). **Keep `ASR_MODEL=small` and `ASR_LANG=hi`** — `small`
+  is the smallest size that transcribes Hindi correctly (`base`/`tiny` mangle
+  it), and forcing `hi` is both faster and accurate for Hindi/Hinglish.
+- **Switchable backend (`ASR_BACKEND`)** — `auto` (default) uses **mlx-whisper
+  on Apple Silicon** (Neural Engine, ~10x faster than CPU Whisper on an M4;
+  install: `uv pip install -p omnivoice-env/bin/python mlx-whisper`) and
+  **faster-whisper everywhere else** — CUDA fp16 on Kaggle/NVIDIA, CPU int8 on
+  other machines. The same repo therefore runs fast on the M4 AND on Kaggle's
+  Linux GPU with no edits. `ASR_BACKEND=mlx` or `=faster-whisper` forces one.
+  Note mlx-whisper has no beam decoder; `ASR_FINAL_BEAM` applies to the
+  faster-whisper backend only.
+- Want true multilingual STT? Set `ASR_LANG=` (empty = auto-detect per
+  utterance). Auto-detect is great for English but routinely mislabels SHORT
+  Hindi clips (as es/ru/ur/si) — that is why Hindi seemed broken.
 
 ```ini
 # .env — voice input
-ASR_MODEL=base        # tiny | base | small (default) | medium
-ASR_LANG=hi
-ASR_DEVICE=           # auto: cuda on NVIDIA, cpu elsewhere
-ASR_COMPUTE=          # auto: float16 (CUDA) / int8 (CPU)
+ASR_BACKEND=auto      # auto | mlx (Apple Silicon only) | faster-whisper
+ASR_MODEL=small       # tiny | base | small (default) | medium
+ASR_LANG=hi           # hi = Hindi/Hinglish (fast, accurate); empty = auto-detect any language
+ASR_DEVICE=           # auto: cuda on NVIDIA, cpu elsewhere (fw backend)
+ASR_COMPUTE=          # auto: float16 (CUDA) / int8 (CPU) (fw backend)
+ASR_FINAL_BEAM=5      # fw only: beam width for the final transcript
 VOICE_ASR_PARTIAL_NEW_SECONDS=0.45   # live-caption cadence
 VOICE_ASR_PARTIAL_GAP_SECONDS=0.9
+VOICE_ASR_SPECULATIVE=1              # 1 = fast greedy transcript fires the reply before the beam final (lower latency)
+VOICE_SPECULATIVE_MS=5000            # how long the client waits for the final before releasing the mic anyway
+VOICE_AUTO_SEND_MS=280               # end-of-speech silence tail before the utterance is sent (lower = snappier turns)
 ```
 
 ## 5. Testing on a GPU cloud / Kaggle

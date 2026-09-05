@@ -18,7 +18,8 @@ const CFG = {
   wsReconnectMs: 1500,
   recRestartMs: 400,
   vadTickMs: 50,
-  autoSendMs: 450,
+  autoSendMs: 280,
+  specChat: true, // server sends a fast "speculative" transcript; reply starts on it, final reconciles
   sendMinChars: 2, // min non-space chars to treat as real words
   vadNoiseFloor: 0.005,
   vadThresholdMin: 0.014,
@@ -49,6 +50,7 @@ const mergeCfg = (c) => {
   CFG.speakTailMs = num(c.speak_tail_ms, CFG.speakTailMs);
   CFG.vadRecActiveMs = num(c.vad_rec_active_ms, CFG.vadRecActiveMs);
   CFG.bargeIdleMs = num(c.barge_idle_ms, CFG.bargeIdleMs);
+  CFG.specChat = c.spec_chat !== undefined ? !!c.spec_chat : CFG.specChat; // live tunable
 };
 if (typeof fetch === "function") {
   fetch(CONFIG_URL)
@@ -100,10 +102,12 @@ export default function App() {
     noise: CFG.vadNoiseFloor, // adaptive ambient floor (updated when idle)
     threshold: Math.max(CFG.vadNoiseFloor * CFG.vadGateMult, CFG.vadThresholdMin),
     hotTicks: 0, // consecutive ticks above threshold (debounce noise blips)
+    strongTicks: 0, // consecutive ticks WELL above the gate (only this may cut the assistant)
     textHeard: false, // recognizer delivered real words during this burst
     anyVoice: false, // analyser saw real voice at least once this burst
     bargeLatched: false, // already cut the assistant during this burst
     voiceSilentSince: 0, // ms timestamp when the burst ended
+    uttEndedAt: 0, // ms timestamp when the utterance was closed (speculative-release timer)
     lastUtt: 0, // recognizer last heard anything (ms)
     lastSpeakAt: 0, // when OUR speaker output last had real audio (echo guard)
   });
@@ -137,6 +141,7 @@ export default function App() {
       currentSourceRef.current = src;
       src.onended = () => {
         currentSourceRef.current = null;
+        try { src.disconnect(); } catch { /* noop */ } // free the audio graph — every frame adds nodes
         resolve();
       };
       src.start();
@@ -332,8 +337,12 @@ export default function App() {
     let rafVad = 0;
     let pcmTimer = 0;
     let closingAsr = false;
+    let asrClosedCount = 0;
+    let asrWarned = false;
     let pcmBuf = []; // Float32Array pieces waiting to be flushed to /ws/asr
     let pcmLen = 0;
+    let lastPartial = ""; // most recent live caption (fallback if final is empty)
+    let specSentFor = ""; // text already submitted speculatively (guards double-send)
 
     const asrSendJson = (obj) => {
       const ws = asrWsRef.current;
@@ -361,6 +370,7 @@ export default function App() {
       asrWsRef.current = ws;
       ws.onopen = () => {
         asrOpenRef.current = true;
+        asrClosedCount = 0;
       };
       ws.onclose = () => {
         asrOpenRef.current = false;
@@ -368,7 +378,16 @@ export default function App() {
         streamingRef.current = false;
         pcmBuf = [];
         pcmLen = 0;
-        if (listeningRef.current && !closingAsr) setTimeout(connectAsr, CFG.wsReconnectMs);
+        if (listeningRef.current && !closingAsr) {
+          asrClosedCount += 1;
+          // The /ws/asr endpoint only exists on a server running the current
+          // code — tell the user to restart it instead of failing silently.
+          if (asrClosedCount >= 4 && !asrWarned) {
+            asrWarned = true;
+            showError("वॉयस इंजन (Whisper) से कनेक्ट नहीं हो पा रहा — कृपया सर्वर रीस्टार्ट करें (python voice_api.py)।");
+          }
+          setTimeout(connectAsr, CFG.wsReconnectMs);
+        }
       };
       ws.onmessage = (ev) => {
         let m;
@@ -382,14 +401,48 @@ export default function App() {
           // live caption from Whisper; also confirms real speech for barge-in
           const t = (m.text || "").trim();
           if (t) {
+            lastPartial = t;
             v.textHeard = true;
             setInterim(t);
           }
-        } else if (m.type === "final") {
+        } else if (m.type === "speculative") {
+          // Fast greedy decode of the finished utterance: start the LLM turn
+          // NOW. The authoritative "final" follows and reconciles.
+          if (!asrBusyRef.current) return; // stale spec after a watchdog release — ignore
           const t = (m.text || "").trim();
+          if (CFG.specChat && t && t.replace(/\s/g, "").length >= CFG.sendMinChars) {
+            v.textHeard = true;
+            setInterim("");
+            specSentFor = t;
+            lastPartial = ""; // final reconciliation only if no spec turn went out
+            asrBusyRef.current = false; // allow the next utterance to open while the final lands
+            apiRef.current.submitChat(t);
+          }
+        } else if (m.type === "final") {
+          // short clips can come back empty — fall back to the last live caption
+          const t = (m.text || "").trim() || lastPartial;
+          lastPartial = "";
           asrBusyRef.current = false;
           streamingRef.current = false;
-          if (t && t.replace(/\s/g, "").length >= CFG.sendMinChars) {
+          if (specSentFor) {
+            // A speculative turn already went out: reconcile only on real divergence.
+            const norm = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+            const same = norm(t) === norm(specSentFor);
+            const tokensA = new Set(norm(specSentFor).split(/\s+/).filter(Boolean));
+            const tokensB = new Set(norm(t).split(/\s+/).filter(Boolean));
+            const common = [...tokensA].filter((w) => tokensB.has(w)).length;
+            const diverged =
+              !same &&
+              tokensB.size > 0 &&
+              (common / Math.max(1, tokensA.size) < 0.5 || t.length > specSentFor.length * 1.6);
+            if (diverged) {
+              specSentFor = "";
+              setInterim(t);
+              apiRef.current.submitChat(t); // beam heard something meaningfully different
+            } else {
+              specSentFor = ""; // close enough — the speculative reply stands
+            }
+          } else if (t && t.replace(/\s/g, "").length >= CFG.sendMinChars) {
             v.textHeard = true;
             setInterim(t);
             apiRef.current.submitChat(t); // the turn goes out with the real transcript
@@ -399,6 +452,7 @@ export default function App() {
         } else if (m.type === "error") {
           asrBusyRef.current = false;
           streamingRef.current = false;
+          specSentFor = ""; // never let a dead utterance's guard leak into the next one
           setInterim("");
           showError("बोलने की पहचान में त्रुटि: " + (m.message || ""));
         }
@@ -442,10 +496,16 @@ export default function App() {
       }
 
       // Debounce: noise blips are short; real voice sustains. Count ticks.
+      // `strong` energy (well above the gate) is what may interrupt the
+      // assistant — our own echo / ambient noise rarely exceeds it, so a
+      // long reply can't accidentally stop itself.
+      const strong = mic.rms > v.threshold * 1.6;
       if (hot) {
         v.hotTicks += 1;
         v.lastUtt = now; // energy-backed speech time (drives end-of-speech)
       } else v.hotTicks = 0;
+      if (strong) v.strongTicks += 1;
+      else v.strongTicks = 0;
       const sustainedVoice = v.hotTicks >= sustainTicks;
       if (sustainedVoice) v.anyVoice = true; // latch: analyser really heard us
       const voiceHeard = sustainedVoice || v.textHeard || v.anyVoice;
@@ -462,13 +522,14 @@ export default function App() {
       if (sustainedVoice && !streamingRef.current && !asrBusyRef.current && asrOpenRef.current) {
         streamingRef.current = true;
         v.voiceSilentSince = 0;
+        specSentFor = ""; // new utterance: drop any stale speculative-turn guard
         asrSendJson({ type: "start" });
       }
 
       // ---- BARGE-IN (real sustained speech cuts the assistant) --------
       if (assistantBusy && !v.bargeLatched) {
         const enough =
-          (v.textHeard && v.hotTicks >= textTicks) || v.hotTicks >= failsafeTicks;
+          (v.textHeard && v.hotTicks >= textTicks) || v.strongTicks >= failsafeTicks;
         if (enough) {
           v.bargeLatched = true; // latch: one cut per burst
           apiRef.current.hardStop();
@@ -482,22 +543,40 @@ export default function App() {
       // lag no longer matters: the transcript request is sent at "end" and the
       // authoritative "final" arrives right after.
       const recActive = now - v.lastUtt < CFG.vadRecActiveMs;
-      if (streamingRef.current && voiceHeard && !assistantBusy) {
-        if (hot || recActive) {
-          v.voiceSilentSince = 0; // still talking
-        } else {
-          if (!v.voiceSilentSince) v.voiceSilentSince = now;
-          else if (now - v.voiceSilentSince > CFG.autoSendMs) {
-            v.voiceSilentSince = 0;
-            v.hotTicks = 0;
-            v.textHeard = false;
-            v.anyVoice = false;
-            streamingRef.current = false;
-            asrBusyRef.current = true; // wait for the server's "final"
-            asrSendJson({ type: "end" });
-          }
-        }
+      // If no speculative transcript arrives shortly after "end" (slow backend
+      // or disabled), release the mic anyway so the next burst works.
+      if (!streamingRef.current && !asrBusyRef.current && !specSentFor &&
+          now - v.uttEndedAt > (CFG.specChat ? 120 : 0)) {
+        asrBusyRef.current = false;
+        streamingRef.current = false;
       }
+          if (streamingRef.current && voiceHeard && !assistantBusy) {
+            if (hot || recActive) {
+              v.voiceSilentSince = 0; // still talking
+            } else {
+              if (!v.voiceSilentSince) v.voiceSilentSince = now;
+              else if (now - v.voiceSilentSince > CFG.autoSendMs) {
+                v.voiceSilentSince = 0;
+                v.hotTicks = 0;
+                v.textHeard = false;
+                v.anyVoice = false;
+                streamingRef.current = false;
+                v.uttEndedAt = now; // speculative turn may fire before the final lands
+                asrBusyRef.current = true; // wait for the server's "final" (or spec release)
+                asrSendJson({ type: "end" });
+                // Watchdog: if neither a speculative nor the final transcript
+                // arrives (lost frame/drop), don't leave the mic dead — release
+                // after 12 s so the next burst works.
+                setTimeout(() => {
+                  if (asrBusyRef.current) {
+                    asrBusyRef.current = false;
+                    streamingRef.current = false;
+                    setInterim("");
+                  }
+                }, 12000);
+              }
+            }
+          }
     };
 
     const enableMic = async () => {
@@ -505,19 +584,23 @@ export default function App() {
       v.noise = CFG.vadNoiseFloor;
       v.threshold = Math.max(CFG.vadNoiseFloor * CFG.vadGateMult, CFG.vadThresholdMin);
       v.hotTicks = 0;
+      v.strongTicks = 0;
       v.textHeard = false;
       v.anyVoice = false;
       v.bargeLatched = false;
       v.voiceSilentSince = 0;
+      v.uttEndedAt = 0;
       v.lastUtt = 0;
       v.lastSpeakAt = 0;
       streamingRef.current = false;
       asrBusyRef.current = false;
+      asrWarned = false;
+      lastPartial = "";
       setInterim("");
       listeningRef.current = true;
       setListening(true);
       rafVad = setInterval(vadTick, CFG.vadTickMs);
-      pcmTimer = setInterval(asrSendPcm, 50);
+      pcmTimer = setInterval(asrSendPcm, 25); // flush mic PCM every 25 ms (was 50 — halves mic-side latency)
       const ok = await engine.startMic(); // AEC-enabled mic (inside the click)
       if (!ok) {
         disableMic();
