@@ -203,6 +203,15 @@ LLM_SYSTEM_PROMPT = (
     "मैसेज, टेंशन, सीन, चिल, स्मार्ट, थिंक, लर्न। "
     "टेक के छोटे नाम (HTML, CSS, API, GPU) देवनागरी अक्षर-नामों में लिखो जैसे: "
     "एचटीएमएल, सीएसएस, एपीआई, जीपीयू — ताकि उच्चारण एकदम साफ़ रहे। "
+    "ज़रूरी: यूज़र का बोला हुआ आप तक आवाज़-पहचान (ASR) के ज़रिए आता है, जो अक्सर "
+    "नाम और प्रॉपर नाउन ग़लत लिखता है। जवाब लिखने से पहले यूज़र के टेक्स्ट में "
+    "नामों को ध्यान से पढ़ो — अगर कोई शब्द असली चीज़/इंसान/किरदार/ब्रांड के नाम "
+    "से लगभग मिलता है (जैसे बोला-सुना में फ़र्क़ की वजह से), तो उसे असली सही "
+    "नाम से सुधार कर उसी के बारे में जवाब दो। अगर बातचीत की हिस्ट्री में वो "
+    "नाम/चीज़ पहले सही रूप में आ चुकी है, तो हिस्ट्री वाला सही नाम ही इस्तेमाल "
+    "करो — यूज़र की आख़िरी ग़लत स्पेलिंग कभी मत दोहराओ। यूज़र के सही किए नाम का "
+    "कोई ज़िक्र मत करो — सीधे सही नाम इस्तेमाल करो, जैसे कोई दोस्त सुनकर समझ "
+    "गया हो। "
     "टोन: एक दोस्त जैसा, आसान और नैचुरल — नकली जेन-ज़ी नकल मत बनो। कैज़ुअल "
     "शब्द (मतलब, यार, भाई, चिल, टेंशन, एकदम) केवल तब इस्तेमाल करो जब वो सच में "
     "फिट हों, बाकी वाक्य साफ़ सीधी बोलचाल की हिंदी में लिखो। "
@@ -725,6 +734,7 @@ def api_config():
         "asr_lang": ASR_LANG or "",
         "asr_device": ASR_DEVICE,
         "asr_final_beam": ASR_FINAL_BEAM,
+        "asr_initial_prompt": ASR_INITIAL_PROMPT or "",
         "asr_speculative": ASR_SPECULATIVE,
         "spec_chat": ASR_SPECULATIVE,  # the UI reads this key (client-side speculative-turn toggle)
         "speculative_ms": ASR_SPECULATIVE_MS,
@@ -1252,6 +1262,10 @@ ASR_PARTIAL_MIN_GAP = float(os.environ.get("VOICE_ASR_PARTIAL_GAP_SECONDS", "0.9
 # final before releasing the mic anyway.
 ASR_SPECULATIVE = os.environ.get("VOICE_ASR_SPECULATIVE", "1").strip().lower() not in ("0", "false", "no")
 ASR_SPECULATIVE_MS = int(os.environ.get("VOICE_SPECULATIVE_MS", "5000"))
+# Vocabulary hint passed to Whisper as initial_prompt: proper nouns / brand
+# names the ASR mangles ("नोबिता" heard as "Nakota"). Keep it SHORT (one
+# line); empty = off.
+ASR_INITIAL_PROMPT = os.environ.get("ASR_INITIAL_PROMPT", "").strip() or None
 
 # HF repo ids of the MLX-converted Whisper checkpoints per size. A full repo id
 # (containing "/") in ASR_MODEL is passed through untouched.
@@ -1332,6 +1346,8 @@ class _MlxAsr:
         }
         if ASR_LANG:
             kwargs["language"] = ASR_LANG
+        if ASR_INITIAL_PROMPT:
+            kwargs["initial_prompt"] = ASR_INITIAL_PROMPT
         try:
             res = self._transcribe(samples, path_or_hf_repo=self._repo, **kwargs)
         except TypeError:
@@ -1354,6 +1370,7 @@ class _FasterWhisperAsr:
         segs, _info = self._model.transcribe(
             samples, language=ASR_LANG, beam_size=beam,
             condition_on_previous_text=False, vad_filter=vad,
+            initial_prompt=ASR_INITIAL_PROMPT,
             no_repeat_ngram_size=max(0, ASR_NO_REPEAT_NGRAM),  # 0 disables (CTranslate2 convention)
         )
         return "".join(s.text for s in segs).strip()

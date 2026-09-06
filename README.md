@@ -112,6 +112,12 @@ whose RTF feels comfortable — that is your real quality/speed sweet spot.
 Every knob is documented in `.env.example` (chat windows, VAD, pauses, pacing,
 ASR cadence, …) and is served to the UI by `/api/config`.
 
+**Pronunciation of tech terms:** the LLM is instructed to write acronyms in
+Devanagari (एचटीएमएल, सीएसएस…); any Latin that still slips through is mapped
+by `HINGLISH_TO_DEVANAGARI` in `voice_api.py` (whole words first — html, css,
+markup, video, … — then letter NAMES so unknown acronyms spell out: vpn → वी
+पी एन). Extend the dict there when a term is mispronounced.
+
 **Known upstream issue:** OmniVoice leaks GPU memory across repeated
 `generate()` calls (`k2-fsa/OmniVoice#199`). This repo applies the upstream
 workaround — `torch.cuda.empty_cache()` around every call plus pulling outputs
