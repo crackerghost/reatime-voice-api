@@ -296,6 +296,11 @@ export default function App() {
   /* ---------- ASR readiness: server preloads Whisper at boot ---------- */
   const [asrReady, setAsrReady] = useState(false);
   const [asrReconnecting, setAsrReconnecting] = useState(false);
+  // Server rejected the last utterance (speaker-gate or noise blip) — show a
+  // transient chip so it's clear WHY nothing happened, then auto-dismiss.
+  const [asrRejected, setAsrRejected] = useState("");
+  const asrRejTimerRef = useRef(0);
+  useEffect(() => () => clearTimeout(asrRejTimerRef.current), []); // unmount cleanup
   useEffect(() => {
     let alive = true;
     let t = 0;
@@ -644,6 +649,20 @@ export default function App() {
           streamingRef.current = false;
           vadRef.current.streamingRefCur = false;
           asrBusyRef.current = true;
+          return;
+        }
+        if (m.type === "rejected") {
+          // Server dropped the utterance ("speaker" = voiceprint mismatch from
+          // the gate, "blip" = too short). Show why, clear any stale caption
+          // fallback so it can never fire a phantom turn, release the mic.
+          clearTimeout(asrRejTimerRef.current);
+          setAsrRejected(m.message || "blip");
+          asrRejTimerRef.current = setTimeout(() => setAsrRejected(""), 2500);
+          lastPartial = "";
+          asrBusyRef.current = false;
+          streamingRef.current = false;
+          vadRef.current.streamingRefCur = false;
+          setInterim("");
           return;
         }
         if (m.type === "partial") {
@@ -1070,6 +1089,20 @@ export default function App() {
                 <span className="max-w-lg truncate rounded-full bg-cyan-50/90 px-4 py-1.5 text-xs italic text-cyan-600 shadow-sm ring-1 ring-cyan-100/80">
                   “{interim}”
                 </span>
+              )}
+              {asrRejected && (
+                <button
+                  onClick={() => {
+                    clearTimeout(asrRejTimerRef.current);
+                    setAsrRejected("");
+                  }}
+                  className="rounded-full bg-amber-50/95 px-4 py-1.5 text-xs font-medium text-amber-700 shadow-sm ring-1 ring-amber-200/80 transition hover:bg-amber-100"
+                  title="यह बात आपकी आवाज़ नहीं लगी इसलिए नज़रअंदाज़ की गई — दबाकर हटाएँ"
+                >
+                  {asrRejected === "speaker"
+                    ? "आपकी आवाज़ नहीं लगी — नज़रअंदाज़ कर दिया ✓"
+                    : "बहुत छोटी आवाज़ — नज़रअंदाज़ कर दिया ✓"}
+                </button>
               )}
             </div>
           </div>

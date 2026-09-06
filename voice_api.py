@@ -1715,6 +1715,7 @@ async def ws_asr(websocket: WebSocket):
             buf = []; total = 0; new_since = 0.0
             if len(samples) < int(max(0.25, MIN_UTT_MS / 1000.0) * ASR_SR):
                 log.info("ASR utterance discarded (%s): %.2fs audio too short", reason, dur_s)
+                out_q.put(("rejected", "blip"))   # UI shows a dismiss chip
                 out_q.put(("final", ""))
                 return
             # Speaker-identity gate: is this the PRIMARY speaker (or someone
@@ -1726,6 +1727,7 @@ async def ws_asr(websocket: WebSocket):
                     "Speaker gate: utterance REJECTED (%s): sim=%.2f < %.2f (not the primary speaker)",
                     reason, sim, SPEAKER_SIM_MIN,
                 )
+                out_q.put(("rejected", "speaker"))  # UI shows a dismiss chip
                 out_q.put(("final", ""))
                 return
             if ASR_SPECULATIVE:
