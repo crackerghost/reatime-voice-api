@@ -111,8 +111,8 @@ export const engine = {
     // only use the Blob when the file is genuinely unavailable.
     const src =
       "class PcmTap extends AudioWorkletProcessor{\n" +
-      "constructor(opts){super();const outRate=(opts&&opts.processorOptions&&opts.processorOptions.outRate)||16000;this.step=outRate/sampleRate;this.phase=0;}\n" +
-      "process(inputs){const ch=inputs[0]&&inputs[0][0];if(!ch||ch.length===0)return true;const out=[];for(let i=0;i<ch.length;i++){this.phase+=this.step;if(this.phase>=1){this.phase-=1;out.push(ch[i]);}}if(out.length)this.port.postMessage(new Float32Array(out));return true;}\n" +
+      "constructor(opts){super();const outRate=(opts&&opts.processorOptions&&opts.processorOptions.outRate)||16000;this.step=outRate/sampleRate;this.phase=0;this.acc=0;this.accN=0;}\n" +
+      "process(inputs){const ch=inputs[0]&&inputs[0][0];if(!ch||ch.length===0)return true;const out=[];for(let i=0;i<ch.length;i++){this.acc+=ch[i];this.accN+=1;this.phase+=this.step;if(this.phase>=1){this.phase-=1;out.push(this.acc/Math.max(1,this.accN));this.acc=0;this.accN=0;}}if(out.length)this.port.postMessage(new Float32Array(out));return true;}\n" +
       "}\nregisterProcessor(\"pcm-tap\",PcmTap);";
 
     const fileUrl = `${location.origin}/pcm-tap.js`;
