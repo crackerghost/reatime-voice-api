@@ -554,7 +554,20 @@ export default function App() {
       if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
     };
     const asrSendPcm = () => {
-      if (pcmLen && streamingRef.current && asrOpenRef.current && !asrBusyRef.current) {
+      // Server-VAD mode makes the browser a dumb continuous streamer: flush
+      // whenever the socket is open, EVEN before Silero opens an utterance.
+      // streamingRef only turns true on the server's vad_start, which cannot
+      // arrive until the server has HEARD audio — gating the flush on it here
+      // deadlocks the whole path (no PCM sent -> Silero never opens -> no
+      // vad_start -> no transcription at all).
+      const canStream = streamingRef.current || serverMode;
+      // During a decode (asrBusy) the server worker is busy but still QUEUES
+      // incoming PCM — in server mode keep flushing so the first words of the
+      // user's next sentence are never dropped (the server's Silero pre-roll
+      // covers the seam). Only the legacy client-VAD path pauses while a
+      // final is on its way.
+      const notBusy = serverMode || !asrBusyRef.current;
+      if (pcmLen && canStream && asrOpenRef.current && notBusy) {
         const joined = new Float32Array(pcmLen);
         let o = 0;
         for (const p of pcmBuf) {
@@ -748,17 +761,23 @@ export default function App() {
       // silence tail after it, only drop while no user utterance is open —
       // once the utterance IS open the user is definitely talking, and
       // cutting the tail there would swallow their first words.
+      // In server-VAD mode the tail is the SERVER's job (assistant gate + its
+      // own pre-roll), and streamingRef stays false until Silero opens — so
+      // gating the tail on it here would swallow the user's first ~700ms of
+      // speech right after our reply. Only drop while OUR audio is actually
+      // playing; the server decides when the echo tail is safe.
       const echo = speakingRef.current ||
-        (!streamingRef.current && now - v.lastSpeakAt <= CFG.speakTailMs);
+        (!serverMode && !streamingRef.current && now - v.lastSpeakAt <= CFG.speakTailMs);
       if (echo) {
         preRollClear(); // never replay our own voice as ASR input
         return;
       }
       if (serverMode) {
         // Server VAD is the turn-taker: stream continuously (the server keeps
-        // its own pre-roll and gates opens while our TTS plays). Decode gaps
-        // (asrBusy) just drop frames — the server pre-roll covers the seams.
-        if (!asrOpenRef.current || asrBusyRef.current) return;
+        // its own pre-roll and gates opens while our TTS plays). Do NOT drop
+        // during decode gaps (asrBusy): the server queues the PCM anyway, so
+        // dropping here would only lose the first words of the next sentence.
+        if (!asrOpenRef.current) return;
         pcmBuf.push(arr);
         pcmLen += arr.length;
         return;

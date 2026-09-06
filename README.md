@@ -195,7 +195,8 @@ Knobs (see `.env.example`):
 
 ```bash
 VOICE_SPEAKER_GATE=auto       # auto = on when resemblyzer + ref clip exist
-VOICE_SPEAKER_SIM_MIN=0.62    # cosine threshold; raise for stricter, lower if your mic rejects you
+VOICE_SPEAKER_SIM_MIN=0.45    # cosine threshold; raise for stricter, lower (0.4) if your mic rejects you
+                               # (live voice via Chrome AEC/NS scores ~0.49-0.55 vs the clean ref clip)
 ```
 
 Kaggle notebooks give a free NVIDIA GPU (T4/P100, 16 GB) — great for

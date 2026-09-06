@@ -737,6 +737,7 @@ def api_config():
         "asr_final_beam": ASR_FINAL_BEAM,
         "asr_initial_prompt": ASR_INITIAL_PROMPT or "",
         "asr_vad_mode": VAD_BACKEND,  # "server" = Silero VAD authority; client opts in per connection
+        "silero_silence_ms": SILERO_SILENCE_MS,  # pause length that closes an utterance
         "speaker_gate": bool(_get_speaker_ref() is not None and SPEAKER_GATE not in ("0", "off")),
         "speaker_sim_min": SPEAKER_SIM_MIN,
         "asr_speculative": ASR_SPECULATIVE,
@@ -1290,7 +1291,11 @@ VAD_MODE = (os.environ.get("ASR_VAD_MODE", "auto").strip().lower() or "auto")
 SILERO_ON_THRESH = float(os.environ.get("VOICE_SILERO_ON", "0.55"))     # p(voice) to OPEN (high = noise-proof)
 SILERO_HOLD_THRESH = float(os.environ.get("VOICE_SILERO_HOLD", "0.35"))  # p(voice) to STAY open (hysteresis)
 SILERO_ON_MS = int(os.environ.get("VOICE_SILERO_ON_MS", "150"))          # speech this long opens the turn
-SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "700"))  # silence this long closes it
+# Silence this long closes it. 1200ms (not 700ms) on purpose: humans pause
+# 700-1100ms while thinking mid-sentence, and a shorter window split one
+# sentence into two turns — the first fragment got submitted alone ("short
+# text, text skipped") and the rest barge-in'd as a second turn.
+SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "1200"))
 SERVER_PRE_ROLL_S = float(os.environ.get("VOICE_SERVER_PRE_ROLL_S", "0.4"))  # kept before the open decision
 MIN_UTT_MS = int(os.environ.get("VOICE_MIN_UTT_MS", "300"))              # shorter utterances are discarded as blips
 
@@ -1380,7 +1385,12 @@ def _get_silero() -> _Silero:
 #                        0/off = disable entirely
 #   VOICE_SPEAKER_SIM_MIN  cosine threshold (default 0.62); raise for stricter
 SPEAKER_GATE = (os.environ.get("VOICE_SPEAKER_GATE", "auto").strip().lower() or "auto")
-SPEAKER_SIM_MIN = float(os.environ.get("VOICE_SPEAKER_SIM_MIN", "0.62"))
+# 0.45, not 0.62: the reference clip is a clean recording, but the LIVE voice
+# arrives through Chrome's AEC/NS/AGC, and that channel difference alone drops
+# the SAME speaker's cosine similarity to ~0.49-0.55 (observed on this setup).
+# 0.62 rejected the user's own voice on every utterance; 0.45 still separates
+# a clearly-different voice (phone/video/TV ~0.30-0.45) from the primary user.
+SPEAKER_SIM_MIN = float(os.environ.get("VOICE_SPEAKER_SIM_MIN", "0.45"))
 _speaker_emb: np.ndarray | None = None
 _speaker_enc = None
 _speaker_lock = threading.Lock()
