@@ -507,6 +507,11 @@ export default function App() {
     let asrWarned = false;
     let pcmBuf = []; // Float32Array pieces waiting to be flushed to /ws/asr
     let pcmLen = 0;
+    // Silence-tail hold: after "early_end" we STOP streaming mic PCM so the
+    // server's early-decode buffer stays frozen (exact reuse at "end"). Frames
+    // arriving during the tail are parked here and restored if speech resumes.
+    let tailHold = false;
+    let tailBuf = [];
     let lastPartial = ""; // most recent live caption (fallback if final is empty)
     let specSentFor = ""; // text already submitted speculatively (guards double-send)
     // Pre-roll ring buffer: ALWAYS keep the last ~350 ms of non-echo mic PCM.
@@ -699,6 +704,10 @@ export default function App() {
         return;
       }
       preRollPush(arr); // always keep the rolling pre-roll (first words)
+      if (tailHold) {
+        tailBuf.push(arr); // park tail frames; restored if speech resumes
+        return;
+      }
       if (!streamingRef.current) return;
       pcmBuf.push(arr);
       pcmLen += arr.length;
@@ -827,12 +836,21 @@ export default function App() {
           if (v.voiceSilentSince) {
             v.voiceSilentSince = 0; // resumed within the silence tail
             asrSendJson({ type: "resume" }); // void any early pre-decode
+            if (tailHold) {
+              tailHold = false; // resume streaming; restore parked frames first
+              pcmBuf.unshift(...tailBuf);
+              pcmLen += tailBuf.reduce((n, p) => n + p.length, 0);
+              tailBuf = [];
+            }
           }
         } else {
           if (!v.voiceSilentSince) {
             v.voiceSilentSince = now;
             // silence just started -> server pre-decodes NOW while this tail
-            // counts down; the "end" below then reuses that decode instantly
+            // counts down; the "end" below then reuses that decode instantly.
+            // Stop streaming PCM so the server's decode buffer stays frozen.
+            tailHold = true;
+            tailBuf = [];
             asrSendJson({ type: "early_end" });
           }
           else if (now - v.voiceSilentSince > CFG.autoSendMs) {
@@ -844,6 +862,8 @@ export default function App() {
             streamingRef.current = false;
             v.uttEndedAt = now;
             asrBusyRef.current = true;
+            tailHold = false; // discard parked tail frames (post-speech silence)
+            tailBuf = [];
             asrSendJson({ type: "end" });
             // Watchdog: if neither a speculative nor the final transcript
             // arrives (lost frame/drop), don't leave the mic dead — release
@@ -925,6 +945,8 @@ export default function App() {
       streamingRef.current = false;
       pcmBuf = [];
       pcmLen = 0;
+      tailHold = false;
+      tailBuf = [];
       engine.stopTap();
       engine.stopMic();
       setInterim("");
