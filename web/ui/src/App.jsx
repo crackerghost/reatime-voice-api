@@ -1101,8 +1101,6 @@ export default function App() {
                 >
                   {asrRejected === "speaker"
                     ? "आपकी आवाज़ नहीं लगी — नज़रअंदाज़ कर दिया ✓"
-                    : asrRejected === "impulse"
-                    ? "शोर लगा, आवाज़ नहीं — नज़रअंदाज़ कर दिया ✓"
                     : "बहुत छोटी आवाज़ — नज़रअंदाज़ कर दिया ✓"}
                 </button>
               )}

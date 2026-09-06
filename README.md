@@ -198,17 +198,6 @@ VOICE_SPEAKER_GATE=auto       # auto = on when resemblyzer + ref clip exist
 VOICE_SPEAKER_SIM_MIN=0.62    # cosine threshold; raise for stricter, lower if your mic rejects you
 ```
 
-### Impulse-noise gate (finger snaps, claps, knocks)
-
-Impulses are Silero's blind spot: a loud snap can hold `p(speech)` above the
-open threshold for the 150 ms window, yet contains almost no real voiced
-audio — and Whisper then *hallucinates* a phrase on it. Every open utterance
-therefore also accumulates **voiced milliseconds** (frames where Silero
-confirms speech). Utterances below `VOICE_MIN_VOICED_MS` (default 160 ms —
-real words are 200 ms+) are discarded as `rejected: impulse` before any
-decode, and the live-caption timer is gated on the same measure so Whisper
-never sees a snap in the first place.
-
 Kaggle notebooks give a free NVIDIA GPU (T4/P100, 16 GB) — great for
 benchmarking the CUDA path. Kaggle has no microphone or browser, so test
 **TTS generation + speed** there (not the live mic chat).
