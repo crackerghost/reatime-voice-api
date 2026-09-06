@@ -134,6 +134,13 @@ to CPU — so long-running servers stay flat.
   Linux GPU with no edits. `ASR_BACKEND=mlx` or `=faster-whisper` forces one.
   Note mlx-whisper has no beam decoder; `ASR_FINAL_BEAM` applies to the
   faster-whisper backend only.
+- **Fastest + accurate on Kaggle / NVIDIA (recommended .env):** `ASR_BACKEND=faster-whisper`,
+  `ASR_MODEL=large-v3-turbo`, `ASR_DEVICE=cuda`, `ASR_COMPUTE=float16`, `ASR_FINAL_BEAM=5`.
+  large-v3-turbo is ~10-15x realtime on a T4 with the best realtime Hindi/Hinglish
+  accuracy (large-v3 is ~4x slower for near-zero gain; int8_float16 is ~20% faster
+  with a slight accuracy trade). OmniVoice fp16 (~1.3 GB) + turbo fp16 (~1.6 GB)
+  fit Kaggle's 16 GB GPUs with room to spare. `auto` already resolves to exactly
+  this on Linux+GPU — pinning just removes ambiguity.
 - Want true multilingual STT? Set `ASR_LANG=` (empty = auto-detect per
   utterance). Auto-detect is great for English but routinely mislabels SHORT
   Hindi clips (as es/ru/ur/si) — that is why Hindi seemed broken.

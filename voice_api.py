@@ -444,7 +444,7 @@ def _clause_units(sent: str) -> list[str]:
     return [p for p in final if p]
 
 
-def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt):
+def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt, t0=None):
     """3-thread pipeline: LLM producer -> text/windowing -> audio synth.
 
     Pipeline (all three run concurrently, so nothing serializes):
@@ -470,6 +470,10 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     last_user = messages[-1]["content"] if messages else ""
     is_greeting = bool(GREETING_RE.search(last_user))
     sent_count = 0
+    if t0 is None:
+        t0 = time.perf_counter()  # request start (set by the WS handler normally)
+    # latency/RTF accounting, filled by audio_synth, reported at the end
+    timing = {"first_audio": 0.0, "windows": 0, "total_gen": 0.0, "total_dur": 0.0}
 
     # ---- producer: read the LLM stream continuously ---------------------
     sent_q: queue.Queue = queue.Queue()
@@ -501,10 +505,28 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                     return
                 if stop_evt is not None and stop_evt.is_set():
                     continue  # drop windows queued after an interrupt
+                t_gen = time.perf_counter()
                 w = _generate(state.ov_model, state.voice_prompt, win["text"],
                               win["steps"], _pick_speed(win["text"], speed),
                               TEMPERATURE)
+                gen_s = time.perf_counter() - t_gen
                 w = _insert_pauses(w, SAMPLE_RATE, win["text"])
+                dur_s = w.shape[-1] / SAMPLE_RATE
+                rtf = gen_s / dur_s if dur_s > 0 else 0.0
+                timing["windows"] += 1
+                timing["total_gen"] += gen_s
+                timing["total_dur"] += dur_s
+                if timing["first_audio"] == 0.0:
+                    timing["first_audio"] = time.perf_counter() - t0
+                    log.info(
+                        "TTS window #1: %d ch, step %d -> %.2fs audio in %.2fs (RTF %.2f) | first audio %.2fs after request",
+                        len(win["text"]), win["steps"], dur_s, gen_s, rtf, timing["first_audio"],
+                    )
+                else:
+                    log.info(
+                        "TTS window #%d: %d ch, step %d -> %.2fs audio in %.2fs (RTF %.2f)",
+                        timing["windows"], len(win["text"]), win["steps"], dur_s, gen_s, rtf,
+                    )
                 out_q.put(("audio", _wav_bytes(w, SAMPLE_RATE)))
         except Exception as e:  # noqa: BLE001 — reported by the main thread
             llm_error.append(f"audio: {type(e).__name__}: {e}")
@@ -582,7 +604,12 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
         audio_done.wait(timeout=180)
         if llm_error:
             raise RuntimeError(llm_error[0])
-        out_q.put(("done", None))
+        rtf = timing["total_gen"] / timing["total_dur"] if timing["total_dur"] else 0.0
+        log.info(
+            "TTS total: %d window(s), %.2fs audio in %.2fs gen (avg RTF %.2f) | first audio %.2fs after request",
+            timing["windows"], timing["total_dur"], timing["total_gen"], rtf, timing["first_audio"],
+        )
+        out_q.put(("done", {"first_audio": round(timing["first_audio"], 2), "rtf": round(rtf, 2)}))
     except Exception as e:  # noqa: BLE001 — report to the client
         log.exception("WS chat synthesis failed")
         out_q.put(("error", f"{type(e).__name__}: {e}"))
@@ -902,7 +929,7 @@ def _generate(model, voice_prompt, text, num_step, speed, temperature):
     return segs[0] if len(segs) == 1 else np.concatenate(segs)
 
 
-def _stream_batches(state, text, num_step, speed, stop_evt):
+def _stream_batches(state, text, num_step, speed, stop_evt, t0=None):
     """Yield playable WAV bytes per generated sentence chunk, in order.
 
     The worker thread (see _synth_worker) pulls from this generator as fast as
@@ -921,19 +948,44 @@ def _stream_batches(state, text, num_step, speed, stop_evt):
     if not batches:
         return
     first = True
+    n_win, total_gen, total_dur = 0, 0.0, 0.0
     for gen_text in batches:
         if stop_evt is not None and stop_evt.is_set():
             return
         steps = min(num_step, FIRST_WINDOW_STEP) if first else num_step
-        first = False
+        t_gen = time.perf_counter()
         w = _generate(state.ov_model, state.voice_prompt, gen_text, steps, _pick_speed(gen_text, speed), TEMPERATURE)
+        gen_s = time.perf_counter() - t_gen
         w = _insert_pauses(w, SAMPLE_RATE, gen_text)
+        dur_s = w.shape[-1] / SAMPLE_RATE
+        n_win += 1
+        total_gen += gen_s
+        total_dur += dur_s
+        rtf = gen_s / dur_s if dur_s > 0 else 0.0
+        if first:
+            first_audio = (time.perf_counter() - t0) if t0 else 0.0
+            log.info(
+                "TTS window #1: %d ch, step %d -> %.2fs audio in %.2fs (RTF %.2f)%s",
+                len(gen_text), steps, dur_s, gen_s, rtf,
+                f" | first audio {first_audio:.2f}s after request" if t0 else "",
+            )
+        else:
+            log.info(
+                "TTS window #%d: %d ch, step %d -> %.2fs audio in %.2fs (RTF %.2f)",
+                n_win, len(gen_text), steps, dur_s, gen_s, rtf,
+            )
+        first = False
         yield _wav_bytes(w, SAMPLE_RATE)
+    avg_rtf = total_gen / total_dur if total_dur else 0.0
+    log.info(
+        "TTS total: %d window(s), %.2fs audio in %.2fs gen (avg RTF %.2f)",
+        n_win, total_dur, total_gen, avg_rtf,
+    )
 
 
-def _synth_worker(state, text, num_step, speed, out_q, stop_evt):
+def _synth_worker(state, text, num_step, speed, out_q, stop_evt, t0=None):
     try:
-        for chunk in _stream_batches(state, text, num_step, speed, stop_evt):
+        for chunk in _stream_batches(state, text, num_step, speed, stop_evt, t0):
             out_q.put(("audio", chunk))
         out_q.put(("done", None))
     except Exception as e:  # noqa: BLE001 — report to the client
@@ -1023,7 +1075,7 @@ async def ws_tts(websocket: WebSocket):
                     out_q: queue.Queue = queue.Queue()
                     threading.Thread(
                         target=_chat_worker,
-                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt),
+                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start),
                         daemon=True,
                     ).start()
 
@@ -1037,6 +1089,8 @@ async def ws_tts(websocket: WebSocket):
                             await websocket.send_text(json.dumps({"type": "text", "text": payload}))
                         elif kind == "audio":
                             frames += 1
+                            if frames == 1:
+                                log.info("WS chat first audio frame sent %.2fs after request", time.perf_counter() - start)
                             try:
                                 await websocket.send_bytes(payload)
                             except Exception:
@@ -1044,8 +1098,15 @@ async def ws_tts(websocket: WebSocket):
                                 return
                         elif kind == "done":
                             elapsed = round(time.perf_counter() - start, 2)
-                            log.info("WS chat done: %d frame(s) in %.2fs", frames, elapsed)
-                            await websocket.send_text(json.dumps({"type": "done", "frames": frames, "elapsed": elapsed}))
+                            extra = payload if isinstance(payload, dict) else {}
+                            log.info(
+                                "WS chat done: %d frame(s) in %.2fs | first audio %.2fs | TTS RTF %.2f",
+                                frames, elapsed, extra.get("first_audio", 0), extra.get("rtf", 0),
+                            )
+                            await websocket.send_text(json.dumps({
+                                "type": "done", "frames": frames, "elapsed": elapsed,
+                                "first_audio": extra.get("first_audio", 0), "rtf": extra.get("rtf", 0),
+                            }))
                             break
                         else:  # error
                             log.error("WS chat error: %s", payload)
@@ -1074,7 +1135,7 @@ async def ws_tts(websocket: WebSocket):
                 out_q: queue.Queue = queue.Queue()
                 threading.Thread(
                     target=_synth_worker,
-                    args=(state, text, num_step, speed, out_q, stop_evt),
+                    args=(state, text, num_step, speed, out_q, stop_evt, start),
                     daemon=True,
                 ).start()
 
@@ -1086,6 +1147,8 @@ async def ws_tts(websocket: WebSocket):
                     kind, payload = await asyncio.get_running_loop().run_in_executor(None, out_q.get)
                     if kind == "audio":
                         frames += 1
+                        if frames == 1:
+                            log.info("WS synth first audio frame sent %.2fs after request", time.perf_counter() - start)
                         try:
                             await websocket.send_bytes(payload)
                         except Exception:

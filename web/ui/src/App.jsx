@@ -91,6 +91,7 @@ export default function App() {
   const dropRef = useRef(false);
   const activeRef = useRef(false); // a reply is being streamed from the server
   const framesRef = useRef(0);
+  const turnStartRef = useRef(0); // browser-side: when the current turn was submitted (first-audio stopwatch)
   const openAssistantId = useRef(null);
   const assistantTextRef = useRef("");
   const asrWsRef = useRef(null); // /ws/asr connection (streaming faster-whisper)
@@ -266,6 +267,7 @@ export default function App() {
       // dropRef stays true (set by hardStop) until the server's "start" for
       // this reply — any stale frames of the aborted reply are ignored.
       framesRef.current = 0;
+      turnStartRef.current = performance.now(); // browser-measured first-audio latency
       activeRef.current = false;
       openAssistantId.current = null;
       assistantTextRef.current = "";
@@ -408,6 +410,9 @@ export default function App() {
               activeRef.current = false;
               return;
             }
+            console.info(
+              `[voice] reply done: ${m.frames} frame(s) | server total ${m.elapsed}s | first audio ${m.first_audio ?? "?"}s | TTS RTF ${m.rtf ?? "?"}`,
+            );
             // attach the server-measured response time to the finished bubble
             const doneId = openAssistantId.current;
             if (doneId && m.elapsed != null) {
@@ -436,6 +441,11 @@ export default function App() {
         } else {
           if (dropRef.current) return; // stale audio frame of an aborted reply
           framesRef.current += 1;
+          if (framesRef.current === 1 && turnStartRef.current) {
+            console.info(
+              `[voice] first audio received ${(performance.now() - turnStartRef.current).toFixed(0)}ms after submit (browser-measured, incl. network)`,
+            );
+          }
           pendingRef.current.push(new Blob([ev.data], { type: "audio/wav" }));
           if (!speakingRef.current) {
             speakingRef.current = true;
