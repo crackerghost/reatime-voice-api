@@ -1330,6 +1330,22 @@ class _Silero:
         with torch.no_grad():
             return float(self.model(torch.from_numpy(frame512), 16000).item())
 
+    def reset(self) -> None:
+        """Clear the internal LSTM hidden state (JIT model keeps _h/_c).
+
+        Called when an utterance opens so state from the previous turn can't
+        bleed into the new one. Best-effort across silero-vad versions: if the
+        attributes move, skipping the reset must never crash the worker.
+        """
+        import torch
+        for attr in ("_h", "_c"):
+            try:
+                t = getattr(self.model, attr, None)
+                if isinstance(t, torch.Tensor):
+                    setattr(self.model, attr, torch.zeros_like(t))
+            except Exception:  # noqa: BLE001 — hygiene only, never fatal
+                pass
+
 
 _silero: _Silero | None = None
 _silero_lock = threading.Lock()
