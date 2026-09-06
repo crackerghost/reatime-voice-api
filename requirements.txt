@@ -29,6 +29,11 @@ scipy
 noisereduce
 
 # --- Voice-input ASR backend (/ws/asr streaming transcription) ---
+# Silero VAD: server-side neural speech/non-speech classifier — the noise-proof
+# turn-taker (fan/door/keyboard noise can no longer open phantom utterances).
+# `ASR_VAD_MODE=auto` uses it when installed, else the browser energy VAD.
+silero-vad>=5.0
+onnxruntime
 # faster-whisper runs on every platform (CUDA on Kaggle/NVIDIA GPUs, CPU
 # elsewhere). mlx-whisper is the Apple Silicon Neural-Engine backend (~10x
 # faster than CPU Whisper on M-series) and is installed ONLY on macOS arm64 —

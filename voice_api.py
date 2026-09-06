@@ -24,6 +24,7 @@ import re
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -735,6 +736,7 @@ def api_config():
         "asr_device": ASR_DEVICE,
         "asr_final_beam": ASR_FINAL_BEAM,
         "asr_initial_prompt": ASR_INITIAL_PROMPT or "",
+        "asr_vad_mode": VAD_BACKEND,  # "server" = Silero VAD authority; client opts in per connection
         "asr_speculative": ASR_SPECULATIVE,
         "spec_chat": ASR_SPECULATIVE,  # the UI reads this key (client-side speculative-turn toggle)
         "speculative_ms": ASR_SPECULATIVE_MS,
@@ -1267,6 +1269,78 @@ ASR_SPECULATIVE_MS = int(os.environ.get("VOICE_SPECULATIVE_MS", "5000"))
 # line); empty = off.
 ASR_INITIAL_PROMPT = os.environ.get("ASR_INITIAL_PROMPT", "").strip() or None
 
+# ---------- Server-side neural VAD (Silero) — the noise-immune turn-taker ----------
+#
+# The browser's energy VAD cannot tell VOICE from NOISE — a fan, door slam or
+# keyboard burst crosses the loudness gate, opens an utterance, and Whisper
+# transcribes garbage into a phantom reply. Silero is a tiny neural net that
+# classifies speech vs non-speech per 32 ms frame, so noise never opens a turn.
+#
+# Architecture (what LiveKit/Pipecat-class stacks do):
+#   browser  -> streams AEC mic PCM continuously (a thin dumb streamer)
+#   server   -> Silero decides open/close; pre-roll ring keeps first words;
+#               utterance close triggers the decode pipeline (early decode
+#               overlapped while silence is being confirmed, as before)
+#   legacy   -> ASR_VAD_MODE=client keeps the old browser-energy behavior
+#
+# "auto": Silero if the package is installed, else client VAD (graceful).
+VAD_MODE = (os.environ.get("ASR_VAD_MODE", "auto").strip().lower() or "auto")
+SILERO_ON_THRESH = float(os.environ.get("VOICE_SILERO_ON", "0.55"))     # p(voice) to OPEN (high = noise-proof)
+SILERO_HOLD_THRESH = float(os.environ.get("VOICE_SILERO_HOLD", "0.35"))  # p(voice) to STAY open (hysteresis)
+SILERO_ON_MS = int(os.environ.get("VOICE_SILERO_ON_MS", "150"))          # speech this long opens the turn
+SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "700"))  # silence this long closes it
+SERVER_PRE_ROLL_S = float(os.environ.get("VOICE_SERVER_PRE_ROLL_S", "0.4"))  # kept before the open decision
+MIN_UTT_MS = int(os.environ.get("VOICE_MIN_UTT_MS", "300"))              # shorter utterances are discarded as blips
+
+
+def _pick_vad_mode() -> str:
+    if VAD_MODE == "server":
+        return "server"
+    if VAD_MODE in ("client", "browser"):
+        return "client"
+    try:
+        import silero_vad  # noqa: F401
+        return "server"
+    except ImportError:
+        return "client"
+
+
+VAD_BACKEND = _pick_vad_mode()  # resolved once at boot; logged + served via /api/config
+
+
+class _Silero:
+    """Lazy-loaded Silero VAD (ONNX/JIT, CPU) shared by all /ws/asr workers.
+
+    The model is stateful per stream: each worker calls reset() when an
+    utterance opens so hidden state never bleeds across turns. Feed exactly
+    512-sample float32 chunks @16 kHz; returns p(speech) in [0, 1].
+    """
+
+    def __init__(self):
+        import warnings
+        from silero_vad import load_silero_vad
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.model = load_silero_vad()
+
+    def p(self, frame512: np.ndarray) -> float:
+        import torch
+        with torch.no_grad():
+            return float(self.model(torch.from_numpy(frame512), 16000).item())
+
+
+_silero: _Silero | None = None
+_silero_lock = threading.Lock()
+
+
+def _get_silero() -> _Silero:
+    global _silero
+    if _silero is None:
+        with _silero_lock:
+            if _silero is None:
+                _silero = _Silero()
+    return _silero
+
 # HF repo ids of the MLX-converted Whisper checkpoints per size. A full repo id
 # (containing "/") in ASR_MODEL is passed through untouched.
 # NOTE: the turbo checkpoint on HF is "whisper-large-v3-turbo" (no -mlx suffix) —
@@ -1473,6 +1547,10 @@ async def ws_asr(websocket: WebSocket):
     client -> {"type": "cancel"}            discard the current utterance
     client -> {"type": "early_end"}         silence started: pre-decode while the end-of-speech tail counts down
     client -> {"type": "resume"}            user kept talking: discard the early decode and continue
+    client -> {"type": "mode", "vad": "server"}   opt into server-side Silero VAD (client becomes a dumb streamer)
+    client -> {"type": "assistant", "active": true|false}  our TTS is playing (gate server VAD opens)
+    server -> {"type": "vad_start"}         Silero opened an utterance (client mirrors state / may barge)
+    server -> {"type": "vad_end"}           Silero closed it (then speculative/final follow)
     client -> <binary>                        float32 mono PCM @ 16 kHz while talking
     server -> {"type": "partial", "text"}   live caption (throttled by new-audio / gap)
     server -> {"type": "speculative", "text"}  fast greedy transcript at "end" (if enabled)
@@ -1504,6 +1582,15 @@ async def ws_asr(websocket: WebSocket):
                         except Exception:
                             pass
                         continue
+                    if mtype == "mode":
+                        # client opts into server-side Silero VAD per connection
+                        want = str((msg or {}).get("vad", "")).strip().lower()
+                        ctrl_q.put("__mode_server__" if want == "server" else "__mode_client__")
+                        continue
+                    if mtype == "assistant":
+                        a = bool((msg or {}).get("active"))
+                        ctrl_q.put("__assistant_on__" if a else "__assistant_off__")
+                        continue
                     ctrl_q.put(mtype or "__close__" if mtype in ("start", "end", "cancel", "early_end", "resume") else "__noop__")
         except Exception:
             ctrl_q.put("__close__")
@@ -1515,9 +1602,60 @@ async def ws_asr(websocket: WebSocket):
         new_since = 0.0      # seconds of audio since the last partial run
         last_partial = 0.0   # monotonic time of the last partial run
         open_utt = False
-        early = False        # early_end seen: speculative decode ran during the silence tail
-        held = None          # that pre-decoded transcript (reused at "end" if no new audio)
-        total_at_early = 0   # buffer size when early_end arrived (reuse check)
+        early = False        # early decode ran during silence confirmation
+        held = None          # that pre-decoded transcript (reused at finish)
+        total_at_early = 0   # buffer size when the early decode ran (reuse check)
+        # --- server-side Silero VAD state (used when server_mode is on) ---
+        server_mode = False  # flipped by the client's {"type":"mode","vad":"server"}
+        vad = None           # lazily created _Silero for this connection
+        speech_run = 0.0     # ms of consecutive speech (open decision)
+        silence_run = 0.0    # ms of consecutive silence (close decision)
+        pre_roll: deque = deque(maxlen=int(SERVER_PRE_ROLL_S * ASR_SR / 512))
+        pending512 = np.zeros(0, dtype=np.float32)
+        assistant_active = False  # our TTS is playing: server VAD must not open
+
+        def finish_utterance(reason: str):
+            """Close the open utterance and run the decode pipeline.
+
+            Shared by the legacy client-VAD path ('end') and the server-VAD
+            path (Silero silence timeout) so both get: early-decode reuse,
+            speculative greedy, and the authoritative beam final.
+            """
+            nonlocal open_utt, early, held, total_at_early, buf, total, new_since
+            open_utt = False
+            samples = np.concatenate(buf) if total else np.zeros(0, dtype=np.float32)
+            dur_s = total / ASR_SR
+            reused = early and held is not None and 0 <= total - total_at_early <= int(0.05 * ASR_SR)
+            held_text = held or ""
+            early = False; held = None; total_at_early = 0
+            buf = []; total = 0; new_since = 0.0
+            if len(samples) < int(max(0.25, MIN_UTT_MS / 1000.0) * ASR_SR):
+                log.info("ASR utterance discarded (%s): %.2fs audio too short", reason, dur_s)
+                out_q.put(("final", ""))
+                return
+            if ASR_SPECULATIVE:
+                if reused:
+                    spec = held_text
+                    log.info("ASR greedy: reused early decode (0.00s on critical path)")
+                else:
+                    try:
+                        t = time.perf_counter()
+                        spec = _whisper_text(samples)
+                        log.info("ASR greedy: %.2fs for %.2fs audio", time.perf_counter() - t, dur_s)
+                    except Exception:  # noqa: BLE001 — greedy is best-effort
+                        spec = ""
+                if spec:
+                    out_q.put(("speculative", spec))
+            try:
+                t = time.perf_counter()
+                final = _whisper_text(samples, beam=ASR_FINAL_BEAM, vad=True)
+                log.info("ASR beam: %.2fs for %.2fs audio (%s)", time.perf_counter() - t, dur_s, reason)
+            except Exception as e:  # noqa: BLE001 — report; never kill the worker
+                log.exception("ASR final decode failed")
+                out_q.put(("error", f"ASR decode failed: {type(e).__name__}: {e}"))
+                return
+            out_q.put(("final", final))
+
         while not stop_evt.is_set():
             try:
                 ctl = ctrl_q.get(timeout=0.05)
@@ -1529,12 +1667,76 @@ async def ws_asr(websocket: WebSocket):
                     arr = pcm_q.get_nowait()
                 except queue.Empty:
                     break
+                if server_mode:
+                    # Buffer to 512-sample frames for Silero; the VAD decides
+                    # whether audio feeds the utterance buffer or the pre-roll.
+                    pending512 = np.concatenate([pending512, arr])
+                    while pending512.size >= 512:
+                        frame, pending512 = pending512[:512], pending512[512:]
+                        if vad is None:
+                            try:
+                                vad = _get_silero()
+                            except Exception as e:  # noqa: BLE001 — fall back to client VAD
+                                log.error("Silero unavailable (%s) — falling back to client VAD", e)
+                                server_mode = False
+                                break
+                        if open_utt:
+                            buf.append(frame)
+                            total += len(frame)
+                            new_since += len(frame) / ASR_SR
+                        p_voice = vad.p(frame)
+                        if p_voice >= SILERO_ON_THRESH:
+                            speech_run += 32.0; silence_run = 0.0
+                        elif p_voice < SILERO_HOLD_THRESH:
+                            speech_run = 0.0
+                            if open_utt:
+                                silence_run += 32.0
+                        else:  # hysteresis band: keep current state, no counters
+                            if open_utt:
+                                silence_run = 0.0
+                        if not open_utt:
+                            if speech_run >= SILERO_ON_MS:
+                                if assistant_active:
+                                    speech_run = 0.0  # gated: our TTS is playing
+                                    continue
+                                # OPEN: replay pre-roll so the first words (heard
+                                # before the decision) are never lost
+                                buf.extend(pre_roll)
+                                total += sum(len(f) for f in pre_roll)
+                                pre_roll.clear()
+                                open_utt = True
+                                speech_run = 0.0; silence_run = 0.0
+                                last_partial = time.monotonic()
+                                vad.reset()
+                                out_q.put(("vad_start", ""))
+                                log.info("Server VAD: utterance OPENED")
+                            else:
+                                pre_roll.append(frame)
+                        elif silence_run >= SILERO_SILENCE_MS:
+                            log.info("Server VAD: utterance CLOSING after %.0fms silence", silence_run)
+                            silence_run = 0.0
+                            out_q.put(("vad_end", ""))
+                            finish_utterance("silence")
+                    continue
                 if open_utt:
                     buf.append(arr)
                     total += len(arr)
                     new_since += len(arr) / ASR_SR
             if ctl == "__close__":
                 return
+            if ctl == "__mode_server__":
+                server_mode = True
+                log.info("/ws/asr: server-side Silero VAD engaged for this connection")
+                continue
+            if ctl == "__mode_client__":
+                server_mode = False
+                continue
+            if ctl == "__assistant_on__":
+                assistant_active = True
+                continue
+            if ctl == "__assistant_off__":
+                assistant_active = False
+                continue
             if ctl == "start":
                 buf.clear(); total = 0; new_since = 0.0; open_utt = True
                 last_partial = time.monotonic()
@@ -1545,12 +1747,12 @@ async def ws_asr(websocket: WebSocket):
                 early = False; held = None; total_at_early = 0
                 continue
             if ctl == "early_end" and open_utt:
-                # Overlap trick: the client reports the moment silence starts
-                # (its end-of-speech tail begins counting). Run the speculative
-                # greedy decode NOW, in parallel with that tail, so at "end" the
-                # transcript is already ready — the greedy pass leaves the
-                # critical path entirely. "resume" discards it if the user kept
-                # talking.
+                # Overlap trick (client VAD path): the client reports the moment
+                # silence starts (its end-of-speech tail begins counting). Run
+                # the speculative greedy decode NOW, in parallel with that tail,
+                # so at "end" the transcript is already ready. The server-VAD
+                # path gets the same overlap for free: decode starts the moment
+                # silence is confirmed, while 'vad_end' races to the client.
                 if total >= int(0.25 * ASR_SR):
                     snap = np.concatenate(buf)
                     t = time.perf_counter()
@@ -1559,7 +1761,7 @@ async def ws_asr(websocket: WebSocket):
                     except Exception:  # noqa: BLE001 — best-effort pre-decode
                         held = None
                     log.info(
-                        "ASR early decode: %.2fs for %.2fs audio (overlapped with tail)",
+                        "ASR early decode: %.2fs for %.2fs audio (overlapped)",
                         time.perf_counter() - t, total / ASR_SR,
                     )
                     total_at_early = total
@@ -1569,47 +1771,7 @@ async def ws_asr(websocket: WebSocket):
                 early = False; held = None; total_at_early = 0  # pre-decode is stale now
                 continue
             if ctl == "end":
-                open_utt = False
-                samples = np.concatenate(buf) if total else np.zeros(0, dtype=np.float32)
-                dur_s = total / ASR_SR
-                # reuse the early pre-decode if at most a stray in-flight frame
-                # (~<=50 ms) arrived after the snapshot
-                reused = early and held is not None and 0 <= total - total_at_early <= int(0.05 * ASR_SR)
-                held_text = held or ""
-                early = False; held = None; total_at_early = 0
-                buf.clear(); total = 0; new_since = 0.0
-                # ignore sub-250 ms buffers (pure noise blips); the real turn
-                # gets the accurate beam-search + VAD-trimmed decode
-                if len(samples) < int(0.25 * ASR_SR):
-                    out_q.put(("final", ""))
-                    continue
-                # 1) SPECULATIVE: one fast greedy decode, sent before the beam
-                #    final so the browser can start the LLM turn immediately.
-                #    If "early_end" already decoded this buffer during the
-                #    silence tail, reuse it (0.00s on the critical path).
-                if ASR_SPECULATIVE:
-                    if reused:
-                        spec = held_text
-                        log.info("ASR greedy: reused early decode (0.00s on critical path)")
-                    else:
-                        try:
-                            t = time.perf_counter()
-                            spec = _whisper_text(samples)
-                            log.info("ASR greedy: %.2fs for %.2fs audio", time.perf_counter() - t, dur_s)
-                        except Exception:  # noqa: BLE001 — greedy is best-effort
-                            spec = ""
-                    if spec:
-                        out_q.put(("speculative", spec))
-                # 2) AUTHORITATIVE final: beam search + VAD trimming.
-                try:
-                    t = time.perf_counter()
-                    final = _whisper_text(samples, beam=ASR_FINAL_BEAM, vad=True)
-                    log.info("ASR beam: %.2fs for %.2fs audio", time.perf_counter() - t, dur_s)
-                except Exception as e:  # noqa: BLE001 — report; never kill the worker
-                    log.exception("ASR final decode failed")
-                    out_q.put(("error", f"ASR decode failed: {type(e).__name__}: {e}"))
-                    continue
-                out_q.put(("final", final))
+                finish_utterance("client-vad end")
                 continue
             if (ctl == "__noop__" or ctl is None) and open_utt and total >= int(0.5 * ASR_SR) \
                     and new_since >= ASR_PARTIAL_MIN_NEW \

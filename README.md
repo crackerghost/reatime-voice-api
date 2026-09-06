@@ -167,6 +167,18 @@ VOICE_SPECULATIVE_MS=5000            # how long the client waits for the final b
 VOICE_AUTO_SEND_MS=750               # end-of-speech silence tail before the utterance is sent (lower = snappier turns)
 ```
 
+### Noise-immune turn-taking (server-side Silero VAD)
+
+The browser's energy VAD opens an utterance on ANY loud sound — fans, door
+slams, keyboard bursts — so Whisper transcribes noise into phantom replies.
+This repo ships the professional fix: a **server-side Silero neural VAD** that
+classifies speech vs non-speech per 32 ms frame (`pip install silero-vad`;
+`ASR_VAD_MODE=auto` uses it when installed). In this mode the browser is a thin
+continuous streamer, the server owns open/close decisions (with hysteresis,
+a server-side pre-roll ring so first words are never lost, and a gate that
+ignores mic audio while the assistant's own TTS plays), and noise can no
+longer open a turn. Tune via `VOICE_SILERO_*` knobs in `.env.example`.
+
 ## 5. Testing on a GPU cloud / Kaggle
 
 Kaggle notebooks give a free NVIDIA GPU (T4/P100, 16 GB) — great for

@@ -29,6 +29,7 @@ const CFG = {
   vadFailsafeMs: 900, // sustained energy failsafe (recognizer lagging)
   speakTailMs: 700, // ignore recognition this long after OUR speaker audio stops (echo)
   vadRecActiveMs: 400, // recognizer counts as active within this window
+  asrVadMode: "auto", // "server" = Silero VAD on the server owns turn-taking (noise-proof)
   bargeIdleMs: 900, // recognizer-idle safety-net send delay
 };
 const num = (v, d) => (v === undefined || v === null || Number.isNaN(Number(v)) ? d : Number(v));
@@ -49,6 +50,7 @@ const mergeCfg = (c) => {
   CFG.vadFailsafeMs = num(c.vad_failsafe_ms, CFG.vadFailsafeMs);
   CFG.speakTailMs = num(c.speak_tail_ms, CFG.speakTailMs);
   CFG.vadRecActiveMs = num(c.vad_rec_active_ms, CFG.vadRecActiveMs);
+  CFG.asrVadMode = c.asr_vad_mode || CFG.asrVadMode;
   CFG.bargeIdleMs = num(c.barge_idle_ms, CFG.bargeIdleMs);
   CFG.specChat = c.spec_chat !== undefined ? !!c.spec_chat : CFG.specChat; // live tunable
 };
@@ -512,6 +514,11 @@ export default function App() {
     // arriving during the tail are parked here and restored if speech resumes.
     let tailHold = false;
     let tailBuf = [];
+    // Server-side Silero VAD mode: the SERVER decides when an utterance opens
+    // (neural speech/noise classification — fans/doors/keys can't open turns).
+    // The browser becomes a dumb continuous streamer + keeps energy barge-in.
+    let serverMode = CFG.asrVadMode === "server";
+    let prevAssistant = false; // speaking-state edge -> /ws/asr "assistant" gate
     let lastPartial = ""; // most recent live caption (fallback if final is empty)
     let specSentFor = ""; // text already submitted speculatively (guards double-send)
     // Pre-roll ring buffer: ALWAYS keep the last ~350 ms of non-echo mic PCM.
@@ -566,6 +573,8 @@ export default function App() {
         asrClosedCount = 0;
         asrAttempts = 0;
         asrLastPong = Date.now();
+        // opt into server-side Silero VAD (the server then owns open/close)
+        if (serverMode) asrSendJson({ type: "mode", vad: "server" });
         // heartbeat: detect a dead ASR socket in ~15s
         asrHb = setInterval(() => {
           try {
@@ -618,6 +627,23 @@ export default function App() {
             setAsrReconnecting(false);
             setInterim("");
           }
+          return;
+        }
+        if (m.type === "vad_start") {
+          // Server Silero opened an utterance — mirror client state so the
+          // legacy hooks (interim, watchdogs) stay coherent.
+          streamingRef.current = true;
+          vadRef.current.streamingRefCur = true;
+          vadRef.current.textHeard = false;
+          specSentFor = "";
+          setInterim("");
+          return;
+        }
+        if (m.type === "vad_end") {
+          // Server closed it: speculative/final transcripts follow next
+          streamingRef.current = false;
+          vadRef.current.streamingRefCur = false;
+          asrBusyRef.current = true;
           return;
         }
         if (m.type === "partial") {
@@ -709,6 +735,15 @@ export default function App() {
         preRollClear(); // never replay our own voice as ASR input
         return;
       }
+      if (serverMode) {
+        // Server VAD is the turn-taker: stream continuously (the server keeps
+        // its own pre-roll and gates opens while our TTS plays). Decode gaps
+        // (asrBusy) just drop frames — the server pre-roll covers the seams.
+        if (!asrOpenRef.current || asrBusyRef.current) return;
+        pcmBuf.push(arr);
+        pcmLen += arr.length;
+        return;
+      }
       preRollPush(arr); // always keep the rolling pre-roll (first words)
       if (tailHold) {
         tailBuf.push(arr); // park tail frames; restored if speech resumes
@@ -763,6 +798,13 @@ export default function App() {
       // onFrame keys off this deterministic app state.
       if (speakingRef.current) v.lastSpeakAt = now;
 
+      // Assistant-audio gate for server VAD: tell /ws/asr when OUR TTS plays
+      // so Silero never opens an utterance on AEC residue of our own voice.
+      if (serverMode && speakingRef.current !== prevAssistant) {
+        prevAssistant = speakingRef.current;
+        asrSendJson({ type: "assistant", active: prevAssistant });
+      }
+
       // Aura: show the user is talking (from the raw mic analyser).
       if (mic.rms > v.noise * 0.8 && mic.rms > CFG.vadNoiseFloor) {
         if (!apiRef.current.userTalkingRef.current) apiRef.current.setUserTalking(true);
@@ -798,7 +840,8 @@ export default function App() {
       v.streamingRefCur = streamingRef.current; // used by the hold logic above
 
       // ---- OPEN an utterance on real sustained voice ------------------
-      if (sustainedVoice && !streamingRef.current && !asrBusyRef.current && asrOpenRef.current) {
+      // (client energy VAD path only — in server mode Silero decides)
+      if (!serverMode && sustainedVoice && !streamingRef.current && !asrBusyRef.current && asrOpenRef.current) {
         streamingRef.current = true;
         v.voiceSilentSince = 0;
         v.hotTicks = 0; // reset open-counter once the utterance is open (hold mode)
@@ -837,7 +880,7 @@ export default function App() {
         streamingRef.current = false;
       }
 
-      if (streamingRef.current && voiceHeard && !assistantBusy) {
+      if (!serverMode && streamingRef.current && voiceHeard && !assistantBusy) {
         if (hot || inHold || recActive) {
           if (v.voiceSilentSince) {
             v.voiceSilentSince = 0; // resumed within the silence tail
@@ -889,6 +932,10 @@ export default function App() {
 
     const enableMic = async () => {
       const v = vadRef.current;
+      serverMode = CFG.asrVadMode === "server"; // re-read config each session
+      prevAssistant = false;
+      tailHold = false;
+      tailBuf = [];
       v.noise = CFG.vadNoiseFloor;
       v.threshold = Math.max(CFG.vadNoiseFloor * CFG.vadGateMult, CFG.vadThresholdMin);
       v.hotTicks = 0;
