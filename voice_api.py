@@ -1162,12 +1162,16 @@ ASR_SPECULATIVE_MS = int(os.environ.get("VOICE_SPECULATIVE_MS", "5000"))
 
 # HF repo ids of the MLX-converted Whisper checkpoints per size. A full repo id
 # (containing "/") in ASR_MODEL is passed through untouched.
+# NOTE: the turbo checkpoint on HF is "whisper-large-v3-turbo" (no -mlx suffix) —
+# guessing the suffix produced a 404 that silently killed ASR.
 _MLX_REPOS = {
     "tiny": "mlx-community/whisper-tiny-mlx",
     "base": "mlx-community/whisper-base-mlx",
     "small": "mlx-community/whisper-small-mlx",
     "medium": "mlx-community/whisper-medium-mlx",
     "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "large-turbo": "mlx-community/whisper-large-v3-turbo",  # alias
     "turbo": "mlx-community/whisper-turbo",
 }
 
@@ -1213,6 +1217,16 @@ class _MlxAsr:
             ) from None
         self._transcribe = mlx_whisper.transcribe
         self._repo = _mlx_repo(ASR_MODEL)
+        # Fail fast + load at boot, not on the user's first utterance: a wrong
+        # ASR_MODEL used to surface as an HF 404 INSIDE the /ws/asr worker and
+        # silently kill transcription while /api/config still said asr_ready.
+        from huggingface_hub import model_info
+        model_info(self._repo)  # raises RepositoryNotFoundError for a bad repo id
+        try:
+            import numpy as _np
+            self.transcribe(_np.zeros(ASR_SR, dtype=_np.float32))  # warm the weights
+        except Exception as e:  # noqa: BLE001 — warm decode is best-effort
+            log.warning("mlx ASR warm decode failed (first utterance may be slower): %s", e)
 
     def transcribe(self, samples: np.ndarray, beam: int = 1, vad: bool = False) -> str:
         # Keep mlx-whisper's temperature fallback ladder (we used to pin
@@ -1256,12 +1270,14 @@ def _get_asr():
     """Load (once) the backend selected by ASR_BACKEND and reuse it for all calls."""
     global _asr_backend
     if _asr_backend is None:
-        chosen = _pick_asr_backend()
-        log.info("Loading ASR backend '%s' (model '%s')...", chosen, ASR_MODEL)
-        _asr_backend = _MlxAsr() if chosen == "mlx" else _FasterWhisperAsr()
-        global _asr_ready
-        _asr_ready = True
-        log.info("ASR backend '%s' ready (model '%s').", chosen, ASR_MODEL)
+        with _asr_lock:  # serialize construction — never load the model twice
+            if _asr_backend is None:
+                chosen = _pick_asr_backend()
+                log.info("Loading ASR backend '%s' (model '%s')...", chosen, ASR_MODEL)
+                _asr_backend = _MlxAsr() if chosen == "mlx" else _FasterWhisperAsr()
+                global _asr_ready
+                _asr_ready = True
+                log.info("ASR backend '%s' ready (model '%s').", chosen, ASR_MODEL)
     return _asr_backend
 
 
@@ -1430,7 +1446,13 @@ async def ws_asr(websocket: WebSocket):
                     if spec:
                         out_q.put(("speculative", spec))
                 # 2) AUTHORITATIVE final: beam search + VAD trimming.
-                out_q.put(("final", _whisper_text(samples, beam=ASR_FINAL_BEAM, vad=True)))
+                try:
+                    final = _whisper_text(samples, beam=ASR_FINAL_BEAM, vad=True)
+                except Exception as e:  # noqa: BLE001 — report; never kill the worker
+                    log.exception("ASR final decode failed")
+                    out_q.put(("error", f"ASR decode failed: {type(e).__name__}: {e}"))
+                    continue
+                out_q.put(("final", final))
                 continue
             if (ctl == "__noop__" or ctl is None) and open_utt and total >= int(0.5 * ASR_SR) \
                     and new_since >= ASR_PARTIAL_MIN_NEW \
@@ -1438,7 +1460,10 @@ async def ws_asr(websocket: WebSocket):
                 new_since = 0.0
                 last_partial = time.monotonic()
                 samples = np.concatenate(buf)
-                out_q.put(("partial", _whisper_text(samples)))
+                try:
+                    out_q.put(("partial", _whisper_text(samples)))
+                except Exception:  # noqa: BLE001 — captions are best-effort
+                    log.exception("ASR partial decode failed")
 
     reader_task = asyncio.create_task(reader())
     threading.Thread(target=worker, daemon=True).start()
@@ -1450,7 +1475,13 @@ async def ws_asr(websocket: WebSocket):
                 await asyncio.sleep(0.05)
                 continue
             try:
-                await websocket.send_text(json.dumps({"type": kind, "text": text}))
+                # error frames carry the reason in "message" (the client reads
+                # m.message); transcript frames keep the "text" field.
+                frame = (
+                    {"type": kind, "message": text}
+                    if kind == "error" else {"type": kind, "text": text}
+                )
+                await websocket.send_text(json.dumps(frame))
             except Exception:  # noqa: BLE001 — client vanished mid-decode; stop the worker too
                 break
     except WebSocketDisconnect:

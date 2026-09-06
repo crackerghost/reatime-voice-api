@@ -101,15 +101,18 @@ export default function App() {
   const vadRef = useRef({
     noise: CFG.vadNoiseFloor, // adaptive ambient floor (updated when idle)
     threshold: Math.max(CFG.vadNoiseFloor * CFG.vadGateMult, CFG.vadThresholdMin),
-    hotTicks: 0, // consecutive ticks above threshold (debounce noise blips)
+    hotTicks: 0, // consecutive ticks above open threshold (debounce noise blips)
     strongTicks: 0, // consecutive ticks WELL above the gate (only this may cut the assistant)
     textHeard: false, // recognizer delivered real words during this burst
     anyVoice: false, // analyser saw real voice at least once this burst
     bargeLatched: false, // already cut the assistant during this burst
-    voiceSilentSince: 0, // ms timestamp when the burst ended
+    voiceSilentSince: 0, // ms timestamp when the burst went silent
     uttEndedAt: 0, // ms timestamp when the utterance was closed (speculative-release timer)
     lastUtt: 0, // recognizer last heard anything (ms)
     lastSpeakAt: 0, // when OUR speaker output last had real audio (echo guard)
+    voiceEnergy: null, // leaky-integrator short-term RMS for hysteresis
+    streamingRefCur: false, // mirror of streamingRef.current for tick-closed access
+    recordingSince: 0, // when the current utterance was opened (diagnostic)
   });
   const listeningRef = useRef(false);
   const userTalkingRef = useRef(false);
@@ -158,7 +161,7 @@ export default function App() {
   /* ---- play an already-decoded buffer (drain prefetches decodes) ---- */
   const playBuf = useCallback((buf) => {
     const ctx = engine.unlock();
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const src = ctx.createBufferSource();
       src.buffer = buf;
       engine.connectSpeak(src);
@@ -168,16 +171,30 @@ export default function App() {
         try { src.disconnect(); } catch { /* noop */ } // free the audio graph
         resolve();
       };
-      src.start();
+      src.onerror = () => {
+        currentSourceRef.current = null;
+        try { src.disconnect(); } catch { /* noop */ }
+        reject(new Error("audio playback error"));
+      };
+      try {
+        src.start();
+      } catch (e) {
+        currentSourceRef.current = null;
+        try { src.disconnect(); } catch { /* noop */ }
+        reject(e);
+      }
     });
   }, []);
 
   const drain = useCallback(async () => {
     const ctx = engine.unlock();
     let nxt = null; // AudioBuffer prefetched for the next frame (decoded while current plays)
+    const startedAt = Date.now();
     while (pendingRef.current.length > 0) {
       if (dropRef.current) {
         pendingRef.current.length = 0;
+        speakingRef.current = false;
+        setSpeaking(false);
         return;
       }
       const blob = pendingRef.current.shift();
@@ -192,11 +209,23 @@ export default function App() {
         try {
           buf = await ctx.decodeAudioData(await blob.arrayBuffer());
         } catch {
-          await pre.catch(() => null); // drop the bad frame, keep the prefetch warm
+          // bad frame — drop it but keep the queue and speaking state healthy
+          console.warn("[voice] dropped a corrupt TTS audio frame");
+          await pre.catch(() => null); // keep the prefetch warm
           continue;
         }
       }
-      await playBuf(buf);
+      try {
+        await playBuf(buf);
+      } catch {
+        // playback failed — stop claiming we're speaking so the UI recovers
+        currentSourceRef.current = null;
+        speakingRef.current = false;
+        setSpeaking(false);
+        pendingRef.current = [];
+        console.warn("[voice] TTS playback failed; cleared pending frames");
+        return;
+      }
       nxt = await pre; // cache for the next iteration
     }
     speakingRef.current = false;
@@ -262,6 +291,7 @@ export default function App() {
 
   /* ---------- ASR readiness: server preloads Whisper at boot ---------- */
   const [asrReady, setAsrReady] = useState(false);
+  const [asrReconnecting, setAsrReconnecting] = useState(false);
   useEffect(() => {
     let alive = true;
     let t = 0;
@@ -287,6 +317,10 @@ export default function App() {
     let ttsAttempts = 0;
     let ttsHb = 0;
     let ttsLastPong = 0;
+    // playback watchdog: if we claim to be speaking but nothing is actually
+    // playing and no new frame has arrived, clear the stuck state so the UI
+    // and the echo guard don't stay wrong.
+    let speakWatchdog = 0;
     const connect = () => {
       const ws = new WebSocket(WS_URL);
       ws.binaryType = "arraybuffer";
@@ -350,7 +384,22 @@ export default function App() {
                   : x
               );
             });
-            assistantTextRef.current += m.text;
+            assistantTextRef.current += m.text;          } else if (m.type === "error") {
+            if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
+            assistantTextRef.current = "";
+            openAssistantId.current = null;
+            activeRef.current = false;
+            // a server-side failure (e.g. OmniVoice returned no audio) should
+            // not leave the UI stuck in a "speaking" state.
+            speakingRef.current = false;
+            setSpeaking(false);
+            if (speakWatchdog) { clearTimeout(speakWatchdog); speakWatchdog = 0; }
+            if (currentSourceRef.current) {
+              try { currentSourceRef.current.stop(); } catch { /* noop */ }
+              currentSourceRef.current = null;
+            }
+            pendingRef.current = [];
+            showError("बोलने में त्रुटि: " + m.message);
           } else if (m.type === "done") {
             if (dropRef.current) {
               // closing done of the reply we interrupted — discard silently
@@ -367,6 +416,7 @@ export default function App() {
               );
             }
             if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
+
             assistantTextRef.current = "";
             openAssistantId.current = null;
             activeRef.current = false;
@@ -392,12 +442,30 @@ export default function App() {
             api.setSpeaking(true);
             drain();
           }
+          // keep the playback watchdog honest: a new frame just landed
+          if (speakWatchdog) {
+            clearTimeout(speakWatchdog);
+            speakWatchdog = 0;
+          }
+          // arm the watchdog the first time we start playing — if the queue
+          // empties and nothing replays within ~2.5 s, something is stuck.
+          if (!speakWatchdog && currentSourceRef.current) {
+            speakWatchdog = setTimeout(() => {
+              if (speakingRef.current && !currentSourceRef.current && pendingRef.current.length === 0) {
+                speakingRef.current = false;
+                setSpeaking(false);
+                console.warn("[voice] speaking stuck with no active source — cleared");
+              }
+              speakWatchdog = 0;
+            }, 2500);
+          }
         }
       };
     };
     connect();
     return () => {
       closed = true;
+      if (speakWatchdog) { clearTimeout(speakWatchdog); speakWatchdog = 0; }
       const ws = wsRef.current;
       if (ws) ws.close();
     };
@@ -503,15 +571,23 @@ export default function App() {
         if (listeningRef.current && !closingAsr) {
           asrClosedCount += 1;
           asrAttempts += 1;
+          // reconnect immediately (bounded) so a momentary server restart or
+          // network blip doesn't leave the mic open and silent.
+          const delay = Math.min(CFG.wsReconnectMs * 2 ** Math.min(asrAttempts - 1, 3), 15000);
+          setTimeout(connectAsr, delay);
+          // transient indicator while we're down — clearer than a silent mic.
+          if (asrAttempts <= 3) {
+            setInterim("");
+            setAsrReconnecting(true);
+          }
           // The /ws/asr endpoint only exists on a server running the current
-          // code — tell the user to restart it instead of failing silently.
-          if (asrClosedCount >= 4 && !asrWarned) {
+          // code — tell the user to restart it instead of failing silently,
+          // but only after a few reconnect attempts so a transient drop isn't
+          // surfaced as a server error.
+          if (asrClosedCount >= 3 && !asrWarned) {
             asrWarned = true;
             showError("वॉयस इंजन (Whisper) से कनेक्ट नहीं हो पा रहा — कृपया सर्वर रीस्टार्ट करें (python voice_api.py)।");
           }
-          // exponential backoff, capped: 1.5s -> 3s -> 6s -> 12s -> 15s
-          const delay = Math.min(CFG.wsReconnectMs * 2 ** Math.min(asrAttempts - 1, 3), 15000);
-          setTimeout(connectAsr, delay);
         }
       };
       ws.onmessage = (ev) => {
@@ -521,9 +597,12 @@ export default function App() {
         } catch {
           return;
         }
-        const v = vadRef.current;
         if (m.type === "pong") { // heartbeat reply
           asrLastPong = Date.now();
+          if (asrReconnecting) {
+            setAsrReconnecting(false);
+            setInterim("");
+          }
           return;
         }
         if (m.type === "partial") {
@@ -581,7 +660,9 @@ export default function App() {
         } else if (m.type === "error") {
           asrBusyRef.current = false;
           streamingRef.current = false;
+          vadRef.current.streamingRefCur = false; // keep the VAD hold-mirror in sync
           specSentFor = ""; // never let a dead utterance's guard leak into the next one
+          if (asrReconnecting) setAsrReconnecting(false);
           setInterim("");
           showError("बोलने की पहचान में त्रुटि: " + (m.message || ""));
         }
@@ -613,16 +694,45 @@ export default function App() {
       pcmLen += arr.length;
     };
 
+    // Leaky-integrator voice metric with hysteresis.
+    //
+    // The old gate was brittle: one tick below threshold reset the open counter,
+    // so a brief mouth noise or a mic-gain pump could kill an utterance that was
+    // already mid-word. The new gate smooths short-term RMS into `v.voiceEnergy`
+    // and opens only when that smoothed value has been above a *lower* open
+    // threshold for vadSustainMs, then HOLDS the mic open down to an even lower
+    // hold threshold (hysteresis), so brief dips never steal the next phoneme.
+    // Barge-in still uses the original strong-energy path so the assistant can be
+    // cut reliably on real sustained speech.
     const vadTick = () => {
       if (!listeningRef.current) return;
       const mic = engine.readMic();
       const v = vadRef.current;
       const now = performance.now();
+
       // thresholds recomputed per tick so a late /api/config fetch is honored
       const sustainTicks = ticksFor(CFG.vadSustainMs); // real voice energy length
       const textTicks = ticksFor(CFG.vadTextMs); // words + energy confirm
       const failsafeTicks = ticksFor(CFG.vadFailsafeMs); // sustained-energy failsafe
-      const hot = mic.rms > v.threshold; // above the voice gate this tick
+
+      // smoothed short-term energy (leaky integrator, ~1 s time constant at
+      // 50 ms ticks). Keeps momentary dips from resetting the open decision.
+      const alpha = 0.08;
+      v.voiceEnergy = v.voiceEnergy == null
+        ? mic.rms
+        : v.voiceEnergy * (1 - alpha) + mic.rms * alpha;
+
+      // hysteresis thresholds are recomputed from the live noise floor each tick
+      // so a late /api/config fetch is honored without restarting the mic.
+      const openThresh = Math.max(v.noise * CFG.vadGateMult * 0.9, CFG.vadThresholdMin * 0.9);
+      const holdThresh = Math.max(v.noise * CFG.vadGateMult * 0.45, CFG.vadThresholdMin * 0.45);
+      const strongThresh = v.threshold * 1.6;
+
+      // hot = clearly above the open gate this tick
+      const hot = mic.rms > openThresh;
+      const inHold = v.streamingRefCur || v.voiceSilentSince > 0
+        ? mic.rms > holdThresh : false;
+      const sustainedVoice = v.hotTicks >= sustainTicks;
 
       // Remember when OUR reply is audibly playing — the frame-drop gate in
       // onFrame keys off this deterministic app state.
@@ -635,19 +745,22 @@ export default function App() {
         if (apiRef.current.userTalkingRef.current) apiRef.current.setUserTalking(false);
       }
 
-      // Debounce: noise blips are short; real voice sustains. Count ticks.
-      // `strong` energy (well above the gate) is what may interrupt the
-      // assistant — our own echo / ambient noise rarely exceeds it, so a
-      // long reply can't accidentally stop itself.
-      const strong = mic.rms > v.threshold * 1.6;
-      if (hot) {
+      // strong energy (well above the gate) — barge-in path only
+      const strong = mic.rms > strongThresh;
+      if (hot || (v.streamingRefCur && inHold)) {
         v.hotTicks += 1;
         v.lastUtt = now; // energy-backed speech time (drives end-of-speech)
-      } else v.hotTicks = 0;
+      } else {
+        // do NOT hard-reset while we're holding an open utterance — allow brief
+        // dips below the open line but above the hold line
+        if (!v.streamingRefCur || mic.rms <= holdThresh) v.hotTicks = Math.max(0, v.hotTicks - 1);
+      }
       if (strong) v.strongTicks += 1;
       else v.strongTicks = 0;
-      const sustainedVoice = v.hotTicks >= sustainTicks;
-      if (sustainedVoice) v.anyVoice = true; // latch: analyser really heard us
+      if (sustainedVoice) v.anyVoice = true;
+
+      // voice heard = open energy OR recognizer already delivered words OR we
+      // previously latched that real voice existed this burst
       const voiceHeard = sustainedVoice || v.textHeard || v.anyVoice;
 
       // Ambient noise-floor tracking ONLY while nobody has spoken recently.
@@ -657,13 +770,16 @@ export default function App() {
       }
 
       const assistantBusy = speakingRef.current || activeRef.current;
+      v.streamingRefCur = streamingRef.current; // used by the hold logic above
 
       // ---- OPEN an utterance on real sustained voice ------------------
       if (sustainedVoice && !streamingRef.current && !asrBusyRef.current && asrOpenRef.current) {
         streamingRef.current = true;
         v.voiceSilentSince = 0;
+        v.hotTicks = 0; // reset open-counter once the utterance is open (hold mode)
         specSentFor = ""; // new utterance: drop any stale speculative-turn guard
         asrSendJson({ type: "start" });
+        v.recordingSince = now;
         // Replay the pre-roll right after "start" so the ~250 ms the VAD
         // needed to open the utterance is NOT lost from the transcript.
         const pr = preRollRead();
@@ -679,17 +795,14 @@ export default function App() {
         const enough =
           (v.textHeard && v.hotTicks >= textTicks) || v.strongTicks >= failsafeTicks;
         if (enough) {
-          v.bargeLatched = true; // latch: one cut per burst
+          v.bargeLatched = true;
           apiRef.current.hardStop();
         }
       }
       // latch releases once the user stops producing sound (next burst can cut)
-      if (v.bargeLatched && !hot) v.bargeLatched = false;
+      if (v.bargeLatched && !hot && v.strongTicks === 0) v.bargeLatched = false;
 
       // ---- END-OF-SPEECH: silence after a real burst closes it ---------
-      // End = the analyser is cold for ~autoSendMs after real energy. Whisper
-      // lag no longer matters: the transcript request is sent at "end" and the
-      // authoritative "final" arrives right after.
       const recActive = now - v.lastUtt < CFG.vadRecActiveMs;
       // If no speculative transcript arrives shortly after "end" (slow backend
       // or disabled), release the mic anyway so the next burst works.
@@ -698,33 +811,36 @@ export default function App() {
         asrBusyRef.current = false;
         streamingRef.current = false;
       }
-          if (streamingRef.current && voiceHeard && !assistantBusy) {
-            if (hot || recActive) {
-              v.voiceSilentSince = 0; // still talking
-            } else {
-              if (!v.voiceSilentSince) v.voiceSilentSince = now;
-              else if (now - v.voiceSilentSince > CFG.autoSendMs) {
-                v.voiceSilentSince = 0;
-                v.hotTicks = 0;
-                v.textHeard = false;
-                v.anyVoice = false;
+
+      if (streamingRef.current && voiceHeard && !assistantBusy) {
+        if (hot || inHold || recActive) {
+          v.voiceSilentSince = 0; // still talking (or holding through a dip)
+        } else {
+          if (!v.voiceSilentSince) v.voiceSilentSince = now;
+          else if (now - v.voiceSilentSince > CFG.autoSendMs) {
+            v.voiceSilentSince = 0;
+            v.hotTicks = 0;
+            v.textHeard = false;
+            v.anyVoice = false;
+            v.streamingRefCur = false;
+            streamingRef.current = false;
+            v.uttEndedAt = now;
+            asrBusyRef.current = true;
+            asrSendJson({ type: "end" });
+            // Watchdog: if neither a speculative nor the final transcript
+            // arrives (lost frame/drop), don't leave the mic dead — release
+            // after 12 s so the next burst works.
+            setTimeout(() => {
+              if (asrBusyRef.current) {
+                asrBusyRef.current = false;
                 streamingRef.current = false;
-                v.uttEndedAt = now; // speculative turn may fire before the final lands
-                asrBusyRef.current = true; // wait for the server's "final" (or spec release)
-                asrSendJson({ type: "end" });
-                // Watchdog: if neither a speculative nor the final transcript
-                // arrives (lost frame/drop), don't leave the mic dead — release
-                // after 12 s so the next burst works.
-                setTimeout(() => {
-                  if (asrBusyRef.current) {
-                    asrBusyRef.current = false;
-                    streamingRef.current = false;
-                    setInterim("");
-                  }
-                }, 12000);
+                v.streamingRefCur = false;
+                setInterim("");
               }
-            }
+            }, 12000);
           }
+        }
+      }
     };
 
     const enableMic = async () => {
@@ -740,6 +856,9 @@ export default function App() {
       v.uttEndedAt = 0;
       v.lastUtt = 0;
       v.lastSpeakAt = 0;
+      v.voiceEnergy = null;
+      v.streamingRefCur = false;
+      v.recordingSince = 0;
       streamingRef.current = false;
       asrBusyRef.current = false;
       asrWarned = false;
@@ -758,9 +877,13 @@ export default function App() {
       }
       connectAsr();
       const tapped = await engine.startTap(onFrame);
-      if (!tapped) {
+      if (!tapped.ok) {
         disableMic();
-        showError("इस ब्राउज़र में ऑडियो स्ट्रीमिंग उपलब्ध नहीं है — Chrome/Edge आज़माएँ।");
+        const msg =
+          tapped.error
+            ? `ऑडियो स्ट्रीमिंग उपलब्ध नहीं है — ${tapped.error}. Chrome/Edge आज़माएँ।`
+            : "इस ब्राउज़र में ऑडियो स्ट्रीमिंग उपलब्ध नहीं है — Chrome/Edge आज़माएँ।";
+        showError(msg);
       }
     };
 

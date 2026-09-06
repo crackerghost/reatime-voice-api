@@ -26,3 +26,5 @@ Thumbs.db
 nohup.out
 .ipynb_checkpoints/
 kaggle/.cache/
+/.freebuff
+/.vite

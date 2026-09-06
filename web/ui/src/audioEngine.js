@@ -92,46 +92,83 @@ export const engine = {
     }
     micSrc = null;
   },
-  /* Tap the AEC-cleaned mic stream as 16 kHz mono frames for streaming ASR. */
+  /* Tap the AEC-cleaned mic stream as 16 kHz mono frames for streaming ASR.
+
+     Fail LOUDLY rather than silently returning false: the UI needs to know
+     when the PCM tap can't be created so it can show a real "voice engine"
+     error instead of the user just wondering why their voice isn't heard.
+
+     Worklet module loads can fail transiently (AudioContext not yet ready,
+     CSP/COOP edge cases, serving the file from a slow static handler), so we
+     retry a few times with short backoff before falling back to the inline
+     Blob URL, and we never swallow the final error. */
   async startTap(onFrame) {
-    if (!micSrc) return false;
-    if (tap) return true;
-    try {
-      // Load the worklet from a real same-origin file (web/ui/public -> dist
-      // root). A Blob URL fallback is kept for setups where the file is
-      // missing — Chrome can refuse Blob worklet modules under some CSPs,
-      // which would otherwise silently kill STT.
-      const src =
-        "class PcmTap extends AudioWorkletProcessor{\n" +
-        "constructor(opts){super();const outRate=(opts&&opts.processorOptions&&opts.processorOptions.outRate)||16000;this.step=outRate/sampleRate;this.phase=0;}\n" +
-        "process(inputs){const ch=inputs[0]&&inputs[0][0];if(!ch||ch.length===0)return true;const out=[];for(let i=0;i<ch.length;i++){this.phase+=this.step;if(this.phase>=1){this.phase-=1;out.push(ch[i]);}}if(out.length)this.port.postMessage(new Float32Array(out));return true;}\n" +
-        "}\nregisterProcessor(\"pcm-tap\",PcmTap);";
-      let url = `${location.origin}/pcm-tap.js`;
+    if (!micSrc) return { ok: false, error: "mic not started" };
+    if (tap) return { ok: true };
+
+    // Inline worklet source kept as the last-resort fallback. Chrome can
+    // refuse Blob URLs under some CSPs, so we try the real file first and
+    // only use the Blob when the file is genuinely unavailable.
+    const src =
+      "class PcmTap extends AudioWorkletProcessor{\n" +
+      "constructor(opts){super();const outRate=(opts&&opts.processorOptions&&opts.processorOptions.outRate)||16000;this.step=outRate/sampleRate;this.phase=0;}\n" +
+      "process(inputs){const ch=inputs[0]&&inputs[0][0];if(!ch||ch.length===0)return true;const out=[];for(let i=0;i<ch.length;i++){this.phase+=this.step;if(this.phase>=1){this.phase-=1;out.push(ch[i]);}}if(out.length)this.port.postMessage(new Float32Array(out));return true;}\n" +
+      "}\nregisterProcessor(\"pcm-tap\",PcmTap);";
+
+    const fileUrl = `${location.origin}/pcm-tap.js`;
+    const tries = 4;
+    let last = null;
+    for (let i = 0; i < tries; i++) {
       try {
-        await ctx.audioWorklet.addModule(url);
-      } catch {
-        url = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
-        await ctx.audioWorklet.addModule(url);
-        URL.revokeObjectURL(url);
+        await ctx.audioWorklet.addModule(fileUrl);
+        break;
+      } catch (e) {
+        last = e;
+        if (i < tries - 1) await new Promise((r) => setTimeout(r, 120 * (i + 1)));
       }
+    }
+
+    // If the real file never loaded, try the inline Blob as a final attempt.
+    if (last && i === tries - 1) {
+      try {
+        const blobUrl = URL.createObjectURL(
+          new Blob([src], { type: "application/javascript" }),
+        );
+        try {
+          await ctx.audioWorklet.addModule(blobUrl);
+          last = null; // success
+        } finally {
+          setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        }
+      } catch (e) {
+        last = e;
+      }
+    }
+
+    if (last) {
+      return { ok: false, error: last instanceof Error ? last.message : String(last) };
+    }
+
+    try {
       tap = new AudioWorkletNode(ctx, "pcm-tap", {
         processorOptions: { outRate: 16000 },
       });
       tap.port.onmessage = (e) => onFrame(e.data);
       micSrc.connect(tap);
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (e) {
+      stopTap();
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+      };
     }
   },
   stopTap() {
-    if (tap) {
-      try {
-        tap.disconnect();
-      } catch { /* noop */ }
-      tap.port.onmessage = null;
-      tap = null;
-    }
+    if (!tap) return;
+    try { tap.disconnect(); } catch { /* noop */ }
+    tap.port.onmessage = null;
+    tap = null;
   },
   readMic() {
     return read(micAnalyser);
