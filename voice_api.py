@@ -1556,13 +1556,14 @@ class _FasterWhisperAsr:
 
         segs, _info = self._model.transcribe(
             samples,
-            language=ASR_LANG,
+            language=ASR_LANG or "hi",
+            task="transcribe",  # Explicitly enforce transcription (never translation into English)
             beam_size=beam,
             temperature=0.0,  # Strictly deterministic: prevents hallucination ladders
             condition_on_previous_text=False,
             vad_filter=True,  # Strip trailing/leading silence so Whisper decodes actual speech
             vad_parameters=dict(min_silence_duration_ms=200),
-            initial_prompt=ASR_INITIAL_PROMPT,
+            initial_prompt=ASR_INITIAL_PROMPT or "नमस्ते राहुल भाई, आप कैसे हैं? हाँ, मैं पूछ रहा हूँ कि मेरी आवाज़ आपको आ रही है या नहीं?",
             no_repeat_ngram_size=max(0, ASR_NO_REPEAT_NGRAM),  # 0 disables (CTranslate2 convention)
         )
         return "".join(s.text for s in segs).strip()
