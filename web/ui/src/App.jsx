@@ -26,7 +26,7 @@ const CFG = {
   vadGateMult: 3.4, // voice gate = noise * this (or threshold_min, whichever is higher)
   vadSustainMs: 250, // energy this long = real voice (barge / arm send)
   vadTextMs: 150, // …or recognizer words + this much energy confirm
-  vadFailsafeMs: 900, // sustained energy failsafe (recognizer lagging)
+  vadFailsafeMs: 250, // quick ~250ms sustained energy barge-in trigger (was 900ms)
   speakTailMs: 700, // ignore recognition this long after OUR speaker audio stops (echo)
   vadRecActiveMs: 400, // recognizer counts as active within this window
   asrVadMode: "auto", // "server" = Silero VAD on the server owns turn-taking (noise-proof)
@@ -757,32 +757,24 @@ export default function App() {
     const onFrame = (arr) => {
       const v = vadRef.current;
       const now = performance.now();
-      // Echo guard: drop mic frames while OUR audio is playing. In the
-      // silence tail after it, only drop while no user utterance is open —
-      // once the utterance IS open the user is definitely talking, and
-      // cutting the tail there would swallow their first words.
-      // In server-VAD mode the tail is the SERVER's job (assistant gate + its
-      // own pre-roll), and streamingRef stays false until Silero opens — so
-      // gating the tail on it here would swallow the user's first ~700ms of
-      // speech right after our reply. Only drop while OUR audio is actually
-      // playing; the server decides when the echo tail is safe.
-      const echo = speakingRef.current ||
-        (!serverMode && !streamingRef.current && now - v.lastSpeakAt <= CFG.speakTailMs);
-      if (echo) {
-        preRollClear(); // never replay our own voice as ASR input
-        return;
-      }
+      // Always push into rolling pre-roll (350ms of audio) so when the user
+      // interrupts (barges in), their initial words are NEVER lost!
+      preRollPush(arr);
+
       if (serverMode) {
-        // Server VAD is the turn-taker: stream continuously (the server keeps
-        // its own pre-roll and gates opens while our TTS plays). Do NOT drop
-        // during decode gaps (asrBusy): the server queues the PCM anyway, so
-        // dropping here would only lose the first words of the next sentence.
+        // Server VAD owns turn-taking: stream continuously so Silero can detect speech
         if (!asrOpenRef.current) return;
         pcmBuf.push(arr);
         pcmLen += arr.length;
         return;
       }
-      preRollPush(arr); // always keep the rolling pre-roll (first words)
+
+      // In client mode, drop frames only while audio is playing and no utterance is open
+      const echo = speakingRef.current || (!streamingRef.current && now - v.lastSpeakAt <= CFG.speakTailMs);
+      if (echo && !streamingRef.current) {
+        return;
+      }
+
       if (tailHold) {
         tailBuf.push(arr); // park tail frames; restored if speech resumes
         return;
@@ -902,7 +894,23 @@ export default function App() {
           (v.textHeard && v.hotTicks >= textTicks) || v.strongTicks >= failsafeTicks;
         if (enough) {
           v.bargeLatched = true;
+          v.lastSpeakAt = 0; // Clear echo tail so speech immediately after barge-in is NOT dropped!
           apiRef.current.hardStop();
+          if (serverMode) {
+            asrSendJson({ type: "assistant", active: false });
+          } else if (!streamingRef.current && asrOpenRef.current) {
+            streamingRef.current = true;
+            v.voiceSilentSince = 0;
+            v.hotTicks = 0;
+            specSentFor = "";
+            asrSendJson({ type: "start" });
+            const pr = preRollRead();
+            if (pr) {
+              pcmBuf.unshift(pr);
+              pcmLen += pr.length;
+            }
+            preRollClear();
+          }
         }
       }
       // latch releases once the user stops producing sound (next burst can cut)

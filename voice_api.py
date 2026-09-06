@@ -1267,10 +1267,10 @@ ASR_PARTIAL_MIN_GAP = float(os.environ.get("VOICE_ASR_PARTIAL_GAP_SECONDS", "0.9
 # final before releasing the mic anyway.
 ASR_SPECULATIVE = os.environ.get("VOICE_ASR_SPECULATIVE", "1").strip().lower() not in ("0", "false", "no")
 ASR_SPECULATIVE_MS = int(os.environ.get("VOICE_SPECULATIVE_MS", "5000"))
-# Vocabulary hint passed to Whisper as initial_prompt: proper nouns / brand
-# names the ASR mangles ("नोबिता" heard as "Nakota"). Keep it SHORT (one
-# line); empty = off.
-ASR_INITIAL_PROMPT = os.environ.get("ASR_INITIAL_PROMPT", "").strip() or None
+ASR_INITIAL_PROMPT = os.environ.get(
+    "ASR_INITIAL_PROMPT",
+    "नमस्ते, क्या हाल है? कोडिंग, एआई, कंप्यूटर, प्रोग्रामिंग, ऐप, डेटा, सवाल, जवाब।"
+).strip() or None
 
 # ---------- Server-side neural VAD (Silero) — the noise-immune turn-taker ----------
 #
@@ -1549,9 +1549,19 @@ class _FasterWhisperAsr:
         self._model = WhisperModel(ASR_MODEL, device=ASR_DEVICE, compute_type=ASR_COMPUTE)
 
     def transcribe(self, samples: np.ndarray, beam: int = 1, vad: bool = False) -> str:
+        # Normalize audio peak so soft speech doesn't drop into silence hallucinations
+        peak = float(np.abs(samples).max()) if samples.size else 0.0
+        if peak > 0.005:
+            samples = samples * (0.8 / max(peak, 0.15))
+
         segs, _info = self._model.transcribe(
-            samples, language=ASR_LANG, beam_size=beam,
-            condition_on_previous_text=False, vad_filter=vad,
+            samples,
+            language=ASR_LANG,
+            beam_size=beam,
+            temperature=0.0,  # Strictly deterministic: prevents hallucination ladders
+            condition_on_previous_text=False,
+            vad_filter=True,  # Strip trailing/leading silence so Whisper decodes actual speech
+            vad_parameters=dict(min_silence_duration_ms=200),
             initial_prompt=ASR_INITIAL_PROMPT,
             no_repeat_ngram_size=max(0, ASR_NO_REPEAT_NGRAM),  # 0 disables (CTranslate2 convention)
         )
@@ -1583,20 +1593,22 @@ def _warmup_asr():
         log.error("ASR warmup failed (will retry lazily on first use): %s", e)
 
 
-def _collapse_repeats(text: str) -> str:
-    """Fix Whisper repetition loops: "अगर अगर अगर अगर…" -> "अगर".
+_HALLUCINATION_PHRASES = {
+    "चुप हो जाओ", "चुप रहो", "चुप हो जा", "सब्सक्राइब करें", "सब्सक्राइब",
+    "धन्यवाद", "थैंक यू", "thank you for watching", "thanks for watching",
+    "subtitles by", "please subscribe", "like share subscribe", "you",
+}
 
-    Two passes:
-      1. an identical word repeated more than ASR_MAX_DUP times IN A ROW is
-         truncated (Hindi reduplication like "धीरे धीरे" still survives);
-      2. if a single word makes up >= 40% of the whole utterance (>= 4 times),
-         only its first two occurrences are kept — loops often RESTART mid-
-         sentence instead of staying adjacent.
-    Stray U+FFFD chars (truncated Devanagari tokens like "अ�") become spaces.
-    """
+
+def _collapse_repeats(text: str) -> str:
+    """Fix Whisper repetition loops and filter known YouTube/movie subtitle hallucinations."""
     t = (text or "").strip()
     if not t:
         return t
+    norm_check = re.sub(r"[^\w\s\u0900-\u097F]", "", t).strip().lower()
+    if norm_check in _HALLUCINATION_PHRASES:
+        log.warning("ASR hallucination dropped: '%s'", t)
+        return ""
     t = t.replace("\ufffd", " ")
     words = t.split()
     out: list[str] = []
