@@ -1365,6 +1365,13 @@ def _get_silero() -> _Silero:
 #   VOICE_SPEAKER_SIM_MIN  cosine threshold (default 0.62); raise for stricter
 SPEAKER_GATE = (os.environ.get("VOICE_SPEAKER_GATE", "auto").strip().lower() or "auto")
 SPEAKER_SIM_MIN = float(os.environ.get("VOICE_SPEAKER_SIM_MIN", "0.62"))
+# Minimum SILENCE-CONFIRMED speech (ms) an utterance must contain to be
+# transcribed. Impulse noises (finger snaps, claps, door knocks) are Silero's
+# blind spot: a loud snap can hold p(speech)>=ON for the 150ms open window,
+# but it contains almost no real voiced audio. Words are 200ms+ of voiced
+# sound; snaps land at ~30-90ms. This is measured with the same Silero model
+# that opened the utterance, so it cannot be fooled by loud-but-not-speech.
+MIN_VOICED_MS = float(os.environ.get("VOICE_MIN_VOICED_MS", "160"))
 _speaker_emb: np.ndarray | None = None
 _speaker_enc = None
 _speaker_lock = threading.Lock()
@@ -1697,6 +1704,7 @@ async def ws_asr(websocket: WebSocket):
         pre_roll: deque = deque(maxlen=int(SERVER_PRE_ROLL_S * ASR_SR / 512))
         pending512 = np.zeros(0, dtype=np.float32)
         assistant_active = False  # our TTS is playing: server VAD must not open
+        voiced_ms = 0.0      # Silero-confirmed speech inside the open utterance
 
         def finish_utterance(reason: str):
             """Close the open utterance and run the decode pipeline.
@@ -1705,17 +1713,32 @@ async def ws_asr(websocket: WebSocket):
             path (Silero silence timeout) so both get: early-decode reuse,
             speculative greedy, and the authoritative beam final.
             """
-            nonlocal open_utt, early, held, total_at_early, buf, total, new_since
+            nonlocal open_utt, early, held, total_at_early, buf, total, new_since, voiced_ms
             open_utt = False
             samples = np.concatenate(buf) if total else np.zeros(0, dtype=np.float32)
             dur_s = total / ASR_SR
             reused = early and held is not None and 0 <= total - total_at_early <= int(0.05 * ASR_SR)
             held_text = held or ""
+            voiced = voiced_ms  # capture before the reset (impulse gate below)
             early = False; held = None; total_at_early = 0
-            buf = []; total = 0; new_since = 0.0
+            buf = []; total = 0; new_since = 0.0; voiced_ms = 0.0
             if len(samples) < int(max(0.25, MIN_UTT_MS / 1000.0) * ASR_SR):
                 log.info("ASR utterance discarded (%s): %.2fs audio too short", reason, dur_s)
                 out_q.put(("rejected", "blip"))   # UI shows a dismiss chip
+                out_q.put(("final", ""))
+                return
+            # Impulse-noise gate: reject utterances with too little SILENCE-
+            # CONFIRMED speech. A finger snap/clap/knock can hold Silero open
+            # for the 150ms window, but carries almost no real voiced audio;
+            # any real word has 200ms+. Server-VAD connections only — the
+            # legacy client-VAD path has no per-frame Silero to measure with.
+            if server_mode and vad is not None and voiced < MIN_VOICED_MS:
+                log.info(
+                    "ASR utterance discarded (%s): %.0fms voiced < %.0fms min "
+                    "(impulse noise — snap/clap/knock)",
+                    reason, voiced, MIN_VOICED_MS,
+                )
+                out_q.put(("rejected", "impulse"))  # UI shows a dismiss chip
                 out_q.put(("final", ""))
                 return
             # Speaker-identity gate: is this the PRIMARY speaker (or someone
@@ -1777,11 +1800,13 @@ async def ws_asr(websocket: WebSocket):
                                 log.error("Silero unavailable (%s) — falling back to client VAD", e)
                                 server_mode = False
                                 break
+                        p_voice = vad.p(frame)
                         if open_utt:
                             buf.append(frame)
                             total += len(frame)
                             new_since += len(frame) / ASR_SR
-                        p_voice = vad.p(frame)
+                            if p_voice >= SILERO_ON_THRESH:
+                                voiced_ms += 32.0  # Silero-confirmed speech
                         if p_voice >= SILERO_ON_THRESH:
                             speech_run += 32.0; silence_run = 0.0
                         elif p_voice < SILERO_HOLD_THRESH:
@@ -1836,11 +1861,13 @@ async def ws_asr(websocket: WebSocket):
                 continue
             if ctl == "start":
                 buf.clear(); total = 0; new_since = 0.0; open_utt = True
+                voiced_ms = 0.0
                 last_partial = time.monotonic()
                 early = False; held = None; total_at_early = 0
                 continue
             if ctl == "cancel":
                 buf.clear(); total = 0; new_since = 0.0; open_utt = False
+                voiced_ms = 0.0
                 early = False; held = None; total_at_early = 0
                 continue
             if ctl == "early_end" and open_utt:
@@ -1871,6 +1898,7 @@ async def ws_asr(websocket: WebSocket):
                 finish_utterance("client-vad end")
                 continue
             if (ctl == "__noop__" or ctl is None) and open_utt and total >= int(0.5 * ASR_SR) \
+                    and voiced_ms >= MIN_VOICED_MS \
                     and new_since >= ASR_PARTIAL_MIN_NEW \
                     and time.monotonic() - last_partial >= ASR_PARTIAL_MIN_GAP:
                 new_since = 0.0
