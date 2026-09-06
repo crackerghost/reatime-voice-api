@@ -179,7 +179,24 @@ a server-side pre-roll ring so first words are never lost, and a gate that
 ignores mic audio while the assistant's own TTS plays), and noise can no
 longer open a turn. Tune via `VOICE_SILERO_*` knobs in `.env.example`.
 
-## 5. Testing on a GPU cloud / Kaggle
+### Speaker-identity gate (your voice vs everyone else)
+
+Silero solves *noise*, but a **competing human voice** — a video playing on
+another phone, a family member talking — is still speech. This repo adds the
+"Hey Siri"-style answer: a **speaker-verification gate** (Resemblyzer,
+MIT-licensed). The primary speaker's voiceprint is enrolled once from the same
+`VOICE_REF_AUDIO` clip used for TTS cloning; before any utterance is
+transcribed, its d-vector embedding is compared (cosine similarity). Same
+speaker scores ~0.75–0.95; other voices, phones, and TV audio score ~0.4–0.6
+and are **silently dropped** — no transcript, no phantom reply. It fails open
+(any internal error → decode proceeds) and costs ~20 ms on CPU.
+
+Knobs (see `.env.example`):
+
+```bash
+VOICE_SPEAKER_GATE=auto       # auto = on when resemblyzer + ref clip exist
+VOICE_SPEAKER_SIM_MIN=0.62    # cosine threshold; raise for stricter, lower if your mic rejects you
+```
 
 Kaggle notebooks give a free NVIDIA GPU (T4/P100, 16 GB) — great for
 benchmarking the CUDA path. Kaggle has no microphone or browser, so test

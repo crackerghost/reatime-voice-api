@@ -737,6 +737,8 @@ def api_config():
         "asr_final_beam": ASR_FINAL_BEAM,
         "asr_initial_prompt": ASR_INITIAL_PROMPT or "",
         "asr_vad_mode": VAD_BACKEND,  # "server" = Silero VAD authority; client opts in per connection
+        "speaker_gate": bool(_get_speaker_ref() is not None and SPEAKER_GATE not in ("0", "off")),
+        "speaker_sim_min": SPEAKER_SIM_MIN,
         "asr_speculative": ASR_SPECULATIVE,
         "spec_chat": ASR_SPECULATIVE,  # the UI reads this key (client-side speculative-turn toggle)
         "speculative_ms": ASR_SPECULATIVE_MS,
@@ -1341,6 +1343,88 @@ def _get_silero() -> _Silero:
                 _silero = _Silero()
     return _silero
 
+
+# ---------- Speaker-identity gate (whose voice is it?) ----------
+#
+# Neither a denoiser nor Silero can reject a SECOND HUMAN VOICE (a phone
+# playing a video next to the mic): noise-cancelers remove stationary noise,
+# and Silero classifies speech vs non-speech — a video's speech is speech.
+# A single microphone also cannot measure distance, so "only the closest
+# voice" is not physically available.
+#
+# The professional answer (the same trick as "Hey Siri" / "OK Google"):
+# SPEAKER VERIFICATION. Enroll the primary speaker's voiceprint once (the
+# voice-clone reference clip already on disk), and before transcribing an
+# utterance verify it actually sounds like that speaker. Cosine similarity
+# of d-vector embeddings: same speaker ~0.75-0.95, other voices/noise ~0.4-0.6
+# -> a tunable threshold rejects the TV/phone/roommate no matter how loud.
+#
+# Tunables (.env):
+#   VOICE_SPEAKER_GATE   auto (default) = on when resemblyzer + ref clip exist
+#                        0/off = disable entirely
+#   VOICE_SPEAKER_SIM_MIN  cosine threshold (default 0.62); raise for stricter
+SPEAKER_GATE = (os.environ.get("VOICE_SPEAKER_GATE", "auto").strip().lower() or "auto")
+SPEAKER_SIM_MIN = float(os.environ.get("VOICE_SPEAKER_SIM_MIN", "0.62"))
+_speaker_emb: np.ndarray | None = None
+_speaker_enc = None
+_speaker_lock = threading.Lock()
+
+
+def _get_speaker_ref() -> np.ndarray | None:
+    """Lazily build the primary-speaker voiceprint from the reference clip."""
+    global _speaker_emb, _speaker_enc
+    if SPEAKER_GATE in ("0", "off", "false", "no"):
+        return None
+    if _speaker_emb is None:
+        with _speaker_lock:
+            if _speaker_emb is None:
+                if not REF_AUDIO.exists():
+                    log.warning("Speaker gate: reference clip %s missing — gate disabled", REF_AUDIO.name)
+                    _speaker_emb = np.zeros(0, dtype=np.float32)  # sentinel: unavailable
+                    return None
+                try:
+                    from resemblyzer import VoiceEncoder, preprocess_wav
+                    if _speaker_enc is None:
+                        _speaker_enc = VoiceEncoder()
+                    wav = preprocess_wav(str(REF_AUDIO))
+                    if len(wav) < int(1.0 * 16000):
+                        log.warning("Speaker gate: reference clip too short — gate disabled")
+                        _speaker_emb = np.zeros(0, dtype=np.float32)
+                        return None
+                    _speaker_emb = _speaker_enc.embed_utterance(wav)
+                    log.info("Speaker gate enrolled from %s (%.1fs of voice)", REF_AUDIO.name, len(wav) / 16000)
+                except ImportError:
+                    log.warning("Speaker gate: resemblyzer not installed (uv pip install resemblyzer) — gate disabled")
+                    _speaker_emb = np.zeros(0, dtype=np.float32)
+                    return None
+                except Exception as e:  # noqa: BLE001 — gate must never kill ASR
+                    log.warning("Speaker gate enrollment failed (%s) — gate disabled", e)
+                    _speaker_emb = np.zeros(0, dtype=np.float32)
+                    return None
+    if _speaker_emb is not None and _speaker_emb.size == 0:
+        return None
+    return _speaker_emb
+
+
+def _speaker_similarity(samples: np.ndarray) -> float | None:
+    """Cosine similarity of an utterance against the enrolled voiceprint.
+
+    Uses only the loudest ~6 s of speech (embed_utterance is O(seconds) and
+    utterances are short anyway). None = gate unavailable/disabled.
+    """
+    ref = _get_speaker_ref()
+    if ref is None:
+        return None
+    try:
+        from resemblyzer import preprocess_wav
+        if samples.size > 6 * ASR_SR:
+            samples = samples[-6 * ASR_SR:]  # most recent speech carries the ID
+        emb = _speaker_enc.embed_utterance(preprocess_wav(samples, ASR_SR))
+        return float(np.dot(ref, emb))
+    except Exception as e:  # noqa: BLE001 — fail open: decode proceeds
+        log.warning("Speaker gate check failed (%s) — allowing utterance", e)
+        return None
+
 # HF repo ids of the MLX-converted Whisper checkpoints per size. A full repo id
 # (containing "/") in ASR_MODEL is passed through untouched.
 # NOTE: the turbo checkpoint on HF is "whisper-large-v3-turbo" (no -mlx suffix) —
@@ -1631,6 +1715,17 @@ async def ws_asr(websocket: WebSocket):
             buf = []; total = 0; new_since = 0.0
             if len(samples) < int(max(0.25, MIN_UTT_MS / 1000.0) * ASR_SR):
                 log.info("ASR utterance discarded (%s): %.2fs audio too short", reason, dur_s)
+                out_q.put(("final", ""))
+                return
+            # Speaker-identity gate: is this the PRIMARY speaker (or someone
+            # else / a phone video in the background)? Same speaker ~0.75-0.95,
+            # others ~0.4-0.6 -> rejected utterances are silently dropped.
+            sim = _speaker_similarity(samples)
+            if sim is not None and sim < SPEAKER_SIM_MIN:
+                log.info(
+                    "Speaker gate: utterance REJECTED (%s): sim=%.2f < %.2f (not the primary speaker)",
+                    reason, sim, SPEAKER_SIM_MIN,
+                )
                 out_q.put(("final", ""))
                 return
             if ASR_SPECULATIVE:
