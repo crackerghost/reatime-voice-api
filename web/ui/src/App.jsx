@@ -610,7 +610,7 @@ export default function App() {
           const t = (m.text || "").trim();
           if (t) {
             lastPartial = t;
-            v.textHeard = true;
+            vadRef.current.textHeard = true;
             setInterim(t);
           }
         } else if (m.type === "speculative") {
@@ -619,7 +619,7 @@ export default function App() {
           if (!asrBusyRef.current) return; // stale spec after a watchdog release — ignore
           const t = (m.text || "").trim();
           if (CFG.specChat && t && t.replace(/\s/g, "").length >= CFG.sendMinChars) {
-            v.textHeard = true;
+            vadRef.current.textHeard = true;
             setInterim("");
             specSentFor = t;
             lastPartial = ""; // final reconciliation only if no spec turn went out
@@ -651,7 +651,7 @@ export default function App() {
               specSentFor = ""; // close enough — the speculative reply stands
             }
           } else if (t && t.replace(/\s/g, "").length >= CFG.sendMinChars) {
-            v.textHeard = true;
+            vadRef.current.textHeard = true;
             setInterim(t);
             apiRef.current.submitChat(t); // the turn goes out with the real transcript
           } else {
