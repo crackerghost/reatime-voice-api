@@ -654,10 +654,16 @@ export default function App() {
             const tokensA = new Set(norm(specSentFor).split(/\s+/).filter(Boolean));
             const tokensB = new Set(norm(t).split(/\s+/).filter(Boolean));
             const common = [...tokensA].filter((w) => tokensB.has(w)).length;
+            const beamLen = t.replace(/\s/g, "").length;
+            const specLen = specSentFor.replace(/\s/g, "").length;
+            // Only reconcile UPWARD: the beam may add/correct text the greedy
+            // pass missed, but a SHORTER beam guess on a short clip is just
+            // noise-vs-noise — resubmitting there barge-ins our own reply.
             const diverged =
               !same &&
               tokensB.size > 0 &&
-              (common / Math.max(1, tokensA.size) < 0.5 || t.length > specSentFor.length * 1.6);
+              beamLen >= specLen &&
+              (common / Math.max(1, tokensA.size) < 0.5 || beamLen > specLen * 1.6);
             if (diverged) {
               specSentFor = "";
               setInterim(t);
