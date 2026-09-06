@@ -1640,7 +1640,17 @@ def _collapse_repeats(text: str) -> str:
     while len(out) >= 2 and len(out[-1]) == 1 and out[-1] != "न" \
             and "\u0900" <= out[-1][0] <= "\u097F":
         out.pop()
-    return " ".join(out)
+    result = " ".join(out)
+
+    # Clean colloquial fast-speech phonetic contractions common in Whisper Hindi
+    result = re.sub(r"\bपूष्रा(?:ओं)?\b", "पूछ रहा हूँ", result)
+    result = re.sub(r"\bपूछरा\b", "पूछ रहा", result)
+    result = re.sub(r"\bआरी\s+है\b", "आ रही है", result)
+    result = re.sub(r"\bआवाद\b", "आवाज़", result)
+    result = re.sub(r"\bकिनी\b", "कि नहीं", result)
+    result = re.sub(r"\bरुग\b", "रुको", result)
+    result = re.sub(r"\bकुչ\b", "कुछ", result)
+    return result
 
 
 def _whisper_text(samples: np.ndarray, beam: int = 1, vad: bool = False) -> str:
