@@ -103,7 +103,7 @@ DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.0"))      # rate when a r
 STEP_MIN = int(os.environ.get("VOICE_STEP_MIN", "4"))
 STEP_MAX = int(os.environ.get("VOICE_STEP_MAX", "64"))
 GREETING_MAX = int(os.environ.get("VOICE_GREETING_MAX", "2"))  # sentences for small-talk replies
-FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "40"))  # chars in 1st audio window (small = fast first audio)
+FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "30"))  # chars in 1st audio window (small = fast first audio)
 
 # MPS (Apple Silicon) / CUDA run best in fp16; CPU falls back to fp32.
 # Override with VOICE_API_DEVICE=cpu|mps|cuda and VOICE_API_DTYPE=fp16|fp32.
@@ -1429,6 +1429,8 @@ async def ws_asr(websocket: WebSocket):
     client -> {"type": "start"}             begin an utterance (clears the buffer)
     client -> {"type": "end"}               end it -> authoritative final transcript
     client -> {"type": "cancel"}            discard the current utterance
+    client -> {"type": "early_end"}         silence started: pre-decode while the end-of-speech tail counts down
+    client -> {"type": "resume"}            user kept talking: discard the early decode and continue
     client -> <binary>                        float32 mono PCM @ 16 kHz while talking
     server -> {"type": "partial", "text"}   live caption (throttled by new-audio / gap)
     server -> {"type": "speculative", "text"}  fast greedy transcript at "end" (if enabled)
@@ -1460,7 +1462,7 @@ async def ws_asr(websocket: WebSocket):
                         except Exception:
                             pass
                         continue
-                    ctrl_q.put(mtype or "__close__" if mtype in ("start", "end", "cancel") else "__noop__")
+                    ctrl_q.put(mtype or "__close__" if mtype in ("start", "end", "cancel", "early_end", "resume") else "__noop__")
         except Exception:
             ctrl_q.put("__close__")
 
@@ -1471,6 +1473,9 @@ async def ws_asr(websocket: WebSocket):
         new_since = 0.0      # seconds of audio since the last partial run
         last_partial = 0.0   # monotonic time of the last partial run
         open_utt = False
+        early = False        # early_end seen: speculative decode ran during the silence tail
+        held = None          # that pre-decoded transcript (reused at "end" if no new audio)
+        total_at_early = 0   # buffer size when early_end arrived (reuse check)
         while not stop_evt.is_set():
             try:
                 ctl = ctrl_q.get(timeout=0.05)
@@ -1491,13 +1496,45 @@ async def ws_asr(websocket: WebSocket):
             if ctl == "start":
                 buf.clear(); total = 0; new_since = 0.0; open_utt = True
                 last_partial = time.monotonic()
+                early = False; held = None; total_at_early = 0
                 continue
             if ctl == "cancel":
                 buf.clear(); total = 0; new_since = 0.0; open_utt = False
+                early = False; held = None; total_at_early = 0
+                continue
+            if ctl == "early_end" and open_utt:
+                # Overlap trick: the client reports the moment silence starts
+                # (its end-of-speech tail begins counting). Run the speculative
+                # greedy decode NOW, in parallel with that tail, so at "end" the
+                # transcript is already ready — the greedy pass leaves the
+                # critical path entirely. "resume" discards it if the user kept
+                # talking.
+                if total >= int(0.25 * ASR_SR):
+                    snap = np.concatenate(buf)
+                    t = time.perf_counter()
+                    try:
+                        held = _whisper_text(snap)
+                    except Exception:  # noqa: BLE001 — best-effort pre-decode
+                        held = None
+                    log.info(
+                        "ASR early decode: %.2fs for %.2fs audio (overlapped with tail)",
+                        time.perf_counter() - t, total / ASR_SR,
+                    )
+                    total_at_early = total
+                    early = True
+                continue
+            if ctl == "resume" and open_utt:
+                early = False; held = None; total_at_early = 0  # pre-decode is stale now
                 continue
             if ctl == "end":
                 open_utt = False
                 samples = np.concatenate(buf) if total else np.zeros(0, dtype=np.float32)
+                dur_s = total / ASR_SR
+                # reuse the early pre-decode if at most a stray in-flight frame
+                # (~<=50 ms) arrived after the snapshot
+                reused = early and held is not None and 0 <= total - total_at_early <= int(0.05 * ASR_SR)
+                held_text = held or ""
+                early = False; held = None; total_at_early = 0
                 buf.clear(); total = 0; new_since = 0.0
                 # ignore sub-250 ms buffers (pure noise blips); the real turn
                 # gets the accurate beam-search + VAD-trimmed decode
@@ -1506,16 +1543,26 @@ async def ws_asr(websocket: WebSocket):
                     continue
                 # 1) SPECULATIVE: one fast greedy decode, sent before the beam
                 #    final so the browser can start the LLM turn immediately.
+                #    If "early_end" already decoded this buffer during the
+                #    silence tail, reuse it (0.00s on the critical path).
                 if ASR_SPECULATIVE:
-                    try:
-                        spec = _whisper_text(samples)
-                    except Exception:  # noqa: BLE001 — greedy is best-effort
-                        spec = ""
+                    if reused:
+                        spec = held_text
+                        log.info("ASR greedy: reused early decode (0.00s on critical path)")
+                    else:
+                        try:
+                            t = time.perf_counter()
+                            spec = _whisper_text(samples)
+                            log.info("ASR greedy: %.2fs for %.2fs audio", time.perf_counter() - t, dur_s)
+                        except Exception:  # noqa: BLE001 — greedy is best-effort
+                            spec = ""
                     if spec:
                         out_q.put(("speculative", spec))
                 # 2) AUTHORITATIVE final: beam search + VAD trimming.
                 try:
+                    t = time.perf_counter()
                     final = _whisper_text(samples, beam=ASR_FINAL_BEAM, vad=True)
+                    log.info("ASR beam: %.2fs for %.2fs audio", time.perf_counter() - t, dur_s)
                 except Exception as e:  # noqa: BLE001 — report; never kill the worker
                     log.exception("ASR final decode failed")
                     out_q.put(("error", f"ASR decode failed: {type(e).__name__}: {e}"))

@@ -824,9 +824,17 @@ export default function App() {
 
       if (streamingRef.current && voiceHeard && !assistantBusy) {
         if (hot || inHold || recActive) {
-          v.voiceSilentSince = 0; // still talking (or holding through a dip)
+          if (v.voiceSilentSince) {
+            v.voiceSilentSince = 0; // resumed within the silence tail
+            asrSendJson({ type: "resume" }); // void any early pre-decode
+          }
         } else {
-          if (!v.voiceSilentSince) v.voiceSilentSince = now;
+          if (!v.voiceSilentSince) {
+            v.voiceSilentSince = now;
+            // silence just started -> server pre-decodes NOW while this tail
+            // counts down; the "end" below then reuses that decode instantly
+            asrSendJson({ type: "early_end" });
+          }
           else if (now - v.voiceSilentSince > CFG.autoSendMs) {
             v.voiceSilentSince = 0;
             v.hotTicks = 0;
