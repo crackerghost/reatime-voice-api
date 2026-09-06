@@ -151,7 +151,7 @@ VOICE_ASR_PARTIAL_GAP_SECONDS=0.9
 VOICE_ASR_SPECULATIVE=1              # 1 = fast greedy transcript fires the reply before the beam final (lower latency)
 VOICE_MIN_WINDOW_CHARS=24            # min chars a non-final TTS window must have (stops tiny 2-3 word chunks)
 VOICE_SPECULATIVE_MS=5000            # how long the client waits for the final before releasing the mic anyway
-VOICE_AUTO_SEND_MS=280               # end-of-speech silence tail before the utterance is sent (lower = snappier turns)
+VOICE_AUTO_SEND_MS=750               # end-of-speech silence tail before the utterance is sent (lower = snappier turns)
 ```
 
 ## 5. Testing on a GPU cloud / Kaggle
@@ -197,6 +197,7 @@ Notes:
 | Assistant still hears itself | Use headphones / lower volume (AEC needs a clear echo reference); confirm the reply is playing through the same tab's speakers |
 | No web UI after `git clone` | `web/ui/dist` is git-ignored — run `cd web/ui && npm install && npm run build` |
 | Chat says "LLM API key not configured" | Add `GROQ_API_KEY` (consoles.groq.com) to `.env` and restart the server |
+| Assistant answers while you're still mid-sentence (server log shows many `Processing audio with duration 00:01…` lines) | End-of-speech tail is too short — raise `VOICE_AUTO_SEND_MS` to 700–900 (it cuts off speech in 1–2 s fragments, each firing a reply) |
 | Generated speech sounds flat/robotic | Raise `VOICE_NUM_STEP`, and/or re-record a cleaner `my_voice.wav` with clear pauses |
 
 ## License & ethics

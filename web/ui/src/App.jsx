@@ -18,7 +18,7 @@ const CFG = {
   wsReconnectMs: 1500,
   recRestartMs: 400,
   vadTickMs: 50,
-  autoSendMs: 280,
+  autoSendMs: 750, // end-of-speech silence tail; <500ms chops speech into fragments that each fire a reply
   specChat: true, // server sends a fast "speculative" transcript; reply starts on it, final reconciles
   sendMinChars: 2, // min non-space chars to treat as real words
   vadNoiseFloor: 0.005,

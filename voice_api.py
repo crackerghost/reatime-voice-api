@@ -44,6 +44,11 @@ from pydantic import BaseModel, Field, model_validator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("voice_api")
+# faster-whisper (and its vad/silero deps) log an INFO line per decode
+# ("Processing audio with duration 00:01.250") — with streaming ASR that is a
+# firehose 2-3x per second while you talk. Our own logger reports the same
+# events usefully, so quiet theirs down.
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
 HERE = Path(__file__).resolve().parent
 
@@ -689,7 +694,7 @@ def api_config():
         "ws_reconnect_ms": int(os.environ.get("VOICE_WS_RECONNECT_MS", "1500")),
         "rec_restart_ms": int(os.environ.get("VOICE_REC_RESTART_MS", "400")),
         "vad_tick_ms": int(os.environ.get("VOICE_VAD_TICK_MS", "50")),
-        "auto_send_ms": int(os.environ.get("VOICE_AUTO_SEND_MS", "280")),
+        "auto_send_ms": int(os.environ.get("VOICE_AUTO_SEND_MS", "750")),
         "send_min_chars": int(os.environ.get("VOICE_SEND_MIN_CHARS", "2")),
         # VAD energy gates (ms of sustained energy etc.)
         "vad_noise_floor": float(os.environ.get("VOICE_VAD_NOISE", "0.005")),
