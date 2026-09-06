@@ -184,9 +184,9 @@ def _pick_speed(sent: str, base: float = 1.0) -> float:
 
 
 # ---------- LLM: OpenAI-compatible chat endpoint (default Groq, gpt-oss-120b) ----------
-LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
-LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.7"))
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
+LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.6"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1000"))
 # gpt-oss models "think" before answering — reasoning tokens count against
 # max_tokens, so a small budget can end with EMPTY content (silent no-reply).
 # "low" keeps first-audio fast; set LLM_REASONING_EFFORT="" to omit the param.
@@ -1237,7 +1237,7 @@ ASR_COMPUTE = (os.environ.get("ASR_COMPUTE", "").strip().lower()
 # Model size (shared by both backends): "small" is the smallest Whisper size
 # that transcribes Hindi well (base/tiny mangle it). On CUDA small is
 # realtime; on the M4 the mlx backend makes it ~10x realtime.
-ASR_MODEL = os.environ.get("ASR_MODEL", "") or "small"
+ASR_MODEL = os.environ.get("ASR_MODEL", "") or "large-v3-turbo"
 # Spoken language: "hi" = Hindi/Hinglish, accurate and fast (no detection
 # pass). LEAVE EMPTY only for true multilingual mode — auto-detect is great
 # for English but routinely mislabels SHORT Hindi clips (es/ru/ur/si).
@@ -1247,7 +1247,7 @@ ASR_SR = 16000
 # decode + VAD trimming (better Hinglish accuracy for ~1.5x the cost of one
 # greedy pass, once per utterance). Live captions stay greedy/beam-1.
 # mlx-whisper 0.4.x has no beam decoder, so it always decodes greedily.
-ASR_FINAL_BEAM = int(os.environ.get("ASR_FINAL_BEAM", "5"))
+ASR_FINAL_BEAM = int(os.environ.get("ASR_FINAL_BEAM", "1"))
 # Anti-repetition loops ("अगर अगर अगर…"): every transcript passes through
 # _collapse_repeats(), the mlx decoder keeps Whisper's temperature fallback
 # ladder (we used to force temperature=0.0, which DISABLED loop detection),
@@ -1291,11 +1291,9 @@ VAD_MODE = (os.environ.get("ASR_VAD_MODE", "auto").strip().lower() or "auto")
 SILERO_ON_THRESH = float(os.environ.get("VOICE_SILERO_ON", "0.55"))     # p(voice) to OPEN (high = noise-proof)
 SILERO_HOLD_THRESH = float(os.environ.get("VOICE_SILERO_HOLD", "0.35"))  # p(voice) to STAY open (hysteresis)
 SILERO_ON_MS = int(os.environ.get("VOICE_SILERO_ON_MS", "150"))          # speech this long opens the turn
-# Silence this long closes it. 1200ms (not 700ms) on purpose: humans pause
-# 700-1100ms while thinking mid-sentence, and a shorter window split one
-# sentence into two turns — the first fragment got submitted alone ("short
-# text, text skipped") and the rest barge-in'd as a second turn.
-SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "1200"))
+# Silence this long closes it. 550ms balances conversational speed and natural
+# pauses without splitting utterances.
+SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "550"))
 SERVER_PRE_ROLL_S = float(os.environ.get("VOICE_SERVER_PRE_ROLL_S", "0.4"))  # kept before the open decision
 MIN_UTT_MS = int(os.environ.get("VOICE_MIN_UTT_MS", "300"))              # shorter utterances are discarded as blips
 
@@ -1756,6 +1754,25 @@ async def ws_asr(websocket: WebSocket):
                 out_q.put(("rejected", "speaker"))  # UI shows a dismiss chip
                 out_q.put(("final", ""))
                 return
+            if ASR_FINAL_BEAM <= 1:
+                # Fast single-pass decode: greedy Whisper on large-v3-turbo
+                if reused:
+                    final = held_text
+                    log.info("ASR: reused early decode (0.00s on critical path)")
+                else:
+                    try:
+                        t = time.perf_counter()
+                        final = _whisper_text(samples)
+                        log.info("ASR: %.2fs for %.2fs audio (%s)", time.perf_counter() - t, dur_s, reason)
+                    except Exception as e:  # noqa: BLE001 — report; never kill the worker
+                        log.exception("ASR decode failed")
+                        out_q.put(("error", f"ASR decode failed: {type(e).__name__}: {e}"))
+                        return
+                if ASR_SPECULATIVE and final:
+                    out_q.put(("speculative", final))
+                out_q.put(("final", final))
+                return
+
             if ASR_SPECULATIVE:
                 if reused:
                     spec = held_text
