@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FaClock, FaMicrophone, FaPaperPlane, FaStop, FaTrash, FaVolumeHigh, FaWandMagicSparkles } from "react-icons/fa6";
+import { FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTrash, FaVolumeHigh, FaWandMagicSparkles } from "react-icons/fa6";
 import AuraGlobe from "./AuraGlobe.jsx";
 import { engine } from "./audioEngine.js";
 
-const GREETING = "नमस्ते! मैं आपका हिंदी असिस्टेंट हूँ। माइक दबाएँ या लिखकर पूछिए — और जब मैं बोलूँ तो बीच में कुछ भी बोलिए, मैं तुरंत रुक जाऊँगा।";
+const GREETING = "नमस्ते! मैं आपका हिंदी ट्यूटर हूँ। माइक दबाकर बोलिए, लिखकर पूछिए, या स्क्रीन शेयर करके दिखाइए क्या समझना है — और जब मैं बोलूँ तो बीच में कुछ भी बोलिए, मैं तुरंत रुक जाऊँगा।";
 const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/tts`;
 const ASR_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/asr`;
 const CONFIG_URL = `${location.protocol}//${location.host}/api/config`;
+const VISION_URL = `${location.protocol}//${location.host}/api/vision`;
 
 /* Live tunables, fetched once from the backend /api/config (which reads them
    from .env). Everything here mirrors an env var server-side, so tuning
@@ -31,6 +32,9 @@ const CFG = {
   vadRecActiveMs: 400, // recognizer counts as active within this window
   asrVadMode: "auto", // "server" = Silero VAD on the server owns turn-taking (noise-proof)
   bargeIdleMs: 900, // recognizer-idle safety-net send delay
+  visionEnabled: false, // server has a VISION_API_KEY (screen understanding ready)
+  screenTickMs: 1200, // screen change-detection cadence while sharing
+  screenPrefetchMs: 8000, // min gap between background /api/vision warm-ups
 };
 const num = (v, d) => (v === undefined || v === null || Number.isNaN(Number(v)) ? d : Number(v));
 const mergeCfg = (c) => {
@@ -53,6 +57,9 @@ const mergeCfg = (c) => {
   CFG.asrVadMode = c.asr_vad_mode || CFG.asrVadMode;
   CFG.bargeIdleMs = num(c.barge_idle_ms, CFG.bargeIdleMs);
   CFG.specChat = c.spec_chat !== undefined ? !!c.spec_chat : CFG.specChat; // live tunable
+  CFG.visionEnabled = c.vision_enabled !== undefined ? !!c.vision_enabled : CFG.visionEnabled;
+  CFG.screenTickMs = num(c.screen_tick_ms, CFG.screenTickMs);
+  CFG.screenPrefetchMs = num(c.screen_prefetch_ms, CFG.screenPrefetchMs);
 };
 if (typeof fetch === "function") {
   fetch(CONFIG_URL)
@@ -81,6 +88,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
+  const [sharing, setSharing] = useState(false); // screen share active
 
   // ---- mutable runtime state (safe across renders) ----
   const wsRef = useRef(null);
@@ -100,6 +108,17 @@ export default function App() {
   const asrOpenRef = useRef(false);
   const asrBusyRef = useRef(false); // a "final" transcript is on its way
   const streamingRef = useRef(false); // mic PCM currently being sent to the ASR
+  // Screen-share state: hidden <video> + change detection + latest JPEG frame.
+  const sharingRef = useRef(false); // mirror of `sharing` for stable callbacks
+  const screenStreamRef = useRef(null);
+  const screenVideoRef = useRef(null);
+  const screenTickRef = useRef(0);
+  const screenCanvasRef = useRef(null); // full-size JPEG encoder canvas
+  const screenDiffCanvasRef = useRef(null); // 32x24 grayscale diff canvas
+  const screenDiffRef = useRef(null); // previous downsampled gray frame
+  const screenFrameRef = useRef(null); // { b64, hash, ts } — newest changed frame
+  const lastSentHashRef = useRef(""); // hash already attached to a chat turn
+  const lastPrefetchAtRef = useRef(0); // last background /api/vision warm-up
   // VAD state — thresholds/initial values come from CFG (env-driven).
   const vadRef = useRef({
     noise: CFG.vadNoiseFloor, // adaptive ambient floor (updated when idle)
@@ -252,6 +271,112 @@ export default function App() {
     setSpeaking(false);
   }, []);
 
+  /* ---- screen share: capture + change detection + Qwen2.5-VL warm-up ----
+     Latency design: the vision call NEVER sits on the reply's critical path
+     more than once. While sharing, a 1.2 s loop downsamples each capture to
+     32x24 gray and compares block-wise; only a real change produces a new
+     JPEG, which is sent to /api/vision in the BACKGROUND (warm cache) so the
+     description is ready before the user even asks. submitChat then attaches
+     the freshest frame+hash; the server answers from cache instantly. */
+  const stopScreenShare = useCallback(() => {
+    sharingRef.current = false;
+    setSharing(false);
+    if (screenTickRef.current) { clearInterval(screenTickRef.current); screenTickRef.current = 0; }
+    const stream = screenStreamRef.current;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    screenStreamRef.current = null;
+    const vid = screenVideoRef.current;
+    if (vid) { try { vid.srcObject = null; } catch { /* noop */ } }
+    screenFrameRef.current = null;
+    screenDiffRef.current = null;
+    lastSentHashRef.current = "";
+  }, []);
+
+  /* One capture tick: downsample -> change detect -> encode JPEG on change ->
+     background warm-up call. Runs every CFG.screenTickMs while sharing. */
+  const screenTick = () => {
+    const vid = screenVideoRef.current;
+    if (!vid || !sharingRef.current || !vid.videoWidth) return;
+    if (!screenCanvasRef.current) {
+      screenCanvasRef.current = document.createElement("canvas");
+      screenDiffCanvasRef.current = document.createElement("canvas");
+      screenDiffCanvasRef.current.width = 32;
+      screenDiffCanvasRef.current.height = 24;
+    }
+    // 1) downsample to 32x24 gray and build a cheap signature
+    const dctx = screenDiffCanvasRef.current.getContext("2d", { willReadFrequently: true });
+    dctx.drawImage(vid, 0, 0, 32, 24);
+    const px = dctx.getImageData(0, 0, 32, 24).data;
+    const gray = new Uint8Array(32 * 24);
+    let sig = 0;
+    for (let i = 0, j = 0; i < gray.length; i++, j += 4) {
+      gray[i] = (px[j] * 299 + px[j + 1] * 587 + px[j + 2] * 114) / 1000;
+      sig = (sig * 31 + gray[i]) | 0;
+    }
+    // 2) block-diff vs previous frame — cursor blinks / tiny animations stay silent
+    const prev = screenDiffRef.current;
+    let changed = !prev;
+    if (prev) {
+      let diff = 0;
+      for (let i = 0; i < gray.length; i++) diff += Math.abs(gray[i] - prev[i]);
+      changed = diff > 320; // ~0.4% of the frame fully flipped
+    }
+    screenDiffRef.current = gray;
+    if (!changed) return;
+    // 3) encode the real frame (max 1280px wide, q0.7 ≈ 100-250 KB)
+    const hash = `s${sig >>> 0}`;
+    const scale = Math.min(1, 1280 / vid.videoWidth);
+    const c = screenCanvasRef.current;
+    c.width = Math.round(vid.videoWidth * scale);
+    c.height = Math.round(vid.videoHeight * scale);
+    c.getContext("2d").drawImage(vid, 0, 0, c.width, c.height);
+    const b64 = c.toDataURL("image/jpeg", 0.7).split(",")[1];
+    screenFrameRef.current = { b64, hash, ts: Date.now() };
+    // 4) background warm-up: describe the NEW screen now so the reply later
+    //    hits the server cache and pays ZERO vision latency.
+    const now = Date.now();
+    if (now - lastPrefetchAtRef.current >= CFG.screenPrefetchMs) {
+      lastPrefetchAtRef.current = now;
+      fetch(VISION_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: b64, hash }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => j && console.info(`[vision] warm cache ${j.cached ? "HIT" : "FILLED"} (${(j.description || "").length} chars)`))
+        .catch(() => {});
+    }
+  };
+
+  const startScreenShare = useCallback(async () => {
+    if (sharingRef.current) { stopScreenShare(); return; }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      showError("इस ब्राउज़र में स्क्रीन शेयर उपलब्ध नहीं है — Chrome/Edge आज़माएँ।");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 5 }, audio: false,
+      });
+      const vid = document.createElement("video");
+      vid.srcObject = stream;
+      vid.muted = true;
+      vid.playsInline = true;
+      await vid.play().catch(() => {});
+      screenStreamRef.current = stream;
+      screenVideoRef.current = vid;
+      screenDiffRef.current = null;
+      lastSentHashRef.current = "";
+      sharingRef.current = true;
+      setSharing(true);
+      stream.getVideoTracks()[0]?.addEventListener("ended", stopScreenShare); // user hit "Stop sharing"
+      screenTickRef.current = setInterval(screenTick, CFG.screenTickMs);
+    } catch (e) {
+      if (e && e.name !== "NotAllowedError") showError("स्क्रीन शेयर शुरू नहीं हो पाया: " + (e.message || e.name));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stopScreenShare]);
+
   /* ---- submit a new user turn ---- */
   const submitChat = useCallback(
     (rawText) => {
@@ -274,7 +399,20 @@ export default function App() {
       openAssistantId.current = null;
       assistantTextRef.current = "";
       setTyping(true);
-      ws.send(JSON.stringify({ type: "chat", text, history: historyRef.current, nfe_step: CFG.chatStep }));
+      const payload = { type: "chat", text, history: historyRef.current, nfe_step: CFG.chatStep };
+      // Screen understanding: while sharing, attach the newest CHANGED frame.
+      // The server describes it cache-first by hash — a warm cache means the
+      // LLM starts with screen context at ZERO extra vision latency.
+      if (sharingRef.current && screenFrameRef.current) {
+        const f = screenFrameRef.current;
+        if (f.hash !== lastSentHashRef.current) {
+          payload.screen = { image: f.b64, hash: f.hash };
+          lastSentHashRef.current = f.hash;
+        }
+        // stale frame (older than 15 s) still helps, but fresh ones are best —
+        // the server's 10-min TTL cache covers the gap either way.
+      }
+      ws.send(JSON.stringify(payload));
     },
     [hardStop]
   );
@@ -282,6 +420,7 @@ export default function App() {
   apiRef.current = {
     submitChat,
     hardStop,
+    toggleScreenShare: () => (sharingRef.current ? stopScreenShare() : startScreenShare()),
     setSpeaking: (v) => {
       speakingRef.current = v;
       setSpeaking(v);
@@ -1190,6 +1329,18 @@ export default function App() {
 
               {/* composer */}
               <div className="flex items-center gap-2 border-t border-slate-100 p-3">
+                <button
+                  onClick={() => apiRef.current.toggleScreenShare && apiRef.current.toggleScreenShare()}
+                  title={sharing ? "स्क्रीन शेयर बंद करें" : "स्क्रीन शेयर करें — मैं देखकर समझाऊँगा"}
+                  disabled={!CFG.visionEnabled}
+                  className={`flex h-11 w-11 items-center justify-center rounded-full shadow-md transition disabled:opacity-40 ${
+                    sharing
+                      ? "animate-pulse bg-emerald-500 text-white shadow-emerald-200"
+                      : "bg-white text-slate-600 ring-1 ring-slate-200 hover:ring-emerald-300"
+                  }`}
+                >
+                  <FaDesktop className="h-4 w-4" />
+                </button>
                 <input
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
@@ -1237,8 +1388,17 @@ export default function App() {
             </div>
             <div className="mt-2 flex items-center justify-between px-2 pb-1">
               <p className="flex items-center gap-1.5 text-[11px] text-slate-400">
-                <FaMicrophone className="h-3 w-3 text-slate-400" />
-                माइक चालू करके बोलिए — बीच में बोलने पर मैं रुक जाता हूँ
+                {sharing ? (
+                  <>
+                    <FaDesktop className="h-3 w-3 text-emerald-500" />
+                    स्क्रीन देख रहा हूँ — बदलाव पर नए सवाल का जवाब तुरंत मिलेगा
+                  </>
+                ) : (
+                  <>
+                    <FaMicrophone className="h-3 w-3 text-slate-400" />
+                    माइक चालू करके बोलिए — बीच में बोलने पर मैं रुक जाता हूँ
+                  </>
+                )}
               </p>
               <button
                 onClick={() => {

@@ -231,7 +231,41 @@ Notes:
 - Outputs are saved as `output_step<num>.wav` next to `main.py`; listen inline
   with `IPython.display.Audio` or download them.
 
-## 6. Troubleshooting
+## 6. Screen understanding (Qwen2.5-VL, optional)
+
+The UI's screen-share button lights up when a vision engine is available.
+While sharing, the browser captures frames, detects changes client-side
+(32×24 gray block-diff, ~1.2 s cadence), and describes only CHANGED screens
+via `POST /api/vision`. Descriptions are cached by the client's change hash,
+so an unchanged screen costs ZERO vision calls, and a changed screen is
+described in the BACKGROUND before you ask — the reply itself pays no vision
+latency.
+
+Two engines (`VISION_BACKEND`):
+
+- **`local` / `auto` without a key — the Kaggle path.** Qwen2.5-VL-3B-Instruct
+  runs IN this process (transformers, fp16 ≈ 4.5 GB VRAM on CUDA — fits a T4
+  next to OmniVoice + Whisper). No API key, no extra server; the model loads
+  lazily on the first screen share so boot time is unchanged.
+  Needs `pip install transformers pillow accelerate` (already in
+  requirements.txt).
+- **`api` — hosted, no VRAM.** Any OpenAI-compatible vision endpoint:
+  DashScope (default), OpenRouter, Together. Needs `VISION_API_KEY` (or
+  `DASHSCOPE_API_KEY`). `auto` (default) prefers the API when a key is set
+  and falls back to the local model otherwise.
+
+```bash
+# .env — screen understanding
+VISION_BACKEND=auto                                        # auto | api | local
+VISION_API_KEY=...                                         # hosted engine only (or DASHSCOPE_API_KEY)
+VISION_LOCAL_MODEL=Qwen/Qwen2.5-VL-3B-Instruct             # local engine (default, T4-friendly)
+VISION_MODEL=qwen2.5-vl-7b-instruct                        # hosted engine model
+```
+
+Screen context is injected into the chat system prompt for that turn, so you
+can ask "यह एरर क्यों आ रहा है?" or "इस कोड में क्या गड़बड़ है?" by voice.
+
+## 7. Troubleshooting
 
 | Symptom | Fix |
 | ------- | --- |

@@ -193,10 +193,23 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1000"))
 LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
 MISTRAL_URL = os.environ.get("MISTRAL_URL", "https://api.groq.com/openai/v1/chat/completions")
 LLM_STREAM_TIMEOUT = float(os.environ.get("VOICE_LLM_TIMEOUT", "120.0"))  # httpx stream read timeout (s)
+# Extra attempts for TRANSIENT LLM failures (429 rate-limit, 5xx, network
+# blips, empty content). 0 = try once. Retries only happen before the first
+# sentence is spoken, so a retry can never interrupt a playing reply.
+LLM_RETRIES = int(os.environ.get("LLM_RETRIES", "2"))
 
 LLM_SYSTEM_PROMPT = (
-    "तुम एक मस्त और चिल हिंदी टीचर हो जो हर चीज़ एकदम सिंपल तरीके से और "
-    "एग्ज़ाम्पल देकर समझाता है — जैसे कोई जेन-ज़ी दोस्त बात कर रहा हो। "
+    "तुम 'साथी' हो — एक प्रोफेशनल ट्यूटर जो बातचीत में दोस्त जैसा है। तुम्हारा काम "
+    "है: कोई भी चीज़ इतनी आसान बनाकर समझाना कि यूज़र को लगे 'अरे, इतना सिंपल था!'। "
+    "तुम टेंशन वाले सवालों को भी आराम से हैंडल करते हो — पहले यूज़र को शांत करते हो "
+    "कोई छोटी सी रिलीफ़ लाइन से, फिर एकदम क्लियर जवाब देते हो। कभी घबराते नहीं, "
+    "कभी लेक्चर नहीं देते, कभी यूज़र को छोटा महसूस नहीं कराते। "
+    "पढ़ाने का तरीका (हर बार यही फ्लो): १) पहले एक लाइन में सीधा जवाब, २) फिर २-३ "
+    "छोटे कदम या कारण बताओ कि ऐसा क्यों होता है, ३) फिर एक रोज़मर्रा एग्ज़ाम्पल "
+    "जैसे 'जैसे-...', ४) अंत में एक छोटा सवाल जो यूज़र को आगे बढ़ाए, जैसे 'अब "
+    "बताओ, किस हिस्से में डाउट है?'। जवाब में यूज़र को प्रोत्साहित करते रहो — "
+    "'अच्छा सवाल', 'बिल्कुल सही सोचा', 'बस थोड़ा और' जैसी लाइनें सच में फिट हों "
+    "तभी। "
     "सबसे ज़रूरी नियम: शुद्ध / फॉर्मल संस्कृतनिष्ठ हिंदी कभी मत लिखो। "
     "जवाब हमेशा पूरी तरह देवनागरी लिपि में लिखो — एक भी अंग्रेज़ी अक्षर "
     "(a-z, A-Z) मत लिखो। अंग्रेज़ी शब्दों को भी देवनागरी में लिखो, जैसे: एआई, "
@@ -213,24 +226,26 @@ LLM_SYSTEM_PROMPT = (
     "करो — यूज़र की आख़िरी ग़लत स्पेलिंग कभी मत दोहराओ। यूज़र के सही किए नाम का "
     "कोई ज़िक्र मत करो — सीधे सही नाम इस्तेमाल करो, जैसे कोई दोस्त सुनकर समझ "
     "गया हो। "
-    "टोन: एक दोस्त जैसा, आसान और नैचुरल — नकली जेन-ज़ी नकल मत बनो। कैज़ुअल "
-    "शब्द (मतलब, यार, भाई, चिल, टेंशन, एकदम) केवल तब इस्तेमाल करो जब वो सच में "
-    "फिट हों, बाकी वाक्य साफ़ सीधी बोलचाल की हिंदी में लिखो। "
-    "एग्ज़ाम्पल — सुध है ❌: 'कंप्यूटर को मानव की तरह सोचने और काम करने की क्षमता देना।' "
-    "एग्ज़ाम्पल — जेन-ज़ी है ✅: 'एआई का मतलब है कंप्यूटर को इतना स्मार्ट बनाना "
-    "कि वो खुद सोच सके — बेसिकली एक सुपर-स्मार्ट दोस्त जैसा।' "
-    "ऐसे ही बात करो: छोटे वाक्य, आसान शब्द, जैसे व्हाट्सऐप पर दोस्त को लिखते हो। "
-    "कठिन या औपचारिक शब्द मत लिखो — 'क्षमता' नहीं, 'पावर या कैपेबिलिटी'; "
-    "'आवश्यकता' नहीं, 'ज़रूरत'; 'उदाहरण' की जगह 'एग्ज़ाम्पल'; 'जानकारी' की जगह "
-    "'इंफो या जानकारी'। "
-    "जरूरी नियम (सबसे पहले याद रखो): अगर उपयोगकर्ता सिर्फ अभिवादन या हालचाल पूछ "
+    "टोन: प्रोफेशनल लेकिन नैचुरल — नकली जेन-ज़ी नकल मत बनो। कैज़ुअल शब्द "
+    "(मतलब, यार, भाई, चिल, एकदम) केवल तब इस्तेमाल करो जब वो सच में फिट हों, "
+    "बाकी वाक्य साफ़ सीधी बोलचाल की हिंदी में लिखो। कठिन या औपचारिक शब्द मत "
+    "लिखो — 'क्षमता' नहीं, 'पावर या कैपेबिलिटी'; 'आवश्यकता' नहीं, 'ज़रूरत'; "
+    "'उदाहरण' की जगह 'एग्ज़ाम्पल'; 'जानकारी' की जगह 'इंफो या जानकारी'। "
+    "स्क्रीन के बारे में: कभी-कभी तुम्हें यूज़र की स्क्रीन का हाल एक 'स्क्रीन "
+    "कॉन्टेक्स्ट' ब्लॉक में मिलता है। अगर वो ब्लॉक मौजूद है, तो उसे १००% सच मानो — "
+    "यूज़र को वही दिख रहा है। यूज़र के सवाल को स्क्रीन से जोड़कर जवाब दो, जैसे तुम "
+    "स्क्रीन साथ बैठकर देख रहे हो। स्क्रीन पर कोई एरर, वार्निंग या दिक्कत दिखे तो "
+    "पहले एक लाइन में बताओ स्क्रीन पर क्या गड़बड़ है, फिर २-३ आसान कदम बताओ जिनसे "
+    "वो ठीक होगी। यूज़र से कभी मत कहो कि तुम्हें 'कॉन्टेक्स्ट' या 'डिस्क्रिप्शन' मिला "
+    "है — सीधे 'आपकी स्क्रीन पर ...' कहकर बात करो। अगर यूज़र स्क्रीन के बारे में "
+    "पूछे और स्क्रीन का हाल न मिला हो, तो मस्त अंदाज़ में बोलो कि स्क्रीन शेयर बटन "
+    "दबाकर स्क्रीन शेयर करें, फिर मैं देखकर बताऊँगा। "
+    "जरूरी नियम: अगर उपयोगकर्ता सिर्फ अभिवादन या हालचाल पूछ "
     "रहा है (जैसे 'नमस्ते', 'हेलो', 'हाय', 'कैसे हो', 'क्या चल रहा है', 'क्या हाल', "
     "'hello', 'hi', 'how are you'), तो सिर्फ १-२ वाक्य का सीधा, स्वाभाविक जवाब दो "
-    "जैसे 'मैं बहुत अच्छा हूँ यार, तुम कैसे हो?' — कोई एग्ज़ाम्पल मत दो, कोई सवाल "
-    "मत जोड़ो, बहुत ज़्यादा मत बोलो। एग्ज़ाम्पल सिर्फ तब दो जब कोई चीज़ या विषय "
-    "समझाना हो, और सवाल सिर्फ तब पूछो जब उपयोगकर्ता कुछ सीख रहा हो। "
-    "जवाब की शैली: पहले एक लाइन में सीधा जवाब, फिर सिर्फ एक आसान रोज़मर्रा "
-    "एग्ज़ाम्पल जैसे 'जैसे-...', और अंत में पूछो कि 'क्या और समझना चाहते हो?' "
+    "जैसे 'मैं बढ़िया हूँ, तुम बताओ आज क्या सीखना है?' — कोई एग्ज़ाम्पल मत दो, कोई "
+    "सवाल-क़तार मत जोड़ो, बहुत ज़्यादा मत बोलो। एग्ज़ाम्पल सिर्फ तब दो जब कोई चीज़ "
+    "या विषय समझाना हो। "
     "हाँ/नहीं वाले या छोटे सवालों (जैसे 'मज़ा आता है क्या?', 'तुम कौन हो?') का जवाब "
     "सिर्फ १-२ वाक्य में दो — लंबा लेक्चर मत दो। लंबा समझाना सिर्फ तब जब वो सिखाने के "
     "लिए पूछे (जैसे 'समझाओ', 'क्या है', 'कैसे', 'सिखाओ') — तब भी सिर्फ ३-४ छोटे वाक्य। "
@@ -240,11 +255,11 @@ LLM_SYSTEM_PROMPT = (
     "खुशी, उत्साह या हैरानी दिखानी हो तो बोलचाल वाले एक्सप्रेशन जोड़ सकते हो — "
     "जैसे 'अरे वाह!', 'वाह!', 'ओहो!', 'हा हा', 'सच में?', 'कमाल है!', 'ज़रूर!' — "
     "लेकिन ज़्यादा मत करो: हर जवाब में ज़्यादा से ज़्यादा १-२ ही जगह, वहीं जहाँ "
-    "सच में फिट बैठे। कुछ गंभीरता या सोच-समझकर बताना हो तो 'देख यार...', 'सुन...' "
+    "सच में फिट बैठे। कुछ गंभीरता या सोच-समझकर बताना हो तो 'देखिए...', 'सुनिए...' "
     "जैसी शुरुआत कर सकते हो। ऐसा नहीं कि हर वाक्य एक्साइटेड लगे — बीच-बीच में "
     "नॉर्मल टोन भी रखो, वरना रोबोटिक लगेगा। "
     "फिलर शब्दों का बैलेंस रखो — 'यार', 'मतलब', 'एकदम' जैसे शब्द पूरे जवाब में "
-    "ज़्यादा से ज़्यादा एक-दो बार ही आएँ, वहीं जहाँ असली दोस्त बोलता तो बोलता। हर "
+    "ज़्यादा से ज़्यादा एक-दो बार ही आएँ, वहीं जहाँ असली ट्यूटर बोलता तो बोलता। हर "
     "वाक्य में 'यार' नहीं आता — वो नकली और चिड़चिड़ा करने वाला लगता है। "
     "कोई चिह्न या फ़ॉर्मेटिंग मत लिखो — न तारांकन (*), न रेखा (---), न क्रमांक "
     "(1., २.), न मोटा अक्षर (**), न बुलेट (-), न इमोजी — पूरी तरह साधारण बोलचाल "
@@ -304,6 +319,9 @@ HINGLISH_TO_DEVANAGARI = {
     "usb": "यूएसबी", "pdf": "पीडीएफ", "url": "यूआरएल", "wifi": "वाईफाई",
     "json": "जेसन", "java": "जावा", "python": "पायथन",
     "javascript": "जावास्क्रिप्ट", "linux": "लिनक्स", "whatsapp": "व्हाट्सऐप",
+    "github": "गिटहब", "git": "गिट", "openai": "ओपन एआई",
+    "chatgpt": "चैटजीपीटी", "youtube": "यूट्यूब", "android": "एंड्रॉइड",
+    "npm": "एनपीएम", "aws": "एडब्ल्यूएस", "kaggle": "कैगल",
     # everyday words that slip through as Latin — say them, don't spell them
     "markup": "मार्कअप", "language": "लैंग्वेज", "languages": "लैंग्वेजेस",
     "software": "सॉफ्टवेयर", "hardware": "हार्डवेयर", "browser": "ब्राउज़र",
@@ -326,6 +344,43 @@ LATIN_TO_DEVANAGARI = {
     "v": "वी", "w": "डब्ल्यू", "x": "एक्स", "y": "वाई", "z": "ज़ी",
 }
 
+# Words the TTS (OmniVoice) misreads even in pure Devanagari — usually conjunct
+# clusters with stacked matras (जिससे -> model merges ि+स+े and says "jisse"
+# wrong / skips the double स). Fix by respelling at the SYLLABLE SEAM: a space
+# spoken aloud is identical to the correct pronunciation, but the model
+# segments each part cleanly. Order matters: longest keys first.
+PRONUNCIATION_FIXES = {
+    # double-स family (स+स conjunct with matras — the model merges them)
+    "जिससे": "जिस से",
+    "इससे": "इस से",
+    "उससे": "उस से",
+    "किससे": "किस से",
+    "बससे": "बस से",
+    # double-च conjunct (च्छ) — the most frequent word in spoken Hindi
+    "अच्छा": "अच छा",
+    "अच्छी": "अच छी",
+    "अच्छे": "अच छे",
+    "अच्छाः": "अच छाः",
+    # conjunct + matra clusters the model reads as one garbled syllable
+    "क्योंकि": "क्यों कि",
+    "इसलिए": "इस लिए",
+    "समस्या": "सम स्या",
+    "इस्तेमाल": "इस्ते माल",
+    "क्षमा": "क्ष मा",
+}
+_PRONUNCIATION_RE = re.compile(
+    "|".join(re.escape(k) for k in sorted(PRONUNCIATION_FIXES, key=len, reverse=True))
+)
+
+
+def _fix_pronunciation(text: str) -> str:
+    """Respell problem words so the TTS says them correctly (sounds identical)."""
+    if not PRONUNCIATION_FIXES or not text:
+        return text
+    return _PRONUNCIATION_RE.sub(
+        lambda m: PRONUNCIATION_FIXES[m.group(0)], text
+    )
+
 
 HAS_LATIN = re.compile(r"[A-Za-z]")
 
@@ -339,6 +394,267 @@ def _devanagari_only(text: str) -> str:
         return "".join(LATIN_TO_DEVANAGARI.get(ch, "") for ch in low)
 
     return re.sub(r"[A-Za-z]+", repl, text) if HAS_LATIN.search(text) else text
+
+
+# ---------- Vision: Qwen2.5-VL screen understanding (/api/vision) ----------
+#
+# When the user shares their screen, the browser grabs a JPEG frame and sends
+# it here. Qwen2.5-VL (any OpenAI-compatible host: DashScope, Together,
+# OpenRouter, local vLLM) writes a compact Hindi description of what is on
+# screen, which the chat LLM then uses as ground truth. The description is
+# cached by the client's change-detection hash, so an unchanged screen costs
+# ZERO vision calls — the tutor keeps answering at full voice speed.
+VISION_BACKEND = os.environ.get("VISION_BACKEND", "auto").strip().lower()  # auto | api | local
+VISION_BASE_URL = os.environ.get(
+    "VISION_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+).rstrip("/")
+VISION_MODEL = os.environ.get("VISION_MODEL", "qwen2.5-vl-7b-instruct")
+# Local (in-process) vision model — Qwen2.5-VL-3B-Instruct fits a Kaggle T4
+# (16 GB) next to OmniVoice + Whisper in fp16 (~7.5 GB weights) and needs NO
+# API key. Loaded lazily on the first screen-share, so boot time is unchanged.
+VISION_LOCAL_MODEL = os.environ.get("VISION_LOCAL_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
+VISION_LOCAL_MAX_NEW_TOKENS = int(os.environ.get("VISION_LOCAL_MAX_NEW_TOKENS", "400"))
+VISION_TIMEOUT = float(os.environ.get("VISION_TIMEOUT", "25.0"))
+# Cached descriptions older than this are considered stale and re-described
+# when the same hash is sent again.
+SCREEN_CACHE_TTL = float(os.environ.get("VISION_CACHE_TTL", "600"))
+
+
+def _vision_api_key() -> str:
+    """Vision API key: VISION_API_KEY -> DASHSCOPE_API_KEY, env or .env file."""
+    for name in ("VISION_API_KEY", "DASHSCOPE_API_KEY"):
+        key = os.environ.get(name, "").strip()
+        if key:
+            return key
+        env_file = HERE / ".env"
+        if env_file.exists():
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith(f"{name}="):
+                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if key:
+                        return key
+    return ""
+
+
+VISION_DESC_PROMPT = (
+    "You are looking at ONE screenshot of the user's screen. A Hindi-speaking "
+    "voice tutor will use your description as its only knowledge of what the "
+    "user can see, so accuracy matters more than style. Describe: 1) which "
+    "app/page/tab is open, 2) the main visible content (code, document, chat, "
+    "video...), 3) any visible error message, warning, or problem — quote its "
+    "exact words (app names and error text may stay in English letters), "
+    "4) anything else the user will probably ask about. Reply in Hindi, "
+    "Devanagari script only, maximum 5 short lines, plain text — no markdown, "
+    "no bullets, no emoji, no preamble like 'यह स्क्रीनशॉट में'."
+)
+
+_screen_lock = threading.Lock()
+_screen_cache: dict = {"hash": None, "desc": "", "ts": 0.0}
+
+
+_vlm_lock = threading.Lock()
+_local_vlm: dict = {"model": None, "processor": None}
+
+
+def _local_vlm_available() -> bool:
+    """True when the local transformers vision stack is importable (no GPU check —
+    it also works on CPU, just slower). Cheap: never imports transformers."""
+    if VISION_BACKEND == "api":
+        return False
+    import importlib.util
+
+    return (
+        importlib.util.find_spec("transformers") is not None
+        and importlib.util.find_spec("PIL") is not None
+    )
+
+
+def _vision_ready_backend() -> str | None:
+    """Which vision engine would actually run right now: 'api' | 'local' | None."""
+    if VISION_BACKEND == "api":
+        return "api" if _vision_api_key() else None
+    if VISION_BACKEND == "local":
+        return "local" if _local_vlm_available() else None
+    # auto: hosted API when a key exists, else the local model
+    if _vision_api_key():
+        return "api"
+    return "local" if _local_vlm_available() else None
+
+
+def _vision_ready() -> bool:
+    return _vision_ready_backend() is not None
+
+
+def _load_local_vlm():
+    """Load Qwen2.5-VL-3B once (lazy, thread-safe). fp16 on CUDA, fp32 on
+    MPS/CPU (fp16 MPS is broken on torch 2.x — same rule as the TTS model)."""
+    if _local_vlm["model"] is not None:
+        return _local_vlm["model"], _local_vlm["processor"]
+    with _vlm_lock:
+        if _local_vlm["model"] is not None:
+            return _local_vlm["model"], _local_vlm["processor"]
+        import torch as _torch
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+        device = "cuda" if _torch.cuda.is_available() else (
+            "mps" if _torch.backends.mps.is_available() else "cpu"
+        )
+        dtype = _torch.float16 if device == "cuda" else _torch.float32
+        log.info("Loading local vision model %s on %s (%s)…", VISION_LOCAL_MODEL, device, dtype)
+        t0 = time.perf_counter()
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            VISION_LOCAL_MODEL, torch_dtype=dtype
+        ).to(device).eval()
+        processor = AutoProcessor.from_pretrained(VISION_LOCAL_MODEL)
+        _local_vlm.update({"model": model, "processor": processor})
+        log.info("Local vision model ready in %.1fs", time.perf_counter() - t0)
+        return model, processor
+
+
+def _screen_describe_local(image_b64: str) -> str:
+    """Describe one screenshot with the LOCAL Qwen2.5-VL-3B (transformers)."""
+    import base64
+
+    import torch as _torch
+    from PIL import Image
+
+    model, processor = _load_local_vlm()
+    img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+    if max(img.size) > 1280:  # keep the vision-token budget (and latency) sane
+        img.thumbnail((1280, 1280))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": VISION_DESC_PROMPT},
+            ],
+        }
+    ]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[img], return_tensors="pt").to(model.device)
+    t0 = time.perf_counter()
+    with _torch.inference_mode():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=VISION_LOCAL_MAX_NEW_TOKENS,
+            do_sample=False,
+        )
+    resp = processor.batch_decode(
+        out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    )[0].strip()
+    if not resp:
+        raise RuntimeError("Local vision model returned an empty description")
+    log.info(
+        "Vision(local): described in %.2fs (%d chars, %s)",
+        time.perf_counter() - t0, len(resp), VISION_LOCAL_MODEL,
+    )
+    return resp
+
+
+def _screen_describe_api(image_b64: str, key: str) -> str:
+    """Describe one screenshot with the hosted Qwen2.5-VL (OpenAI-compatible)."""
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                    },
+                    {"type": "text", "text": VISION_DESC_PROMPT},
+                ],
+            }
+        ],
+        "max_tokens": 500,
+        "temperature": 0.2,
+    }
+    try:
+        r = httpx.post(
+            f"{VISION_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=VISION_TIMEOUT,
+        )
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Vision request failed: {e}") from e
+    if r.status_code != 200:
+        raise RuntimeError(f"Vision API {r.status_code}: {r.text[:200]!r}")
+    try:
+        desc = r.json()["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, ValueError) as e:
+        raise RuntimeError(f"Unexpected vision response: {e}") from e
+    if not desc:
+        raise RuntimeError("Vision model returned an empty description")
+    return desc
+
+
+def _screen_backend_choice() -> str:
+    """Effective backend for THIS call: 'api' | 'local' | raises."""
+    if VISION_BACKEND == "api":
+        return "api"
+    if VISION_BACKEND == "local":
+        return "local"
+    # auto: hosted API when a key exists (fastest first token), else local
+    return "api" if _vision_api_key() else "local"
+
+
+def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool]:
+    """Describe one screenshot; cache-first by client hash.
+
+    Engine: VISION_BACKEND=auto (default) uses the hosted API when a key is
+    configured, otherwise the LOCAL Qwen2.5-VL-3B loaded in this process (no
+    key needed — the Kaggle path). Raises on any error so the caller can
+    decide whether to fall back to a text-only reply.
+    """
+    if client_hash:
+        with _screen_lock:
+            if (
+                _screen_cache["hash"] == client_hash
+                and _screen_cache["desc"]
+                and time.monotonic() - _screen_cache["ts"] < SCREEN_CACHE_TTL
+            ):
+                return _screen_cache["desc"], True
+    t0 = time.perf_counter()
+    backend = _screen_backend_choice()
+    if backend == "api":
+        key = _vision_api_key()
+        if not key:
+            raise RuntimeError(
+                "Vision API key not configured (set VISION_API_KEY or DASHSCOPE_API_KEY in .env, "
+                "or set VISION_BACKEND=local to use the local Qwen2.5-VL-3B)"
+            )
+        desc = _screen_describe_api(image_b64, key)
+    else:
+        if not _local_vlm_available():
+            raise RuntimeError(
+                "Local vision needs 'pip install transformers pillow' (or set VISION_API_KEY "
+                "to use the hosted Qwen2.5-VL API instead)"
+            )
+        desc = _screen_describe_local(image_b64)
+    with _screen_lock:
+        _screen_cache.update({"hash": client_hash or None, "desc": desc, "ts": time.monotonic()})
+    log.info(
+        "Vision(%s): screen described in %.2fs (%d chars)",
+        backend, time.perf_counter() - t0, len(desc),
+    )
+    return desc, False
+
+
+# Appended to the system prompt for turns that carry a fresh screen description.
+SCREEN_CONTEXT_TMPL = (
+    "स्क्रीन कॉन्टेक्स्ट — यूज़र अभी अपनी स्क्रीन शेयर कर रहा है, और स्क्रीन पर "
+    "यह दिख रहा है:\n{desc}\n"
+    "नियम: इसे १००% सच मानो — यूज़र को यही दिख रहा है। यूज़र के सवाल को इसी स्क्रीन "
+    "से जोड़कर जवाब दो, जैसे तुम स्क्रीन साथ बैठकर देख रहे हो। कोई दिक्कत, एरर या "
+    "गलती दिखे तो पहले बताओ स्क्रीन पर क्या गड़बड़ है, फिर २-३ आसान कदम बताओ जिनसे "
+    "वो ठीक होगी। 'स्क्रीन कॉन्टेक्स्ट' जैसे तकनीकी शब्द यूज़र से कभी मत बोलो — "
+    "सीधे 'आपकी स्क्रीन पर ...' कहकर बात करो। अगर सवाल स्क्रीन से जुड़ा लगता है "
+    "पर जानकारी इस ब्लॉक में नहीं है, तो प्यार से कहो कि वो उस हिस्से पर ज़ूम करके "
+    "दोबारा पूछे।"
+)
 
 
 # Serve the built React/Tailwind UI (web/ui/dist). Rebuild with:
@@ -363,6 +679,10 @@ def _llm_api_key() -> str:
     return ""
 
 
+class _LLMRetryable(Exception):
+    """Transient LLM API failure (429/5xx/network) worth retrying."""
+
+
 def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, max_tokens: int | None = None):
     """Stream LLM tokens and yield complete Devanagari sentences as they finish.
 
@@ -370,55 +690,101 @@ def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, ma
     chunk, so the first sentence can be spoken while the model is still
     writing the rest of the reply (kills the "whole reply first, then audio"
     lag).
+
+    Robustness: transient failures (429 rate-limit, 5xx, connect/read
+    timeouts) are retried with backoff while NOTHING has been yielded yet —
+    a mid-stream failure can't be resumed cleanly, so those propagate. An
+    attempt that finishes with ZERO content (reasoning models can burn the
+    whole token budget "thinking") also retries once with double max_tokens
+    before giving up.
     """
-    payload = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens or LLM_MAX_TOKENS,
-        "stream": True,
-    }
-    if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
-        payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    try:
-        with httpx.stream("POST", MISTRAL_URL, headers=headers, json=payload, timeout=LLM_STREAM_TIMEOUT) as r:
-            if r.status_code != 200:
-                raise RuntimeError(f"LLM API {r.status_code}: {r.read()[:300]!r}")
-            buf = ""
-            for line in r.iter_lines():
-                if not line:
-                    continue
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    delta = json.loads(data)["choices"][0]["delta"].get("content") or ""
-                except (KeyError, IndexError, ValueError):
-                    continue
-                if not delta:
-                    continue
-                buf += delta
-                # flush every complete sentence that has finished streaming
-                while True:
-                    m = SENT_END_RE.search(buf)
-                    if not m:
+    total_attempts = 1 + max(0, LLM_RETRIES)
+    attempt = 0
+    tok_budget = max_tokens or LLM_MAX_TOKENS
+    while True:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": tok_budget,
+            "stream": True,
+        }
+        if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
+            payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
+        buf = ""
+        yielded = False
+        retry_wait = 0.8
+        try:
+            with httpx.stream("POST", MISTRAL_URL, headers=headers, json=payload, timeout=LLM_STREAM_TIMEOUT) as r:
+                if r.status_code != 200:
+                    body = r.read()[:300]
+                    if r.status_code == 429 or r.status_code >= 500:
+                        ra = r.headers.get("retry-after", "")
+                        try:
+                            retry_wait = max(retry_wait, min(float(ra), 8.0))
+                        except ValueError:
+                            pass
+                        raise _LLMRetryable(f"LLM API {r.status_code}: {body!r}")
+                    raise RuntimeError(f"LLM API {r.status_code}: {body!r}")
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
                         break
-                    sent = buf[: m.end()].strip()
-                    buf = buf[m.end():]
-                    if sent:
-                        yield sent
-                if len(buf) > 200:  # pathological run with no punctuation yet
-                    yield buf.strip()
-                    buf = ""
-        tail = buf.strip()
-        if tail:
-            yield tail
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"Mistral stream failed: {e}") from e
+                    try:
+                        delta = json.loads(data)["choices"][0]["delta"].get("content") or ""
+                    except (KeyError, IndexError, ValueError):
+                        continue
+                    if not delta:
+                        continue
+                    buf += delta
+                    # flush every complete sentence that has finished streaming
+                    while True:
+                        m = SENT_END_RE.search(buf)
+                        if not m:
+                            break
+                        sent = buf[: m.end()].strip()
+                        buf = buf[m.end():]
+                        if sent:
+                            yielded = True
+                            yield sent
+                    if len(buf) > 200:  # pathological run with no punctuation yet
+                        yielded = True
+                        yield buf.strip()
+                        buf = ""
+            tail = buf.strip()
+            if tail:
+                yielded = True
+                yield tail
+            if not yielded:
+                # Stream "succeeded" but produced nothing speakable — treat as
+                # transient (the next attempt gets double tokens) instead of
+                # leaving the user with silence.
+                raise _LLMRetryable("LLM returned no content (token budget exhausted by reasoning?)")
+            return
+        except _LLMRetryable as e:
+            if yielded or attempt + 1 >= total_attempts:
+                raise RuntimeError(str(e)) from e
+            attempt += 1
+            tok_budget = tok_budget * 2  # reasoning models: give the answer room
+            log.warning("LLM attempt %d/%d failed (%s) — retrying in %.1fs",
+                        attempt, total_attempts, e, retry_wait)
+            time.sleep(retry_wait)
+            retry_wait = min(retry_wait * 2, 8.0)
+        except httpx.HTTPError as e:
+            # connect/read errors — retryable only if nothing was yielded yet
+            if yielded or attempt + 1 >= total_attempts:
+                raise RuntimeError(f"Mistral stream failed: {e}") from e
+            attempt += 1
+            log.warning("LLM attempt %d/%d network error (%s) — retrying in %.1fs",
+                        attempt, total_attempts, e, retry_wait)
+            time.sleep(retry_wait)
+            retry_wait = min(retry_wait * 2, 8.0)
 
 
 def _speech_sentence(sent: str) -> str:
@@ -751,6 +1117,10 @@ def api_config():
         "min_window_chars": MIN_WINDOW_CHARS,
         "max_sentences": MAX_CHAT_SENTENCES,
         "greeting_max": GREETING_MAX,
+        # vision (screen understanding) — read by web/ui/src/App.jsx
+        "vision_enabled": _vision_ready(),
+        "vision_backend": _vision_ready_backend() or "off",
+        "vision_model": (VISION_MODEL if _vision_ready_backend() == "api" else VISION_LOCAL_MODEL),
         # LLM
         "llm_model": LLM_MODEL,
         "llm_temperature": LLM_TEMPERATURE,
@@ -940,7 +1310,7 @@ def _generate(model, voice_prompt, text, num_step, speed, temperature):
     keys, so the demo's `temperature` is mapped to `class_temperature` (token-
     sampling temperature; 0 = greedy) to stay effective.
     """
-    kwargs = {"text": text, "voice_clone_prompt": voice_prompt, "num_step": num_step}
+    kwargs = {"text": _fix_pronunciation(text), "voice_clone_prompt": voice_prompt, "num_step": num_step}
     if speed is not None:
         kwargs["speed"] = speed
     if temperature is not None:
@@ -1106,6 +1476,30 @@ async def ws_tts(websocket: WebSocket):
                 if not history or history[-1]["role"] != "user":
                     history.append({"role": "user", "content": text})
                 messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}, *history]
+
+                # Screen understanding: a shared screen arrives as an optional
+                # {"screen": {"image": <b64>, "hash": <change-detection id>}}.
+                # The description is cache-first (hash-keyed), so an unchanged
+                # screen adds ZERO vision latency — only a fresh screen pays
+                # one Qwen2.5-VL call before the LLM starts writing.
+                screen = data.get("screen") if isinstance(data.get("screen"), dict) else None
+                if screen:
+                    img = str(screen.get("image") or "").strip()
+                    if img.startswith("data:") and "," in img:
+                        img = img.split(",", 1)[1]
+                    if img:
+                        try:
+                            desc, cached = await asyncio.get_running_loop().run_in_executor(
+                                None, _screen_context, img, str(screen.get("hash") or "")
+                            )
+                            log.info("WS chat: screen context %s (%.0f chars)",
+                                     "CACHED" if cached else "fresh", len(desc))
+                            messages[0] = {
+                                "role": "system",
+                                "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_CONTEXT_TMPL.format(desc=desc),
+                            }
+                        except Exception as e:  # noqa: BLE001 — never kill the chat on vision failure
+                            log.warning("Vision call failed (%s) — continuing text-only", e)
 
                 stop_evt.clear()
                 start = time.perf_counter()
@@ -1971,6 +2365,30 @@ async def ws_asr(websocket: WebSocket):
     finally:
         stop_evt.set()
         reader_task.cancel()
+
+
+# ---------- Vision: screen understanding ----------
+class VisionRequest(BaseModel):
+    image: str = Field(..., min_length=32, description="JPEG screenshot, base64 (data: prefix optional)")
+    hash: str = Field("", description="Client-side change-detection id (cache key)")
+
+
+@app.post("/api/vision")
+def api_vision(req: VisionRequest):
+    """Describe one screenshot with Qwen2.5-VL (cache-first by client hash).
+
+    The browser UI calls this when the screen CHANGES (change detection runs
+    client-side), so an idle screen costs nothing and the latest description
+    is always warm before the user asks about it.
+    """
+    img = req.image.strip()
+    if img.startswith("data:") and "," in img:
+        img = img.split(",", 1)[1]
+    try:
+        desc, cached = _screen_context(img, req.hash)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"description": desc, "cached": cached, "model": VISION_MODEL}
 
 
 # ---------- LLM chat (keeps the API key server-side) ----------
