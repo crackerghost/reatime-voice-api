@@ -119,6 +119,7 @@ export default function App() {
   const screenFrameRef = useRef(null); // { b64, hash, ts } — newest changed frame
   const lastSentHashRef = useRef(""); // hash already attached to a chat turn
   const lastPrefetchAtRef = useRef(0); // last background /api/vision warm-up
+  const screenFetchBusyRef = useRef(false); // a warm-up fetch is in flight (never queue)
   // VAD state — thresholds/initial values come from CFG (env-driven).
   const vadRef = useRef({
     noise: CFG.vadNoiseFloor, // adaptive ambient floor (updated when idle)
@@ -290,6 +291,7 @@ export default function App() {
     screenFrameRef.current = null;
     screenDiffRef.current = null;
     lastSentHashRef.current = "";
+    screenFetchBusyRef.current = false;
   }, []);
 
   /* One capture tick: downsample -> change detect -> encode JPEG on change ->
@@ -334,9 +336,17 @@ export default function App() {
     screenFrameRef.current = { b64, hash, ts: Date.now() };
     // 4) background warm-up: describe the NEW screen now so the reply later
     //    hits the server cache and pays ZERO vision latency.
+    //    NEVER queue: a local VLM takes 7-15 s per screen, so firing one fetch
+    //    per change while the screen keeps changing piles up stale requests
+    //    (the 25s→53s queue growth). One in-flight fetch max — if a newer
+    //    frame arrives mid-flight, the next tick sends THAT frame instead.
     const now = Date.now();
-    if (now - lastPrefetchAtRef.current >= CFG.screenPrefetchMs) {
+    if (
+      now - lastPrefetchAtRef.current >= CFG.screenPrefetchMs &&
+      !screenFetchBusyRef.current
+    ) {
       lastPrefetchAtRef.current = now;
+      screenFetchBusyRef.current = true;
       fetch(VISION_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -344,7 +354,10 @@ export default function App() {
       })
         .then((r) => (r.ok ? r.json() : null))
         .then((j) => j && console.info(`[vision] warm cache ${j.cached ? "HIT" : "FILLED"} (${(j.description || "").length} chars)`))
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          screenFetchBusyRef.current = false;
+        });
     }
   };
 

@@ -15,6 +15,7 @@ Example:
 """
 
 import asyncio
+import functools
 import io
 import json
 import logging
@@ -413,7 +414,16 @@ VISION_MODEL = os.environ.get("VISION_MODEL", "qwen2.5-vl-7b-instruct")
 # (16 GB) next to OmniVoice + Whisper in fp16 (~7.5 GB weights) and needs NO
 # API key. Loaded lazily on the first screen-share, so boot time is unchanged.
 VISION_LOCAL_MODEL = os.environ.get("VISION_LOCAL_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
-VISION_LOCAL_MAX_NEW_TOKENS = int(os.environ.get("VISION_LOCAL_MAX_NEW_TOKENS", "400"))
+# 5 short Hindi lines ≈ 160 tokens; 240 is safe headroom — every extra token is
+# ~60-80 ms of decode on a T4, so an oversized cap wastes seconds per screen.
+VISION_LOCAL_MAX_NEW_TOKENS = int(os.environ.get("VISION_LOCAL_MAX_NEW_TOKENS", "240"))
+# Max image side before the vision tower. Vision tokens scale ~quadratically
+# ((px/28)²): a 1280px screenshot ≈ 1000+ tokens (slow prefill on T4) while
+# 896px ≈ ~700 — screen text (errors, code) stays readable at 896.
+VISION_LOCAL_MAX_SIDE = int(os.environ.get("VISION_LOCAL_MAX_SIDE", "896"))
+# 1 = load the local VLM in 4-bit (bitsandbytes): ~2 GB weights, noticeably
+# faster decode on T4. Needs `pip install bitsandbytes`. Default off.
+VISION_LOCAL_4BIT = os.environ.get("VISION_LOCAL_4BIT", "0") == "1"
 VISION_TIMEOUT = float(os.environ.get("VISION_TIMEOUT", "25.0"))
 # Cached descriptions older than this are considered stale and re-described
 # when the same hash is sent again.
@@ -513,10 +523,21 @@ def _load_local_vlm():
             dtype = _torch.float32
         else:
             dtype = _torch.float16 if device == "cuda" else _torch.float32
+        load_kwargs = {"torch_dtype": dtype}
+        if VISION_LOCAL_4BIT:
+            try:
+                from transformers import BitsAndBytesConfig
+
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_compute_dtype=dtype, bnb_4bit_quant_type="nf4"
+                )
+                log.info("Vision: loading %s in 4-bit (nf4)…", VISION_LOCAL_MODEL)
+            except Exception as e:  # noqa: BLE001 — bitsandbytes missing -> plain load
+                log.warning("4-bit load unavailable (%s) — falling back to %s", e, dtype)
         log.info("Loading local vision model %s on %s (%s)…", VISION_LOCAL_MODEL, device, dtype)
         t0 = time.perf_counter()
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            VISION_LOCAL_MODEL, torch_dtype=dtype
+            VISION_LOCAL_MODEL, **load_kwargs
         ).to(device).eval()
         processor = AutoProcessor.from_pretrained(VISION_LOCAL_MODEL)
         _local_vlm.update({"model": model, "processor": processor})
@@ -540,8 +561,8 @@ def _screen_describe_local(image_b64: str) -> str:
         model, processor = _load_local_vlm()
         try:
             img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
-            if max(img.size) > 1280:  # keep the vision-token budget (and latency) sane
-                img.thumbnail((1280, 1280))
+            if max(img.size) > VISION_LOCAL_MAX_SIDE:  # vision tokens ~ (side/28)²
+                img.thumbnail((VISION_LOCAL_MAX_SIDE, VISION_LOCAL_MAX_SIDE))
             messages = [
                 {
                     "role": "user",
@@ -624,6 +645,14 @@ def _screen_backend_choice() -> str:
     return "api" if _vision_api_key() else "local"
 
 
+# Coalescing: while one (slow) local describe runs, newer requests for the
+# SAME screen arrive and would each queue behind it. The winner of the race
+# describes the LATEST frame; losers get that result instead of queueing a
+# redundant generate of an already-stale screen.
+_screen_pending: dict = {}  # hash -> threading.Event
+_screen_pending_lock = threading.Lock()
+
+
 def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, str]:
     """Describe one screenshot; cache-first by client hash.
 
@@ -633,6 +662,9 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, s
     configured, otherwise the LOCAL Qwen2.5-VL-3B loaded in this process (no
     key needed — the Kaggle path). Raises on any error so the caller can
     decide whether to fall back to a text-only reply.
+
+    Coalescing: concurrent requests with the same hash collapse into ONE
+    generate — the first caller runs it, the rest piggyback on its result.
     """
     if client_hash:
         with _screen_lock:
@@ -642,48 +674,226 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, s
                 and time.monotonic() - _screen_cache["ts"] < SCREEN_CACHE_TTL
             ):
                 return _screen_cache["desc"], True, _screen_cache["model"]
+    # ---- piggyback on an in-flight describe of THIS screen ----------------
+    # (registered winner still running -> wait for its result instead of
+    #  queueing a redundant generate of the same stale screen)
+    if client_hash:
+        with _screen_pending_lock:
+            evt = _screen_pending.get(client_hash)
+        if evt is not None and evt.wait(timeout=90):
+            with _screen_lock:
+                if _screen_cache["hash"] == client_hash and _screen_cache["desc"]:
+                    return _screen_cache["desc"], True, _screen_cache["model"]
+        # timeout / winner failed -> fall through and describe ourselves
+    # ---- register as the winner (or run unhashed) -------------------------
+    is_winner = False
+    evt = None
+    if client_hash:
+        with _screen_pending_lock:
+            existing = _screen_pending.get(client_hash)
+            if existing is not None:
+                # someone registered between our check and now — piggyback
+                if existing.wait(timeout=90):
+                    with _screen_lock:
+                        if _screen_cache["hash"] == client_hash and _screen_cache["desc"]:
+                            return _screen_cache["desc"], True, _screen_cache["model"]
+                # winner failed/timed out — we take over as the new winner
+            else:
+                evt = threading.Event()
+                _screen_pending[client_hash] = evt
+                is_winner = True
     t0 = time.perf_counter()
     backend = _screen_backend_choice()
-    if backend == "api":
-        key = _vision_api_key()
-        if not key:
-            raise RuntimeError(
-                "Vision API key not configured (set VISION_API_KEY or DASHSCOPE_API_KEY in .env, "
-                "or set VISION_BACKEND=local to use the local Qwen2.5-VL-3B)"
+    try:
+        if backend == "api":
+            key = _vision_api_key()
+            if not key:
+                raise RuntimeError(
+                    "Vision API key not configured (set VISION_API_KEY or DASHSCOPE_API_KEY in .env, "
+                    "or set VISION_BACKEND=local to use the local Qwen2.5-VL-3B)"
+                )
+            desc = _screen_describe_api(image_b64, key)
+            model_used = VISION_MODEL
+        else:
+            if not _local_vlm_available():
+                raise RuntimeError(
+                    "Local vision needs 'pip install transformers pillow' (or set VISION_API_KEY "
+                    "to use the hosted Qwen2.5-VL API instead)"
+                )
+            desc = _screen_describe_local(image_b64)
+            model_used = VISION_LOCAL_MODEL
+        with _screen_lock:
+            _screen_cache.update(
+                {"hash": client_hash or None, "desc": desc, "ts": time.monotonic(), "model": model_used}
             )
-        desc = _screen_describe_api(image_b64, key)
-        model_used = VISION_MODEL
-    else:
-        if not _local_vlm_available():
-            raise RuntimeError(
-                "Local vision needs 'pip install transformers pillow' (or set VISION_API_KEY "
-                "to use the hosted Qwen2.5-VL API instead)"
-            )
-        desc = _screen_describe_local(image_b64)
-        model_used = VISION_LOCAL_MODEL
-    with _screen_lock:
-        _screen_cache.update(
-            {"hash": client_hash or None, "desc": desc, "ts": time.monotonic(), "model": model_used}
+        log.info(
+            "Vision(%s/%s): screen described in %.2fs (%d chars)",
+            backend, model_used, time.perf_counter() - t0, len(desc),
         )
-    log.info(
-        "Vision(%s/%s): screen described in %.2fs (%d chars)",
-        backend, model_used, time.perf_counter() - t0, len(desc),
-    )
-    return desc, False, model_used
+        return desc, False, model_used
+    finally:
+        if is_winner and evt is not None:
+            with _screen_pending_lock:
+                if _screen_pending.get(client_hash) is evt:
+                    del _screen_pending[client_hash]
+            evt.set()  # wake piggybackers (cache now holds the result)
 
 
-# Appended to the system prompt for turns that carry a fresh screen description.
+# Cold-cache softener: if a describe for THIS screen is already in flight
+# when the user asks, wait up to this long for it instead of answering blind.
+# Only ever applies when a describe is IN FLIGHT — never started on demand.
+VISION_REPLY_WAIT_S = float(os.environ.get("VISION_REPLY_WAIT_S", "1.2"))
+
+
+def _screen_cached_desc(client_hash: str = "", wait_s: float = 0.0) -> tuple[str, str]:
+    """PEEK the screen cache without starting any compute — the reply path
+    never waits for vision unless a describe is ALREADY running for this
+    exact screen (then wait up to wait_s for it to land).
+    Returns (description, model) or ("", "")."""
+    if not client_hash:
+        return "", ""
+    deadline = time.monotonic() + max(0.0, wait_s)
+    while True:
+        with _screen_lock:
+            if (
+                _screen_cache["hash"] == client_hash
+                and _screen_cache["desc"]
+                and time.monotonic() - _screen_cache["ts"] < SCREEN_CACHE_TTL
+            ):
+                return _screen_cache["desc"], _screen_cache["model"]
+        if time.monotonic() >= deadline:
+            return "", ""
+        with _screen_pending_lock:
+            evt = _screen_pending.get(client_hash)
+        if evt is None:
+            return "", ""  # nothing in flight — waiting can never help
+        evt.wait(timeout=0.3)  # poll; the in-flight describe may finish
+
+
+def _warm_screen_cache(image_b64: str, client_hash: str = "") -> None:
+    """Fire-and-forget background describe so the NEXT turn finds a warm cache."""
+    try:
+        _screen_context(image_b64, client_hash)
+    except Exception as e:  # noqa: BLE001 — background job, never crash anything
+        log.warning("Background screen describe failed: %s", e)
+
+
+# ---------- Screen layer 1: fast OCR text (RapidOCR, ~100-300 ms) ----------
+# The VLM summary (layer 2) is rich but slow, so its cache can be seconds
+# stale. OCR is 30-50x cheaper, so the reply path can run it INLINE — text on
+# screen is never more than ~1 turn old. Errors, code, file names, terminal
+# output all arrive as exact text, which is exactly what a tutor quotes.
+_ocr_lock = threading.Lock()
+_ocr_engine = None
+_ocr_disabled = False  # set once if rapidocr is not installed
+_ocr_cache: dict = {"hash": None, "text": "", "ts": 0.0}
+OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "960"))
+OCR_MAX_LINES = int(os.environ.get("VISION_OCR_MAX_LINES", "60"))
+
+
+def _load_ocr():
+    global _ocr_engine
+    if _ocr_engine is not None:
+        return _ocr_engine
+    with _ocr_lock:
+        if _ocr_engine is not None:
+            return _ocr_engine
+        from rapidocr_onnxruntime import RapidOCR
+
+        t0 = time.perf_counter()
+        _ocr_engine = RapidOCR()
+        log.info("RapidOCR ready in %.1fs (screen text layer)", time.perf_counter() - t0)
+        return _ocr_engine
+
+
+def _screen_ocr(image_b64: str, client_hash: str = "") -> str:
+    """Fast text layer: OCR one frame. Cached by hash; ~100-300 ms on GPU."""
+    if client_hash:
+        with _ocr_lock:
+            if (
+                _ocr_cache["hash"] == client_hash
+                and _ocr_cache["text"]
+                and time.monotonic() - _ocr_cache["ts"] < SCREEN_CACHE_TTL
+            ):
+                return _ocr_cache["text"]
+    import base64
+
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+    if max(img.size) > OCR_MAX_SIDE:
+        img.thumbnail((OCR_MAX_SIDE, OCR_MAX_SIDE))
+    engine = _load_ocr()
+    t0 = time.perf_counter()
+    result, _ = engine(np.asarray(img))
+    lines = [r[1].strip() for r in (result or []) if r[1] and r[1].strip()]
+    text = "\n".join(lines[:OCR_MAX_LINES])
+    with _ocr_lock:
+        _ocr_cache.update({"hash": client_hash or None, "text": text, "ts": time.monotonic()})
+    log.info("OCR: %d lines in %.2fs", len(lines), time.perf_counter() - t0)
+    return text
+
+
+def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
+    """Fresh screen context for the reply path (runs in an executor thread).
+
+    OCR text: cache peek, else INLINE (~100-300 ms — fast enough to block on;
+    guarantees text is never more than ~1 turn old).
+    VLM summary: cache peek ONLY with the bounded wait — never recomputed here.
+    """
+    global _ocr_disabled
+    desc, model_used = _screen_cached_desc(client_hash, VISION_REPLY_WAIT_S)
+    ocr = ""
+    if client_hash:
+        with _ocr_lock:
+            if (
+                _ocr_cache["hash"] == client_hash
+                and _ocr_cache["text"]
+                and time.monotonic() - _ocr_cache["ts"] < SCREEN_CACHE_TTL
+            ):
+                ocr = _ocr_cache["text"]
+    if not ocr and image_b64 and not _ocr_disabled:
+        try:
+            ocr = _screen_ocr(image_b64, client_hash)
+        except Exception as e:  # noqa: BLE001 — OCR must never break a reply
+            if isinstance(e, ImportError):
+                _ocr_disabled = True
+                log.warning("rapidocr_onnxruntime not installed — OCR layer disabled (pip install rapidocr-onnxruntime)")
+            else:
+                log.warning("Inline OCR failed: %s", e)
+    return {"ocr": ocr, "desc": desc, "model": model_used}
+
+
+# Appended to the system prompt on turns that carry screen context.
+# The rules make the tutor ACTIVE: reference what is visible, quote exact
+# text ("ये undefined दिख रहा है"), and direct the user's attention
+# ("ये file खोलकर दिखाओ") — like a tutor sitting next to the student.
 SCREEN_CONTEXT_TMPL = (
-    "स्क्रीन कॉन्टेक्स्ट — यूज़र अभी अपनी स्क्रीन शेयर कर रहा है, और स्क्रीन पर "
-    "यह दिख रहा है:\n{desc}\n"
-    "नियम: इसे १००% सच मानो — यूज़र को यही दिख रहा है। यूज़र के सवाल को इसी स्क्रीन "
-    "से जोड़कर जवाब दो, जैसे तुम स्क्रीन साथ बैठकर देख रहे हो। कोई दिक्कत, एरर या "
-    "गलती दिखे तो पहले बताओ स्क्रीन पर क्या गड़बड़ है, फिर २-३ आसान कदम बताओ जिनसे "
-    "वो ठीक होगी। 'स्क्रीन कॉन्टेक्स्ट' जैसे तकनीकी शब्द यूज़र से कभी मत बोलो — "
-    "सीधे 'आपकी स्क्रीन पर ...' कहकर बात करो। अगर सवाल स्क्रीन से जुड़ा लगता है "
-    "पर जानकारी इस ब्लॉक में नहीं है, तो प्यार से कहो कि वो उस हिस्से पर ज़ूम करके "
-    "दोबारा पूछे।"
+    "स्क्रीन कॉन्टेक्स्ट — यूज़र अभी अपनी स्क्रीन शेयर कर रहा है और तुम उसे देख सकते हो।\n"
+    "नियम:\n"
+    "1) इसे १००% सच मानो — यूज़र को यही दिख रहा है।\n"
+    "2) Active tutor बनो: स्क्रीन पर दिख रही चीज़ों को सीधे reference करो — "
+    "'आपके कोड में ये undefined दिख रहा है', 'ये लाइन गलत है'। OCR text से exact "
+    "शब्द/एरर quote करो।\n"
+    "3) जो दिख नहीं रहा, यूज़र से action मांगो — 'ये file खोलकर दिखाओ', 'उस component "
+    "तक scroll करो', 'terminal का output दिखाओ'।\n"
+    "4) यूज़र fix करके दिखाए तो बदलाव notice करके confirm करो — 'अब सही दिख रहा है'।\n"
+    "5) OCR text में menus/notifications का noise हो सकता है — सिर्फ relevant हिस्सा उठाओ।\n"
+    "6) 'स्क्रीन कॉन्टेक्स्ट' जैसे शब्द कभी यूज़र से मत बोलो — सीधे 'आपकी स्क्रीन पर …' कहो।\n"
+    "7) कोई दिक्कत दिखे तो पहले बताओ क्या गड़बड़ है, फिर २-३ आसान कदम।"
 )
+
+
+def _screen_context_block(layers: dict) -> str | None:
+    """Combine the two screen layers into one system-prompt block."""
+    parts = []
+    if layers.get("desc"):
+        parts.append("स्क्रीन का visual summary:\n" + layers["desc"])
+    if layers.get("ocr"):
+        parts.append("स्क्रीन पर अभी दिख रहा text (OCR):\n" + layers["ocr"][:1500])
+    if not parts:
+        return None
+    return SCREEN_CONTEXT_TMPL + "\n\n" + "\n\n".join(parts)
 
 
 # Serve the built React/Tailwind UI (web/ui/dist). Rebuild with:
@@ -1517,18 +1727,37 @@ async def ws_tts(websocket: WebSocket):
                     if img.startswith("data:") and "," in img:
                         img = img.split(",", 1)[1]
                     if img:
-                        try:
-                            desc, cached, _vlm_model = await asyncio.get_running_loop().run_in_executor(
-                                None, _screen_context, img, str(screen.get("hash") or "")
+                        # TWO-LAYER context (executor thread, never the event loop):
+                        #   OCR text  — peek cache, else INLINE (~100-300 ms)
+                        #               → text is never more than ~1 turn old
+                        #   VLM summary — cache peek with bounded wait ONLY;
+                        #               background warmer fills it (7 s/screen)
+                        layers = await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            _screen_layers,
+                            str(screen.get("hash") or ""),
+                            img,
+                        )
+                        block = _screen_context_block(layers)
+                        if block:
+                            log.info(
+                                "WS chat: screen context (OCR %d chars, VLM %d chars%s)",
+                                len(layers.get("ocr") or ""), len(layers.get("desc") or ""),
+                                ", fresh OCR" if layers.get("ocr") else "",
                             )
-                            log.info("WS chat: screen context %s (%.0f chars)",
-                                     "CACHED" if cached else "fresh", len(desc))
                             messages[0] = {
                                 "role": "system",
-                                "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_CONTEXT_TMPL.format(desc=desc),
+                                "content": LLM_SYSTEM_PROMPT + "\n\n" + block,
                             }
-                        except Exception as e:  # noqa: BLE001 — never kill the chat on vision failure
-                            log.warning("Vision call failed (%s) — continuing text-only", e)
+                        else:
+                            log.info("WS chat: no screen context available — text-only reply")
+                        if not layers.get("desc"):
+                            # VLM summary cold → warm in background for next turn
+                            threading.Thread(
+                                target=_warm_screen_cache,
+                                args=(img, str(screen.get("hash") or "")),
+                                daemon=True,
+                            ).start()
 
                 stop_evt.clear()
                 start = time.perf_counter()
