@@ -239,8 +239,9 @@ LLM_SYSTEM_PROMPT = (
     "पहले एक लाइन में बताओ स्क्रीन पर क्या गड़बड़ है, फिर २-३ आसान कदम बताओ जिनसे "
     "वो ठीक होगी। यूज़र से कभी मत कहो कि तुम्हें 'कॉन्टेक्स्ट' या 'डिस्क्रिप्शन' मिला "
     "है — सीधे 'आपकी स्क्रीन पर ...' कहकर बात करो। अगर यूज़र स्क्रीन के बारे में "
-    "पूछे और स्क्रीन का हाल न मिला हो, तो मस्त अंदाज़ में बोलो कि स्क्रीन शेयर बटन "
-    "दबाकर स्क्रीन शेयर करें, फिर मैं देखकर बताऊँगा। "
+    "पूछे और स्क्रीन का हाल न मिला हो, तो पहले यूज़र से पूछो कि स्क्रीन शेयर चालू "
+    "है या नहीं — बिना पूछे यह मत मानो कि शेयर बंद है। शेयर बंद हो तो मस्त अंदाज़ में "
+    "बोलो कि स्क्रीन शेयर बटन दबाकर स्क्रीन दिखाए, फिर मैं देखकर बताऊँगा। "
     "जरूरी नियम: अगर उपयोगकर्ता सिर्फ अभिवादन या हालचाल पूछ "
     "रहा है (जैसे 'नमस्ते', 'हेलो', 'हाय', 'कैसे हो', 'क्या चल रहा है', 'क्या हाल', "
     "'hello', 'hi', 'how are you'), तो सिर्फ १-२ वाक्य का सीधा, स्वाभाविक जवाब दो "
@@ -930,6 +931,21 @@ SCREEN_CONTEXT_TMPL = (
 )
 
 
+# Used when a screen frame ARRIVES but neither layer has data yet (first
+# share in a session: VLM still loading, OCR engine cold). The user IS
+# sharing — the tutor must never ask them to share again.
+SCREEN_PENDING_TMPL = (
+    "स्क्रीन स्थिति — यूज़र अभी स्क्रीन शेयर कर रहा है, पर स्क्रीन का विश्लेषण अभी "
+    "तैयार नहीं हुआ (कुछ सेकंड लगेंगे)।\n"
+    "नियम:\n"
+    "1) कभी मत बोलो कि स्क्रीन शेयर नहीं हुई या शेयर बटन दबाओ — स्क्रीन शेयर हो रही है।\n"
+    "2) छोटे जवाब दो: 'एक पल रुको, मैं स्क्रीन देख रहा हूँ — दोबारा बोलो' जैसा कुछ।\n"
+    "3) अगर यूज़र का सवाल स्क्रीन के बिना भी answer हो सकता है तो पहले answer दो।\n"
+    "4) स्क्रीन विश्लेषण अगले कुछ सेकंड में तैयार हो जाएगा — यूज़र दोबारा पूछे तो "
+    "तब स्क्रीन पूरी तरह दिखेगी।"
+)
+
+
 def _screen_context_block(layers: dict) -> str | None:
     """Combine the two screen layers into one system-prompt block."""
     parts = []
@@ -1349,6 +1365,13 @@ async def lifespan(_app: FastAPI):
     # Preload the ASR model in the background so the first utterance isn't
     # delayed by the model download/load (up to minutes on slow links).
     threading.Thread(target=_warmup_asr, daemon=True).start()
+    # Preload RapidOCR too — without this, the FIRST screen-share turn runs
+    # before the OCR engine exists, _screen_layers sees no layer at all, and
+    # the tutor wrongly claims it can't see the screen.
+    threading.Thread(
+        target=lambda: (_load_ocr(), None)[-1] if not _ocr_disabled else None,
+        daemon=True,
+    ).start()
 
     yield
 
@@ -1796,7 +1819,19 @@ async def ws_tts(websocket: WebSocket):
                                 "content": LLM_SYSTEM_PROMPT + "\n\n" + block,
                             }
                         else:
-                            log.info("WS chat: no screen context available — text-only reply")
+                            # A frame ARRIVED, so the user IS sharing — never let
+                            # the tutor say "share your screen". Tell the LLM the
+                            # analysis is still warming and it should ask the user
+                            # to repeat in a moment; the background warmers below
+                            # fill both layers for the very next turn.
+                            log.info(
+                                "WS chat: screen frame received but analysis pending — "
+                                "using pending-context block"
+                            )
+                            messages[0] = {
+                                "role": "system",
+                                "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_PENDING_TMPL,
+                            }
                         if not layers.get("desc"):
                             # VLM summary cold → describe in background for the
                             # next turn (reply already has fresh OCR text)
