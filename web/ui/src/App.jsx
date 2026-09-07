@@ -120,6 +120,7 @@ export default function App() {
   const lastSentHashRef = useRef(""); // hash already attached to a chat turn
   const lastPrefetchAtRef = useRef(0); // last background /api/vision warm-up
   const screenFetchBusyRef = useRef(false); // a warm-up fetch is in flight (never queue)
+  const screenForceAtRef = useRef(0); // last forced capture (small edits can dodge the diff)
   // VAD state — thresholds/initial values come from CFG (env-driven).
   const vadRef = useRef({
     noise: CFG.vadNoiseFloor, // adaptive ambient floor (updated when idle)
@@ -324,7 +325,12 @@ export default function App() {
       changed = diff > 320; // ~0.4% of the frame fully flipped
     }
     screenDiffRef.current = gray;
-    if (!changed) return;
+    // Small but meaningful changes (a few edited words) can slip under the
+    // diff threshold and leave the tutor blind. Force a capture every 10 s
+    // so context can never lag further behind than that.
+    const forced = Date.now() - screenForceAtRef.current >= 10000;
+    if (forced) screenForceAtRef.current = Date.now();
+    if (!changed && !forced) return;
     // 3) encode the real frame (max 1280px wide, q0.7 ≈ 100-250 KB)
     const hash = `s${sig >>> 0}`;
     const scale = Math.min(1, 1280 / vid.videoWidth);
@@ -390,6 +396,37 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stopScreenShare]);
 
+  /* Capture the screen RIGHT NOW (used at question time so the tutor always
+     sees the screen as it is when you ask — never a stale cached frame).
+     960px/q0.65: OCR reads text fine at this size and the WS upload (and the
+     inline OCR) shrink ~2x vs 1280px/q0.7 — pure latency win on the reply. */
+  const grabScreen = () => {
+    const vid = screenVideoRef.current;
+    if (!vid || !sharingRef.current || !vid.videoWidth) return null;
+    if (!screenCanvasRef.current) screenCanvasRef.current = document.createElement("canvas");
+    const scale = Math.min(1, 960 / vid.videoWidth);
+    const c = screenCanvasRef.current;
+    c.width = Math.round(vid.videoWidth * scale);
+    c.height = Math.round(vid.videoHeight * scale);
+    c.getContext("2d").drawImage(vid, 0, 0, c.width, c.height);
+    const b64 = c.toDataURL("image/jpeg", 0.65).split(",")[1];
+    // signature from the same instant — same pixels = same hash = 0 ms OCR;
+    // changed pixels = new hash = server OCRs fresh (~0.5-1 s GPU)
+    if (!screenDiffCanvasRef.current) {
+      screenDiffCanvasRef.current = document.createElement("canvas");
+      screenDiffCanvasRef.current.width = 32;
+      screenDiffCanvasRef.current.height = 24;
+    }
+    const dctx = screenDiffCanvasRef.current.getContext("2d", { willReadFrequently: true });
+    dctx.drawImage(vid, 0, 0, 32, 24);
+    const px = dctx.getImageData(0, 0, 32, 24).data;
+    let sig = 0;
+    for (let i = 0, j = 0; i < 32 * 24; i++, j += 4) {
+      sig = (sig * 31 + ((px[j] * 299 + px[j + 1] * 587 + px[j + 2] * 114) / 1000)) | 0;
+    }
+    return { b64, hash: `s${sig >>> 0}` };
+  };
+
   /* ---- submit a new user turn ---- */
   const submitChat = useCallback(
     (rawText) => {
@@ -416,14 +453,17 @@ export default function App() {
       // Screen understanding: while sharing, attach the newest CHANGED frame.
       // The server describes it cache-first by hash — a warm cache means the
       // LLM starts with screen context at ZERO extra vision latency.
-      if (sharingRef.current && screenFrameRef.current) {
-        const f = screenFrameRef.current;
-        if (f.hash !== lastSentHashRef.current) {
-          payload.screen = { image: f.b64, hash: f.hash };
-          lastSentHashRef.current = f.hash;
+      if (sharingRef.current) {
+        // PRODUCTION RULE: capture at question time — the tutor always sees
+        // the screen as it is RIGHT NOW, automatically. No keyword triggers,
+        // no stale frames. Same pixels reuse the server's cached OCR (0 ms);
+        // changed pixels get fresh OCR inline (~0.5-1 s GPU).
+        const shot = grabScreen();
+        if (shot) {
+          payload.screen = shot;
+          screenFrameRef.current = { b64: shot.b64, hash: shot.hash, ts: Date.now() };
+          lastSentHashRef.current = shot.hash;
         }
-        // stale frame (older than 15 s) still helps, but fresh ones are best —
-        // the server's 10-min TTL cache covers the gap either way.
       }
       ws.send(JSON.stringify(payload));
     },

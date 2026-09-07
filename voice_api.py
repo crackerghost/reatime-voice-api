@@ -653,10 +653,13 @@ _screen_pending: dict = {}  # hash -> threading.Event
 _screen_pending_lock = threading.Lock()
 
 
-def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, str]:
+def _screen_context(image_b64: str, client_hash: str = "", force: bool = False) -> tuple[str, bool, str]:
     """Describe one screenshot; cache-first by client hash.
 
     Returns (description, was_cached, model_name_actually_used).
+
+    force=True ("check again") skips the cache AND coalescing so the screen
+    is genuinely re-described even if this hash was described before.
 
     Engine: VISION_BACKEND=auto (default) uses the hosted API when a key is
     configured, otherwise the LOCAL Qwen2.5-VL-3B loaded in this process (no
@@ -666,7 +669,7 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, s
     Coalescing: concurrent requests with the same hash collapse into ONE
     generate — the first caller runs it, the rest piggyback on its result.
     """
-    if client_hash:
+    if client_hash and not force:
         with _screen_lock:
             if (
                 _screen_cache["hash"] == client_hash
@@ -677,7 +680,7 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, s
     # ---- piggyback on an in-flight describe of THIS screen ----------------
     # (registered winner still running -> wait for its result instead of
     #  queueing a redundant generate of the same stale screen)
-    if client_hash:
+    if client_hash and not force:
         with _screen_pending_lock:
             evt = _screen_pending.get(client_hash)
         if evt is not None and evt.wait(timeout=90):
@@ -688,7 +691,7 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, s
     # ---- register as the winner (or run unhashed) -------------------------
     is_winner = False
     evt = None
-    if client_hash:
+    if client_hash and not force:
         with _screen_pending_lock:
             existing = _screen_pending.get(client_hash)
             if existing is not None:
@@ -739,10 +742,11 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, s
             evt.set()  # wake piggybackers (cache now holds the result)
 
 
-# Cold-cache softener: if a describe for THIS screen is already in flight
-# when the user asks, wait up to this long for it instead of answering blind.
-# Only ever applies when a describe is IN FLIGHT — never started on demand.
-VISION_REPLY_WAIT_S = float(os.environ.get("VISION_REPLY_WAIT_S", "1.2"))
+# Cold-cache softener: if a describe for THIS screen is ALREADY in flight
+# when the user asks, wait up to this long for it. Keep small — OCR now
+# carries the fresh ground truth, so stalling for the slow VLM is rarely
+# worth it (1.2s here used to tax EVERY changed-screen turn).
+VISION_REPLY_WAIT_S = float(os.environ.get("VISION_REPLY_WAIT_S", "0.3"))
 
 
 def _screen_cached_desc(client_hash: str = "", wait_s: float = 0.0) -> tuple[str, str]:
@@ -770,10 +774,11 @@ def _screen_cached_desc(client_hash: str = "", wait_s: float = 0.0) -> tuple[str
         evt.wait(timeout=0.3)  # poll; the in-flight describe may finish
 
 
-def _warm_screen_cache(image_b64: str, client_hash: str = "") -> None:
-    """Fire-and-forget background describe so the NEXT turn finds a warm cache."""
+def _warm_screen_cache(image_b64: str, client_hash: str = "", force: bool = False) -> None:
+    """Fire-and-forget background describe so the NEXT turn finds a warm cache.
+    force=True re-describes even when the hash is already cached ('check again')."""
     try:
-        _screen_context(image_b64, client_hash)
+        _screen_context(image_b64, client_hash, force=force)
     except Exception as e:  # noqa: BLE001 — background job, never crash anything
         log.warning("Background screen describe failed: %s", e)
 
@@ -785,14 +790,15 @@ def _warm_screen_cache(image_b64: str, client_hash: str = "") -> None:
 # output all arrive as exact text, which is exactly what a tutor quotes.
 _ocr_lock = threading.Lock()
 _ocr_engine = None
+_ocr_cuda = False  # set by _load_ocr (CUDA build -> inline recheck OCR is affordable)
 _ocr_disabled = False  # set once if rapidocr is not installed
 _ocr_cache: dict = {"hash": None, "text": "", "ts": 0.0}
-OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "960"))
+OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "768"))
 OCR_MAX_LINES = int(os.environ.get("VISION_OCR_MAX_LINES", "60"))
 
 
 def _load_ocr():
-    global _ocr_engine
+    global _ocr_engine, _ocr_cuda
     if _ocr_engine is not None:
         return _ocr_engine
     with _ocr_lock:
@@ -801,14 +807,30 @@ def _load_ocr():
         from rapidocr_onnxruntime import RapidOCR
 
         t0 = time.perf_counter()
-        _ocr_engine = RapidOCR()
-        log.info("RapidOCR ready in %.1fs (screen text layer)", time.perf_counter() - t0)
+        try:
+            import onnxruntime as _ort
+
+            use_cuda = "CUDAExecutionProvider" in _ort.get_available_providers()
+        except Exception:  # noqa: BLE001
+            use_cuda = False
+        if use_cuda:
+            _ocr_cuda = True
+            _ocr_engine = RapidOCR(det_use_cuda=True, cls_use_cuda=True, rec_use_cuda=True)
+            log.info("RapidOCR ready on CUDA in %.1fs", time.perf_counter() - t0)
+        else:
+            _ocr_engine = RapidOCR()
+            log.info(
+                "RapidOCR ready on CPU in %.1fs — SLOW for dense screens; "
+                "install onnxruntime-gpu for ~10x faster OCR",
+                time.perf_counter() - t0,
+            )
         return _ocr_engine
 
 
-def _screen_ocr(image_b64: str, client_hash: str = "") -> str:
-    """Fast text layer: OCR one frame. Cached by hash; ~100-300 ms on GPU."""
-    if client_hash:
+def _screen_ocr(image_b64: str, client_hash: str = "", force: bool = False) -> str:
+    """Fast text layer: OCR one frame. Cached by hash; ~100-300 ms on GPU.
+    force=True skips the cache read (user said 'check again')."""
+    if client_hash and not force:
         with _ocr_lock:
             if (
                 _ocr_cache["hash"] == client_hash
@@ -835,11 +857,16 @@ def _screen_ocr(image_b64: str, client_hash: str = "") -> str:
 
 
 def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
-    """Fresh screen context for the reply path (runs in an executor thread).
+    """ALWAYS-REALTIME screen context for the reply path (executor thread).
 
-    OCR text: cache peek, else INLINE (~100-300 ms — fast enough to block on;
-    guarantees text is never more than ~1 turn old).
-    VLM summary: cache peek ONLY with the bounded wait — never recomputed here.
+    The client captures the frame AT QUESTION TIME, so the hash is current:
+      - hash in OCR cache  -> screen pixels are unchanged -> cached text IS
+        the current screen (0 ms)
+      - hash miss          -> screen changed -> OCR runs INLINE (~0.5-1 s on
+        GPU — the price of guaranteed-fresh text; never on CPU, that goes
+        background)
+    VLM summary: cache peek with bounded wait only — background warmer fills
+    it (8-12 s/screen is too slow for the reply path, period).
     """
     global _ocr_disabled
     desc, model_used = _screen_cached_desc(client_hash, VISION_REPLY_WAIT_S)
@@ -853,15 +880,34 @@ def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
             ):
                 ocr = _ocr_cache["text"]
     if not ocr and image_b64 and not _ocr_disabled:
-        try:
-            ocr = _screen_ocr(image_b64, client_hash)
-        except Exception as e:  # noqa: BLE001 — OCR must never break a reply
-            if isinstance(e, ImportError):
-                _ocr_disabled = True
-                log.warning("rapidocr_onnxruntime not installed — OCR layer disabled (pip install rapidocr-onnxruntime)")
-            else:
+        if _ocr_engine is not None and _ocr_cuda:
+            # GPU OCR is fast enough to be in the reply path — fresh text
+            # on EVERY turn, automatically. No keywords, no staleness.
+            try:
+                ocr = _screen_ocr(image_b64, client_hash)
+            except Exception as e:  # noqa: BLE001 — OCR must never break a reply
                 log.warning("Inline OCR failed: %s", e)
+        else:
+            # CPU OCR is far too slow (11 s in the field) — background only.
+            threading.Thread(
+                target=_warm_screen_ocr, args=(image_b64, client_hash), daemon=True
+            ).start()
     return {"ocr": ocr, "desc": desc, "model": model_used}
+
+
+def _warm_screen_ocr(image_b64: str, client_hash: str = "") -> None:
+    """Fire-and-forget background OCR so the NEXT turn has fresh text."""
+    global _ocr_disabled
+    if _ocr_disabled:
+        return
+    try:
+        _screen_ocr(image_b64, client_hash)
+    except Exception as e:  # noqa: BLE001
+        if isinstance(e, ImportError):
+            _ocr_disabled = True
+            log.warning("rapidocr_onnxruntime not installed — OCR layer disabled (pip install rapidocr-onnxruntime)")
+        else:
+            log.warning("Background OCR failed: %s", e)
 
 
 # Appended to the system prompt on turns that carry screen context.
@@ -1752,7 +1798,8 @@ async def ws_tts(websocket: WebSocket):
                         else:
                             log.info("WS chat: no screen context available — text-only reply")
                         if not layers.get("desc"):
-                            # VLM summary cold → warm in background for next turn
+                            # VLM summary cold → describe in background for the
+                            # next turn (reply already has fresh OCR text)
                             threading.Thread(
                                 target=_warm_screen_cache,
                                 args=(img, str(screen.get("hash") or "")),

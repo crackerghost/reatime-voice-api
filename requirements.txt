@@ -33,7 +33,10 @@ noisereduce
 # turn-taker (fan/door/keyboard noise can no longer open phantom utterances).
 # `ASR_VAD_MODE=auto` uses it when installed, else the browser energy VAD.
 silero-vad>=5.0
-onnxruntime
+# OCR/VAD runtime: CUDA build on Linux (Kaggle — ~10x faster screen OCR),
+# CPU build elsewhere. Same import name, one of the two installs per platform.
+onnxruntime; sys_platform != "linux"
+onnxruntime-gpu; sys_platform == "linux"
 # Speaker-verification gate: enrolls the primary speaker's voiceprint from
 # VOICE_REF_AUDIO and drops utterances from anyone else (competing voices,
 # phone videos in the background). MIT-licensed; auto-disables if absent.
