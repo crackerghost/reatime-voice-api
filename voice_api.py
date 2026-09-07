@@ -797,6 +797,43 @@ _ocr_cache: dict = {"hash": None, "text": "", "ts": 0.0}
 OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "768"))
 OCR_MAX_LINES = int(os.environ.get("VISION_OCR_MAX_LINES", "60"))
 
+def _cuda_libs_loadable() -> bool:
+    """True only if the CUDA runtime libs onnxruntime-gpu dlopens actually load.
+
+    Merely having CUDAExecutionProvider in get_available_providers() is NOT
+    enough — a CUDA-13 build on a CUDA-12 host (e.g. latest onnxruntime-gpu on
+    Kaggle) lists the provider, then fails at session creation and silently
+    falls back to CPU. Preloading the exact sonames with RTLD_GLOBAL both
+    verifies them and satisfies the provider's later dlopen.
+    """
+    import ctypes
+    import glob
+
+    candidates: list[str] = []
+    for soname in ("libcublasLt.so.12", "libcudnn.so.9"):
+        found = ctypes.util.find_library(soname.removeprefix("lib").removesuffix(".so.12").removesuffix(".so.9"))
+        paths = [soname]
+        # pip-installed NVIDIA wheels keep libs outside the ld search path
+        for pat in (
+            f"/usr/lib/python3*/dist-packages/nvidia/*/lib/{soname}",
+            f"/usr/local/lib/python3*/dist-packages/nvidia/*/lib/{soname}",
+            f"/usr/lib/python3*/site-packages/nvidia/*/lib/{soname}",
+        ):
+            paths.extend(glob.glob(pat))
+        loaded = False
+        for p in paths:
+            try:
+                ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL)
+                loaded = True
+                break
+            except OSError:
+                continue
+        if not loaded:
+            log.warning("CUDA lib %s not loadable — GPU OCR disabled (CPU fallback)", soname)
+            return False
+        candidates.append(soname)
+    return True
+
 
 def _load_ocr():
     global _ocr_engine, _ocr_cuda
@@ -811,7 +848,7 @@ def _load_ocr():
         try:
             import onnxruntime as _ort
 
-            use_cuda = "CUDAExecutionProvider" in _ort.get_available_providers()
+            use_cuda = "CUDAExecutionProvider" in _ort.get_available_providers() and _cuda_libs_loadable()
         except Exception:  # noqa: BLE001
             use_cuda = False
         if use_cuda:

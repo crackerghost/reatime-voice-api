@@ -36,7 +36,11 @@ silero-vad>=5.0
 # OCR/VAD runtime: CUDA build on Linux (Kaggle — ~10x faster screen OCR),
 # CPU build elsewhere. Same import name, one of the two installs per platform.
 onnxruntime; sys_platform != "linux"
-onnxruntime-gpu; sys_platform == "linux"
+# PINNED: 1.22.x is the last onnxruntime-gpu built for CUDA 12.x — the latest
+# (1.23+) is built for CUDA 13 and CRASHES on Kaggle's CUDA 12 image with
+# "libcublasLt.so.13: cannot open shared object file", silently falling back
+# to CPU (slow OCR). Needs cuDNN 9 (Kaggle's image ships it).
+onnxruntime-gpu==1.22.0; sys_platform == "linux"
 # Speaker-verification gate: enrolls the primary speaker's voiceprint from
 # VOICE_REF_AUDIO and drops utterances from anyone else (competing voices,
 # phone videos in the background). MIT-licensed; auto-disables if absent.
