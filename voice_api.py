@@ -449,10 +449,14 @@ VISION_DESC_PROMPT = (
 )
 
 _screen_lock = threading.Lock()
-_screen_cache: dict = {"hash": None, "desc": "", "ts": 0.0}
+_screen_cache: dict = {"hash": None, "desc": "", "ts": 0.0, "model": ""}
 
 
-_vlm_lock = threading.Lock()
+# RLock, held across load AND generate: model.generate() is NOT safe to run
+# concurrently on one instance — three simultaneous calls (requests queued
+# while the model loads) OOM/race and 503. Serializing them means the 2nd/3rd
+# identical requests then hit the hash cache instead.
+_vlm_lock = threading.RLock()
 _local_vlm: dict = {"model": None, "processor": None}
 
 
@@ -499,7 +503,16 @@ def _load_local_vlm():
         device = "cuda" if _torch.cuda.is_available() else (
             "mps" if _torch.backends.mps.is_available() else "cpu"
         )
-        dtype = _torch.float16 if device == "cuda" else _torch.float32
+        # auto: fp16 on CUDA (~4.5 GB for the 3B), fp32 on MPS/CPU (fp16 MPS
+        # is broken on torch 2.x — same rule as the TTS model). VISION_LOCAL_DTYPE
+        # overrides when MPS memory is tight (fp16 halves the 3B's ~12 GB).
+        want = os.environ.get("VISION_LOCAL_DTYPE", "auto").strip().lower()
+        if want in ("fp16", "float16", "half"):
+            dtype = _torch.float16
+        elif want in ("fp32", "float32", "float"):
+            dtype = _torch.float32
+        else:
+            dtype = _torch.float16 if device == "cuda" else _torch.float32
         log.info("Loading local vision model %s on %s (%s)…", VISION_LOCAL_MODEL, device, dtype)
         t0 = time.perf_counter()
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -512,44 +525,54 @@ def _load_local_vlm():
 
 
 def _screen_describe_local(image_b64: str) -> str:
-    """Describe one screenshot with the LOCAL Qwen2.5-VL-3B (transformers)."""
+    """Describe one screenshot with the LOCAL Qwen2.5-VL-3B (transformers).
+
+    The whole call (load + generate) runs under _vlm_lock so only ONE
+    generation touches the model at a time — concurrent generate() calls on
+    the same weights OOM/race (the cause of the 503 storm after load).
+    """
     import base64
 
     import torch as _torch
     from PIL import Image
 
-    model, processor = _load_local_vlm()
-    img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
-    if max(img.size) > 1280:  # keep the vision-token budget (and latency) sane
-        img.thumbnail((1280, 1280))
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": img},
-                {"type": "text", "text": VISION_DESC_PROMPT},
-            ],
-        }
-    ]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[img], return_tensors="pt").to(model.device)
-    t0 = time.perf_counter()
-    with _torch.inference_mode():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=VISION_LOCAL_MAX_NEW_TOKENS,
-            do_sample=False,
+    with _vlm_lock:
+        model, processor = _load_local_vlm()
+        try:
+            img = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+            if max(img.size) > 1280:  # keep the vision-token budget (and latency) sane
+                img.thumbnail((1280, 1280))
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": VISION_DESC_PROMPT},
+                    ],
+                }
+            ]
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(text=[text], images=[img], return_tensors="pt").to(model.device)
+            t0 = time.perf_counter()
+            with _torch.inference_mode():
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=VISION_LOCAL_MAX_NEW_TOKENS,
+                    do_sample=False,
+                )
+            resp = processor.batch_decode(
+                out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+            )[0].strip()
+        except Exception as e:  # noqa: BLE001 — surface as 503 detail + server log
+            log.exception("Local vision generate failed (%s)", VISION_LOCAL_MODEL)
+            raise RuntimeError(f"Local vision failed: {type(e).__name__}: {e}") from e
+        if not resp:
+            raise RuntimeError("Local vision model returned an empty description")
+        log.info(
+            "Vision(local): described in %.2fs (%d chars, %s)",
+            time.perf_counter() - t0, len(resp), VISION_LOCAL_MODEL,
         )
-    resp = processor.batch_decode(
-        out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
-    )[0].strip()
-    if not resp:
-        raise RuntimeError("Local vision model returned an empty description")
-    log.info(
-        "Vision(local): described in %.2fs (%d chars, %s)",
-        time.perf_counter() - t0, len(resp), VISION_LOCAL_MODEL,
-    )
-    return resp
+        return resp
 
 
 def _screen_describe_api(image_b64: str, key: str) -> str:
@@ -601,8 +624,10 @@ def _screen_backend_choice() -> str:
     return "api" if _vision_api_key() else "local"
 
 
-def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool]:
+def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool, str]:
     """Describe one screenshot; cache-first by client hash.
+
+    Returns (description, was_cached, model_name_actually_used).
 
     Engine: VISION_BACKEND=auto (default) uses the hosted API when a key is
     configured, otherwise the LOCAL Qwen2.5-VL-3B loaded in this process (no
@@ -616,7 +641,7 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool]:
                 and _screen_cache["desc"]
                 and time.monotonic() - _screen_cache["ts"] < SCREEN_CACHE_TTL
             ):
-                return _screen_cache["desc"], True
+                return _screen_cache["desc"], True, _screen_cache["model"]
     t0 = time.perf_counter()
     backend = _screen_backend_choice()
     if backend == "api":
@@ -627,6 +652,7 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool]:
                 "or set VISION_BACKEND=local to use the local Qwen2.5-VL-3B)"
             )
         desc = _screen_describe_api(image_b64, key)
+        model_used = VISION_MODEL
     else:
         if not _local_vlm_available():
             raise RuntimeError(
@@ -634,13 +660,16 @@ def _screen_context(image_b64: str, client_hash: str = "") -> tuple[str, bool]:
                 "to use the hosted Qwen2.5-VL API instead)"
             )
         desc = _screen_describe_local(image_b64)
+        model_used = VISION_LOCAL_MODEL
     with _screen_lock:
-        _screen_cache.update({"hash": client_hash or None, "desc": desc, "ts": time.monotonic()})
+        _screen_cache.update(
+            {"hash": client_hash or None, "desc": desc, "ts": time.monotonic(), "model": model_used}
+        )
     log.info(
-        "Vision(%s): screen described in %.2fs (%d chars)",
-        backend, time.perf_counter() - t0, len(desc),
+        "Vision(%s/%s): screen described in %.2fs (%d chars)",
+        backend, model_used, time.perf_counter() - t0, len(desc),
     )
-    return desc, False
+    return desc, False, model_used
 
 
 # Appended to the system prompt for turns that carry a fresh screen description.
@@ -1489,7 +1518,7 @@ async def ws_tts(websocket: WebSocket):
                         img = img.split(",", 1)[1]
                     if img:
                         try:
-                            desc, cached = await asyncio.get_running_loop().run_in_executor(
+                            desc, cached, _vlm_model = await asyncio.get_running_loop().run_in_executor(
                                 None, _screen_context, img, str(screen.get("hash") or "")
                             )
                             log.info("WS chat: screen context %s (%.0f chars)",
@@ -2385,10 +2414,11 @@ def api_vision(req: VisionRequest):
     if img.startswith("data:") and "," in img:
         img = img.split(",", 1)[1]
     try:
-        desc, cached = _screen_context(img, req.hash)
-    except RuntimeError as e:
+        desc, cached, model = _screen_context(img, req.hash)
+    except Exception as e:  # noqa: BLE001 — log the WHY, not just the 503
+        log.exception("/api/vision failed: %s", e)
         raise HTTPException(status_code=503, detail=str(e)) from e
-    return {"description": desc, "cached": cached, "model": VISION_MODEL}
+    return {"description": desc, "cached": cached, "model": model, "backend": _screen_backend_choice()}
 
 
 # ---------- LLM chat (keeps the API key server-side) ----------
