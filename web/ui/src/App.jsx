@@ -120,6 +120,7 @@ export default function App() {
   const lastSentHashRef = useRef(""); // hash already attached to a chat turn
   const lastPrefetchAtRef = useRef(0); // last background /api/vision warm-up
   const screenFetchBusyRef = useRef(false); // a warm-up fetch is in flight (never queue)
+  const screenNoVideoWarnedRef = useRef(false); // [screen] tick diagnostics, once per share
   const screenForceAtRef = useRef(0); // last forced capture (small edits can dodge the diff)
   // VAD state — thresholds/initial values come from CFG (env-driven).
   const vadRef = useRef({
@@ -299,7 +300,13 @@ export default function App() {
      background warm-up call. Runs every CFG.screenTickMs while sharing. */
   const screenTick = () => {
     const vid = screenVideoRef.current;
-    if (!vid || !sharingRef.current || !vid.videoWidth) return;
+    if (!vid || !sharingRef.current || !vid.videoWidth) {
+      if (sharingRef.current && !screenNoVideoWarnedRef.current) {
+        screenNoVideoWarnedRef.current = true;
+        console.warn("[screen] tick skipped — video not ready (videoWidth=0). If this persists, the capture stream died.");
+      }
+      return;
+    }
     if (!screenCanvasRef.current) {
       screenCanvasRef.current = document.createElement("canvas");
       screenDiffCanvasRef.current = document.createElement("canvas");
@@ -369,6 +376,10 @@ export default function App() {
 
   const startScreenShare = useCallback(async () => {
     if (sharingRef.current) { stopScreenShare(); return; }
+    if (!CFG.visionEnabled) {
+      showError("सर्वर पर vision चालू नहीं है — .env में VISION_BACKEND जाँचें।");
+      return;
+    }
     if (!navigator.mediaDevices?.getDisplayMedia) {
       showError("इस ब्राउज़र में स्क्रीन शेयर उपलब्ध नहीं है — Chrome/Edge आज़माएँ।");
       return;
@@ -388,10 +399,19 @@ export default function App() {
       lastSentHashRef.current = "";
       sharingRef.current = true;
       setSharing(true);
+      screenNoVideoWarnedRef.current = false;
+      console.info("[screen] capture loop started (tick " + CFG.screenTickMs + "ms)");
       stream.getVideoTracks()[0]?.addEventListener("ended", stopScreenShare); // user hit "Stop sharing"
       screenTickRef.current = setInterval(screenTick, CFG.screenTickMs);
     } catch (e) {
-      if (e && e.name !== "NotAllowedError") showError("स्क्रीन शेयर शुरू नहीं हो पाया: " + (e.message || e.name));
+      // VISIBLE failures: a swallowed NotAllowedError made users believe the
+      // screen was being shared when the browser had actually blocked it.
+      if (e && e.name === "NotAllowedError") {
+        showError("स्क्रीन शेयर की अनुमति नहीं मिली — दोबारा कोशिश करें और 'Share' दबाएँ।");
+      } else {
+        showError("स्क्रीन शेयर शुरू नहीं हो पाया: " + (e.message || e.name));
+      }
+      console.warn("[screen] getDisplayMedia failed:", e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stopScreenShare]);
@@ -463,6 +483,9 @@ export default function App() {
           payload.screen = shot;
           screenFrameRef.current = { b64: shot.b64, hash: shot.hash, ts: Date.now() };
           lastSentHashRef.current = shot.hash;
+          console.info(`[screen] frame attached to turn (${Math.round(shot.b64.length * 3 / 4 / 1024)} KB, hash ${shot.hash})`);
+        } else {
+          console.warn("[screen] sharing is ON but grabScreen() returned null — video not ready");
         }
       }
       ws.send(JSON.stringify(payload));
