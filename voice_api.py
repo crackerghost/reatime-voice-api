@@ -242,12 +242,15 @@ LLM_SYSTEM_PROMPT = (
     "पूछे और स्क्रीन का हाल न मिला हो, तो पहले यूज़र से पूछो कि स्क्रीन शेयर चालू "
     "है या नहीं — बिना पूछे यह मत मानो कि शेयर बंद है। शेयर बंद हो तो मस्त अंदाज़ में "
     "बोलो कि स्क्रीन शेयर बटन दबाकर स्क्रीन दिखाए, फिर मैं देखकर बताऊँगा। "
-    "जरूरी नियम: अगर उपयोगकर्ता सिर्फ अभिवादन या हालचाल पूछ "
+    "जरूरी नियम — जीवंत और गतिशील अभिवादन: अगर उपयोगकर्ता सिर्फ अभिवादन या हालचाल पूछ "
     "रहा है (जैसे 'नमस्ते', 'हेलो', 'हाय', 'कैसे हो', 'क्या चल रहा है', 'क्या हाल', "
-    "'hello', 'hi', 'how are you'), तो सिर्फ १-२ वाक्य का सीधा, स्वाभाविक जवाब दो "
-    "जैसे 'मैं बढ़िया हूँ, तुम बताओ आज क्या सीखना है?' — कोई एग्ज़ाम्पल मत दो, कोई "
-    "सवाल-क़तार मत जोड़ो, बहुत ज़्यादा मत बोलो। एग्ज़ाम्पल सिर्फ तब दो जब कोई चीज़ "
-    "या विषय समझाना हो। "
+    "'hello', 'hi', 'how are you'), तो हमेशा १-२ वाक्य का ताज़ा, नया और स्वाभाविक जवाब दो। "
+    "हर बार एक ही रटा-रटाया वाक्य (जैसे 'मैं ठीक हूँ' या 'मैं बढ़िया हूँ') कभी मत दोहराओ! "
+    "हर बातचीत में अंदाज़ बदलो — कभी गर्मजोशी से, कभी दोस्ताना, कभी सीधे काम की बात पर आते हुए। "
+    "अलग-अलग तरह से बात शुरू करो, जैसे: 'अरे नमस्ते! कहिए, आज क्या नया सीखना है?', "
+    "'हेलो जी! सब एकदम मस्त, आज किस टॉपिक पर काम करें?', 'नमस्ते! मैं बिल्कुल तैयार हूँ, "
+    "पूछिए अपना सवाल!', 'हाय! बहुत अच्छा लगा सुनकर, बताइए आज क्या हल करना है?'। "
+    "कोई लंबा लेक्चर मत दो, सीधे स्वाभाविक और आकर्षक अंदाज़ में १-२ वाक्यों में बात शुरू करो। "
     "हाँ/नहीं वाले या छोटे सवालों (जैसे 'मज़ा आता है क्या?', 'तुम कौन हो?') का जवाब "
     "सिर्फ १-२ वाक्य में दो — लंबा लेक्चर मत दो। लंबा समझाना सिर्फ तब जब वो सिखाने के "
     "लिए पूछे (जैसे 'समझाओ', 'क्या है', 'कैसे', 'सिखाओ') — तब भी सिर्फ ३-४ छोटे वाक्य। "
@@ -980,9 +983,12 @@ SCREEN_PENDING_TMPL = (
     "तैयार नहीं हुआ (कुछ सेकंड लगेंगे)।\n"
     "नियम:\n"
     "1) कभी मत बोलो कि स्क्रीन शेयर नहीं हुई या शेयर बटन दबाओ — स्क्रीन शेयर हो रही है।\n"
-    "2) छोटे जवाब दो: 'एक पल रुको, मैं स्क्रीन देख रहा हूँ — दोबारा बोलो' जैसा कुछ।\n"
-    "3) अगर यूज़र का सवाल स्क्रीन के बिना भी answer हो सकता है तो पहले answer दो।\n"
-    "4) स्क्रीन विश्लेषण अगले कुछ सेकंड में तैयार हो जाएगा — यूज़र दोबारा पूछे तो "
+    "2) स्क्रीन शेयर की पुष्टि यूज़र से कभी माँगो नहीं — 'स्क्रीन शेयर बटन दबाया है?', "
+    "'शेयर चालू करो', 'स्क्रीन दिखाओ' जैसा कुछ भी नहीं। शेयर पहले से चालू है, बस "
+    "विश्लेषण लोड हो रहा है।\n"
+    "3) छोटे जवाब दो: 'एक पल रुको, मैं स्क्रीन देख रहा हूँ — दोबारा बोलो' जैसा कुछ।\n"
+    "4) अगर यूज़र का सवाल स्क्रीन के बिना भी answer हो सकता है तो पहले answer दो।\n"
+    "5) स्क्रीन विश्लेषण अगले कुछ सेकंड में तैयार हो जाएगा — यूज़र दोबारा पूछे तो "
     "तब स्क्रीन पूरी तरह दिखेगी।"
 )
 
@@ -1024,6 +1030,64 @@ def _recent_screen_block() -> str | None:
         if _ocr_cache["text"] and time.monotonic() - _ocr_cache["ts"] < SCREEN_CACHE_TTL:
             layers["ocr"] = _ocr_cache["text"]
     return _screen_context_block(layers)
+
+
+# Screen context routing mode: "auto" (intent-based, saves tokens) or "always" (legacy)
+SCREEN_ROUTING_MODE = os.environ.get("VOICE_SCREEN_ROUTING", "auto").strip().lower()
+
+# Regex to detect when a user utterance actually refers to the screen, code, errors, or visual state
+_SCREEN_INTENT_RE = re.compile(
+    r"("
+    r"स्क्रीन|screen|विंडो|window|डिस्प्ले|display|टैब|tab\b|"
+    r"देख|देखो|देखना|दिखा|दिख रहा|दिखाई|देखा|देखकर|look|see|show|visible|watch\b|"
+    r"dekho|dekhiye|dekh|dikhao|dikh\s+raha|"
+    r"ये\s+क्या|यह\s+क्या|यहाँ|इधर|इसमें|इसपर|is\s+par|isme|what\s+is\s+this|what\'?s\s+this|look\s+at\s+this|"
+    r"यहाँ\s+क्या|idhar|yahan|here\b|"
+    r"एरर|error|बग|bug|इशू|issue|प्रॉब्लम|problem|दिक्कत|dikkat|गड़बड़|gadbad|मिस्टेक|mistake|गलत|galat|wrong|"
+    r"एक्सेप्शन|exception|क्रैश|crash|वार्निंग|warning|fail|"
+    r"चल\s+नहीं\s+रहा|काम\s+नहीं\s+कर\s+रहा|nahi\s+chal\s+raha|chal\s+nahi\s+raha|kam\s+nahi\s+kar\s+raha|not\s+working|अटक\s+गया|stuck|"
+    r"कोड|code|लाइन|line\b|सिंटैक्स|syntax|फ़ाइल|file\b|टर्मिनल|terminal|कंसोल|console|आउटपुट|output|लॉग|logs?\b|"
+    r"चेक|check|इंस्पेक्ट|inspect|रिव्यू|review|फिक्स|fix|सॉल्व|solve|सुधार|सुधारो|पढ़|read|"
+    r"बटन|button|फॉर्म|form|कंपोनेंट|component|वेबसाइट|website|पेज|page\b|यूआई|ui\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Short follow-ups in an ongoing debugging / screen discussion
+_SCREEN_FOLLOWUP_RE = re.compile(
+    r"^(तो\s+फिर|अब\s+क्या|आगे\s+क्या|कैसे\s+करूँ|कैसे\s+होगा|क्या\s+करूँ|फिक्स\s+कैसे|how\s+to\s+fix|what\s+next|and\s+now\??$)",
+    re.IGNORECASE,
+)
+
+
+def _should_include_screen_context(text: str, history: list[dict] | None = None) -> bool:
+    """Determine if screen context should be injected into the LLM system prompt.
+
+    Avoids wasting hundreds of tokens on greetings, general theory, or unrelated chat
+    while screen share is active.
+    """
+    if SCREEN_ROUTING_MODE == "always":
+        return True
+
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return False
+
+    # If it directly matches screen/code intent, include it
+    if _SCREEN_INTENT_RE.search(clean_text):
+        return True
+
+    # If it's pure greeting or casual small-talk without screen keywords, skip
+    if GREETING_RE.search(clean_text):
+        return False
+
+    # Check if this is a short follow-up to a recent screen-related question
+    if history and len(clean_text) < 40 and _SCREEN_FOLLOWUP_RE.search(clean_text):
+        user_msgs = [m.get("content", "") for m in history if m.get("role") == "user"]
+        if user_msgs and _SCREEN_INTENT_RE.search(user_msgs[-1]):
+            return True
+
+    return False
 
 
 # Serve the built React/Tailwind UI (web/ui/dist). Rebuild with:
@@ -1156,9 +1220,40 @@ def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, ma
             retry_wait = min(retry_wait * 2, 8.0)
 
 
+_HINDI_NUMS = {
+    0: "शून्य", 1: "एक", 2: "दो", 3: "तीन", 4: "चार", 5: "पांच", 6: "छह", 7: "सात", 8: "आठ", 9: "नौ",
+    10: "दस", 11: "ग्यारह", 12: "बारह", 13: "तेरह", 14: "चौदह", 15: "पंद्रह", 16: "सोलह", 17: "सत्रह",
+    18: "अठारह", 19: "उन्नीस", 20: "बीस", 21: "इक्कीस", 22: "बाईस", 23: "तेईस", 24: "चौबीस", 25: "पच्चीस",
+    26: "छब्बीस", 27: "सत्ताईस", 28: "अट्ठाइस", 29: "उनतीस", 30: "तीस", 31: "इकत्तीस", 32: "बत्तीस",
+    33: "तैंतीस", 34: "चौंतीस", 35: "पैंतीस", 36: "छत्तीस", 37: "सैंतीस", 38: "अड़तीस", 39: "उनतालीस",
+    40: "चालीस", 50: "पचास", 60: "साठ", 70: "सत्तर", 80: "अस्सी", 90: "नब्बे", 100: "सौ",
+}
+
+
+def _convert_numbers_to_hindi(text: str) -> str:
+    """Convert numeric digits to spoken Hindi words so OmniVoice never fails on ASCII numbers."""
+    def _repl(m: re.Match) -> str:
+        s = m.group(0)
+        try:
+            val = int(s)
+            if val in _HINDI_NUMS:
+                return _HINDI_NUMS[val]
+            if val < 100:
+                tens = (val // 10) * 10
+                ones = val % 10
+                return f"{_HINDI_NUMS.get(tens, '')} {_HINDI_NUMS.get(ones, '')}".strip()
+            # Multi-digit numbers (like 404, 2024): pronounce digit-by-digit
+            return " ".join(_HINDI_NUMS.get(int(d), d) for d in s)
+        except Exception:
+            return s
+
+    return re.sub(r"\d+", _repl, text)
+
+
 def _speech_sentence(sent: str) -> str:
-    """Make one streamed sentence speakable (strip markup, Devanagari accent)."""
+    """Make one streamed sentence speakable (strip markup, convert numbers, Devanagari accent)."""
     sent = _speechify(sent)
+    sent = _convert_numbers_to_hindi(sent)
     sent = _devanagari_only(sent)
     if not sent:
         return ""
@@ -1358,11 +1453,9 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 if stop_evt is not None:
                     stop_evt.set()  # tell the producer to stop too
                 break
-        if not emitted_text and not (stop_evt is not None and stop_evt.is_set()):
-            # The LLM returned no speakable text (reasoning models can burn the
-            # whole token budget thinking before saying anything). Always answer
-            # out loud — silence reads as "the assistant is broken".
-            fallback = "माफ़ कीजिए, एक बार फिर से पूछिए।"
+        if (not emitted_text or (llm_error and not emitted_audio)) and not (stop_evt is not None and stop_evt.is_set()):
+            # Always answer out loud — silence reads as "the assistant is broken".
+            fallback = "माफ़ कीजिए, आवाज़ साफ़ नहीं आ पाई। कृपया एक बार फिर बोलिए।"
             out_q.put(("text", fallback))
             win_q.put({"text": fallback, "steps": min(num_step, FIRST_WINDOW_STEP)})
             emitted_audio = True
@@ -1371,7 +1464,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             win_q.put({"text": " ".join(window), "steps": steps})  # final tail window
         win_q.put(None)  # stop the audio thread
         audio_done.wait(timeout=180)
-        if llm_error:
+        if llm_error and not emitted_audio:
             raise RuntimeError(llm_error[0])
         rtf = timing["total_gen"] / timing["total_dur"] if timing["total_dur"] else 0.0
         log.info(
@@ -1440,6 +1533,14 @@ async def lifespan(_app: FastAPI):
         target=lambda: (_load_ocr(), None)[-1] if not _ocr_disabled else None,
         daemon=True,
     ).start()
+    # Preload the local VLM as well. Lazily it loads on the FIRST screen share
+    # (30-70 s on Colab/Kaggle), so the first "मेरी स्क्रीन पर क्या है?" turn
+    # lands while the describe is still running — no context, and the tutor
+    # asks about the share button even though sharing is on. Warm it at boot
+    # instead (background thread, after the TTS model, so startup is unchanged
+    # in sequence and the weights are ready before the user ever shares).
+    if _vision_ready_backend() == "local":
+        threading.Thread(target=_load_local_vlm, daemon=True).start()
 
     yield
 
@@ -1859,72 +1960,80 @@ async def ws_tts(websocket: WebSocket):
                 # screen adds ZERO vision latency — only a fresh screen pays
                 # one Qwen2.5-VL call before the LLM starts writing.
                 screen = data.get("screen") if isinstance(data.get("screen"), dict) else None
+                need_screen = _should_include_screen_context(text, history)
                 if screen:
                     global _last_screen_activity
                     _last_screen_activity = time.monotonic()
-                    img = str(screen.get("image") or "").strip()
+                    img = str(screen.get("image") or screen.get("b64") or "").strip()
                     if img.startswith("data:") and "," in img:
                         img = img.split(",", 1)[1]
                     if img:
-                        # TWO-LAYER context (executor thread, never the event loop):
-                        #   OCR text  — peek cache, else INLINE (~100-300 ms)
-                        #               → text is never more than ~1 turn old
-                        #   VLM summary — cache peek with bounded wait ONLY;
-                        #               background warmer fills it (7 s/screen)
-                        layers = await asyncio.get_running_loop().run_in_executor(
-                            None,
-                            _screen_layers,
-                            str(screen.get("hash") or ""),
-                            img,
-                        )
-                        block = _screen_context_block(layers)
-                        if block:
-                            log.info(
-                                "WS chat: screen context (OCR %d chars, VLM %d chars%s)",
-                                len(layers.get("ocr") or ""), len(layers.get("desc") or ""),
-                                ", fresh OCR" if layers.get("ocr") else "",
+                        if need_screen:
+                            # TWO-LAYER context (executor thread, never the event loop):
+                            #   OCR text  — peek cache, else INLINE (~100-300 ms)
+                            #               → text is never more than ~1 turn old
+                            #   VLM summary — cache peek with bounded wait ONLY;
+                            #               background warmer fills it (7 s/screen)
+                            layers = await asyncio.get_running_loop().run_in_executor(
+                                None,
+                                _screen_layers,
+                                str(screen.get("hash") or ""),
+                                img,
                             )
-                            messages[0] = {
-                                "role": "system",
-                                "content": LLM_SYSTEM_PROMPT + "\n\n" + block,
-                            }
+                            block = _screen_context_block(layers)
+                            if block:
+                                log.info(
+                                    "WS chat: screen context injected (OCR %d chars, VLM %d chars%s)",
+                                    len(layers.get("ocr") or ""), len(layers.get("desc") or ""),
+                                    ", fresh OCR" if layers.get("ocr") else "",
+                                )
+                                messages[0] = {
+                                    "role": "system",
+                                    "content": LLM_SYSTEM_PROMPT + "\n\n" + block,
+                                }
+                            else:
+                                # A frame ARRIVED, so the user IS sharing — never let
+                                # the tutor say "share your screen". Tell the LLM the
+                                # analysis is still warming and it should ask the user
+                                # to repeat in a moment; the background warmers below
+                                # fill both layers for the very next turn.
+                                log.info(
+                                    "WS chat: screen frame received but analysis pending — "
+                                    "using pending-context block"
+                                )
+                                messages[0] = {
+                                    "role": "system",
+                                    "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_PENDING_TMPL,
+                                }
+                            if not layers.get("desc"):
+                                # VLM summary cold → describe in background for the
+                                # next turn (reply already has fresh OCR text)
+                                threading.Thread(
+                                    target=_warm_screen_cache,
+                                    args=(img, str(screen.get("hash") or "")),
+                                    daemon=True,
+                                ).start()
                         else:
-                            # A frame ARRIVED, so the user IS sharing — never let
-                            # the tutor say "share your screen". Tell the LLM the
-                            # analysis is still warming and it should ask the user
-                            # to repeat in a moment; the background warmers below
-                            # fill both layers for the very next turn.
-                            log.info(
-                                "WS chat: screen frame received but analysis pending — "
-                                "using pending-context block"
-                            )
-                            messages[0] = {
-                                "role": "system",
-                                "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_PENDING_TMPL,
-                            }
-                        if not layers.get("desc"):
-                            # VLM summary cold → describe in background for the
-                            # next turn (reply already has fresh OCR text)
+                            log.info("WS chat: screen sharing active, but query does not require screen context (saved tokens)")
+                            # Keep background warmer active so cache stays hot for when user asks about screen
                             threading.Thread(
                                 target=_warm_screen_cache,
                                 args=(img, str(screen.get("hash") or "")),
                                 daemon=True,
                             ).start()
                 else:
-                    # No frame this turn. If screen activity is recent, the user
-                    # IS sharing and the warm caches hold context — inject it so
-                    # the tutor never goes blind mid-share (covers stale client
-                    # bundles / dropped fields / any client-side attach bug).
-                    recent = await asyncio.get_running_loop().run_in_executor(None, _recent_screen_block)
-                    if recent:
-                        log.info(
-                            "WS chat: no frame this turn — using recent cached screen context "
-                            "(activity %.1fs ago)", time.monotonic() - _last_screen_activity,
-                        )
-                        messages[0] = {
-                            "role": "system",
-                            "content": LLM_SYSTEM_PROMPT + "\n\n" + recent,
-                        }
+                    # No frame this turn. If screen activity is recent AND query requires screen:
+                    if need_screen:
+                        recent = await asyncio.get_running_loop().run_in_executor(None, _recent_screen_block)
+                        if recent:
+                            log.info(
+                                "WS chat: using recent cached screen context (activity %.1fs ago)",
+                                time.monotonic() - _last_screen_activity,
+                            )
+                            messages[0] = {
+                                "role": "system",
+                                "content": LLM_SYSTEM_PROMPT + "\n\n" + recent,
+                            }
 
                 stop_evt.clear()
                 start = time.perf_counter()
@@ -2414,9 +2523,8 @@ def _warmup_asr():
 
 
 _HALLUCINATION_PHRASES = {
-    "चुप हो जाओ", "चुप रहो", "चुप हो जा", "सब्सक्राइब करें", "सब्सक्राइब",
-    "धन्यवाद", "थैंक यू", "thank you for watching", "thanks for watching",
-    "subtitles by", "please subscribe", "like share subscribe", "you",
+    "सब्सक्राइब करें", "सब्सक्राइब", "thank you for watching", "thanks for watching",
+    "subtitles by", "please subscribe", "like share subscribe",
 }
 
 
@@ -2584,18 +2692,18 @@ async def ws_asr(websocket: WebSocket):
                 out_q.put(("rejected", "blip"))   # UI shows a dismiss chip
                 out_q.put(("final", ""))
                 return
-            # Speaker-identity gate: is this the PRIMARY speaker (or someone
-            # else / a phone video in the background)? Same speaker ~0.75-0.95,
-            # others ~0.4-0.6 -> rejected utterances are silently dropped.
-            sim = _speaker_similarity(samples)
-            if sim is not None and sim < SPEAKER_SIM_MIN:
-                log.info(
-                    "Speaker gate: utterance REJECTED (%s): sim=%.2f < %.2f (not the primary speaker)",
-                    reason, sim, SPEAKER_SIM_MIN,
-                )
-                out_q.put(("rejected", "speaker"))  # UI shows a dismiss chip
-                out_q.put(("final", ""))
-                return
+            # Speaker-identity gate: check only on sufficiently long speech (>= 1.8s)
+            # because short phrases ("हाँ", "नमस्ते", "ओके") produce noisy embeddings that cause false rejects.
+            if len(samples) >= int(1.8 * ASR_SR):
+                sim = _speaker_similarity(samples)
+                if sim is not None and sim < SPEAKER_SIM_MIN:
+                    log.info(
+                        "Speaker gate: utterance REJECTED (%s): sim=%.2f < %.2f (not the primary speaker)",
+                        reason, sim, SPEAKER_SIM_MIN,
+                    )
+                    out_q.put(("rejected", "speaker"))  # UI shows a dismiss chip
+                    out_q.put(("final", ""))
+                    return
             if ASR_FINAL_BEAM <= 1:
                 # Fast single-pass decode: greedy Whisper on large-v3-turbo
                 if reused:

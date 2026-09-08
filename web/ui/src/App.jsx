@@ -27,7 +27,7 @@ const CFG = {
   vadGateMult: 3.4, // voice gate = noise * this (or threshold_min, whichever is higher)
   vadSustainMs: 250, // energy this long = real voice (barge / arm send)
   vadTextMs: 150, // …or recognizer words + this much energy confirm
-  vadFailsafeMs: 250, // quick ~250ms sustained energy barge-in trigger (was 900ms)
+  vadFailsafeMs: 650, // 650ms sustained energy barge-in trigger (prevents echo/noise cutting the assistant)
   speakTailMs: 700, // ignore recognition this long after OUR speaker audio stops (echo)
   vadRecActiveMs: 400, // recognizer counts as active within this window
   asrVadMode: "auto", // "server" = Silero VAD on the server owns turn-taking (noise-proof)
@@ -444,7 +444,7 @@ export default function App() {
     for (let i = 0, j = 0; i < 32 * 24; i++, j += 4) {
       sig = (sig * 31 + ((px[j] * 299 + px[j + 1] * 587 + px[j + 2] * 114) / 1000)) | 0;
     }
-    return { b64, hash: `s${sig >>> 0}` };
+    return { image: b64, b64, hash: `s${sig >>> 0}` };
   };
 
   /* ---- submit a new user turn ---- */
@@ -458,6 +458,11 @@ export default function App() {
 
       const ws = wsRef.current;
       if (!ws || ws.readyState !== 1) {
+        if (ws && ws.readyState === 0) {
+          // Socket is reconnecting: wait 350ms and retry rather than dropping turn
+          setTimeout(() => submitChat(rawText), 350);
+          return;
+        }
         showError("सर्वर कनेक्शन नहीं है — रुकिए, फिर से पूछिए।");
         return;
       }
