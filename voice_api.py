@@ -2277,6 +2277,12 @@ ASR_COMPUTE = (os.environ.get("ASR_COMPUTE", "").strip().lower()
 # that transcribes Hindi well (base/tiny mangle it). On CUDA small is
 # realtime; on the M4 the mlx backend makes it ~10x realtime.
 ASR_MODEL = os.environ.get("ASR_MODEL", "") or "large-v3-turbo"
+# CPU threads for the CTranslate2 (faster-whisper) decode. CTranslate2's own
+# default (4) has been observed to corrupt the glibc heap on some Linux
+# boxes ("malloc(): unaligned tcache chunk detected" kills the whole server
+# after the second decode) — 2 threads avoids that OpenMP path and is still
+# comfortably realtime for 3-10 s utterances. Raise via .env if you need more.
+ASR_CPU_THREADS = int(os.environ.get("ASR_CPU_THREADS", "2"))
 # Spoken language: "hi" = Hindi/Hinglish, accurate and fast (no detection
 # pass). LEAVE EMPTY only for true multilingual mode — auto-detect is great
 # for English but routinely mislabels SHORT Hindi clips (es/ru/ur/si).
@@ -2585,7 +2591,12 @@ class _FasterWhisperAsr:
 
     def __init__(self):
         from faster_whisper import WhisperModel  # lazy: non-voice users never load it
-        self._model = WhisperModel(ASR_MODEL, device=ASR_DEVICE, compute_type=ASR_COMPUTE)
+        self._model = WhisperModel(
+            ASR_MODEL,
+            device=ASR_DEVICE,
+            compute_type=ASR_COMPUTE,
+            cpu_threads=ASR_CPU_THREADS,  # see ASR_CPU_THREADS note (heap-corruption workaround)
+        )
 
     def transcribe(self, samples: np.ndarray, beam: int = 1, vad: bool = False) -> str:
         # Normalize audio peak so soft speech doesn't drop into silence hallucinations
