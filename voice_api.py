@@ -55,6 +55,43 @@ logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 HERE = Path(__file__).resolve().parent
 
 
+# ---------- Persistent HTTP(S) clients (connection reuse) ----------
+# httpx sync clients are not thread-safe, so we keep ONE client per thread
+# (uvicorn's threadpool + our worker threads). Reusing connections across
+# turns removes the per-call TLS handshake + connect (~50-200 ms) from the
+# reply path. Clients are created lazily and closed at process exit.
+_LLM_CLIENT_TLS = threading.local()
+_VISION_CLIENT_TLS = threading.local()
+
+
+def _llm_http_client() -> httpx.Client:
+    """Thread-local httpx.Client for the LLM endpoint (connection reuse)."""
+    c = getattr(_LLM_CLIENT_TLS, "c", None)
+    if c is None:
+        c = httpx.Client(timeout=LLM_STREAM_TIMEOUT, follow_redirects=True)
+        _LLM_CLIENT_TLS.c = c
+    return c
+
+
+def _vision_http_client() -> httpx.Client:
+    """Thread-local httpx.Client for the vision endpoint (connection reuse)."""
+    c = getattr(_VISION_CLIENT_TLS, "c", None)
+    if c is None:
+        c = httpx.Client(timeout=VISION_TIMEOUT, follow_redirects=True)
+        _VISION_CLIENT_TLS.c = c
+    return c
+
+
+# ---------- Single-GPU guard: TTS generate() vs VLM generate() ----------
+# OmniVoice and Qwen2.5-VL share the same GPU. If a background screen-describe
+# runs while a TTS window generates, both slow down and 16 GB VRAM (T4) can
+# spike. TTS windows are short, so the VLM simply waits its turn.
+GPU_GENERATE_LOCK = threading.Lock()
+# True once the boot warm-up JIT'd the OmniVoice kernels — before that the
+# pre-generate empty_cache() device sync stays (cold-start safety).
+_GPU_WARM = {"done": False}
+
+
 def _load_dotenv(path: Path) -> None:
     """Minimal .env loader (no dependency): KEY=VALUE lines, comments ignored.
 
@@ -274,13 +311,35 @@ LLM_SYSTEM_PROMPT = (
     "हर वाक्य को नई लाइन से शुरू करो (एक लाइन में एक पूरा वाक्य) ताकि बोलते "
     "वक्त सही जगह रुके और फिर से सहज शुरू हो। "
 )
+# ---------- Sub-second latency: SHORT system prompt by default ----------
+# The full persona below is ~2.5 KB -> ~0.3-1 s of LLM prefill before the first
+# token. Default turns use this compact prompt; the full persona is used only
+# when a turn needs it (screen/debug context). VOICE_PROMPT_FILE overrides both.
+LLM_SYSTEM_SHORT = "तुम ‘साथी’ ट्यूटर हो।"
+LLM_SYSTEM_SHORT += " पूरी तरह देवनागरी में लिखो।"
+LLM_SYSTEM_SHORT += " छोटा जवाब: सीधा उत्तर, 2-3 आसान कदम, फिर एक छोटा सवाल। ज़्यादा लेक्चर नहीं।"
+
 # Optional override: point VOICE_PROMPT_FILE at a text file whose contents
 # replace the whole system prompt above (tune the persona without editing code).
+_LLM_PERSONA_CUSTOM = False
+
+
+def _system_prompt_for(need_full: bool, block: str | None = None) -> str:
+    """System prompt for one turn: compact by default, full persona when the
+    turn needs it (screen/debug), with an optional appended context block."""
+    if _LLM_PERSONA_CUSTOM:
+        base = LLM_SYSTEM_PROMPT
+    else:
+        base = LLM_SYSTEM_PROMPT if need_full else LLM_SYSTEM_SHORT
+    return (base + "\n\n" + block) if block else base
+
+
 _PROMPT_FILE = os.environ.get("VOICE_PROMPT_FILE", "")
 if _PROMPT_FILE:
     _pf = Path(_PROMPT_FILE).expanduser()
     if _pf.is_file():
         LLM_SYSTEM_PROMPT = _pf.read_text(encoding="utf-8").strip()
+        _LLM_PERSONA_CUSTOM = True
 
 
 def _speechify(text: str) -> str:
@@ -418,13 +477,10 @@ VISION_MODEL = os.environ.get("VISION_MODEL", "qwen2.5-vl-7b-instruct")
 # (16 GB) next to OmniVoice + Whisper in fp16 (~7.5 GB weights) and needs NO
 # API key. Loaded lazily on the first screen-share, so boot time is unchanged.
 VISION_LOCAL_MODEL = os.environ.get("VISION_LOCAL_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
-# 5 short Hindi lines ≈ 160 tokens; 240 is safe headroom — every extra token is
-# ~60-80 ms of decode on a T4, so an oversized cap wastes seconds per screen.
-VISION_LOCAL_MAX_NEW_TOKENS = int(os.environ.get("VISION_LOCAL_MAX_NEW_TOKENS", "240"))
-# Max image side before the vision tower. Vision tokens scale ~quadratically
-# ((px/28)²): a 1280px screenshot ≈ 1000+ tokens (slow prefill on T4) while
-# 896px ≈ ~700 — screen text (errors, code) stays readable at 896.
-VISION_LOCAL_MAX_SIDE = int(os.environ.get("VISION_LOCAL_MAX_SIDE", "896"))
+# 2-3 short Hindi sentences ≈ 60-80 tokens; 90 is plenty — cuts decode time dramatically
+VISION_LOCAL_MAX_NEW_TOKENS = int(os.environ.get("VISION_LOCAL_MAX_NEW_TOKENS", "90"))
+# Max image side before vision tower: 512px drops vision tokens from 1024 to 256 (4x faster!)
+VISION_LOCAL_MAX_SIDE = int(os.environ.get("VISION_LOCAL_MAX_SIDE", "512"))
 # 1 = load the local VLM in 4-bit (bitsandbytes): ~2 GB weights, noticeably
 # faster decode on T4. Needs `pip install bitsandbytes`. Default off.
 VISION_LOCAL_4BIT = os.environ.get("VISION_LOCAL_4BIT", "0") == "1"
@@ -451,15 +507,10 @@ def _vision_api_key() -> str:
 
 
 VISION_DESC_PROMPT = (
-    "You are looking at ONE screenshot of the user's screen. A Hindi-speaking "
-    "voice tutor will use your description as its only knowledge of what the "
-    "user can see, so accuracy matters more than style. Describe: 1) which "
-    "app/page/tab is open, 2) the main visible content (code, document, chat, "
-    "video...), 3) any visible error message, warning, or problem — quote its "
-    "exact words (app names and error text may stay in English letters), "
-    "4) anything else the user will probably ask about. Reply in Hindi, "
-    "Devanagari script only, maximum 5 short lines, plain text — no markdown, "
-    "no bullets, no emoji, no preamble like 'यह स्क्रीनशॉट में'."
+    "Describe this screenshot for a Hindi tutor in exactly 2 lines of Hindi (Devanagari). "
+    "Line 1: which app/page is open and what the main content is. "
+    "Line 2: any visible error, warning, or code — quote exact English text as-is. "
+    "No intro, no markdown, no bullets. If nothing notable: just 1 line."
 )
 
 _screen_lock = threading.Lock()
@@ -584,8 +635,9 @@ def _screen_describe_local(image_b64: str) -> str:
             inputs = processor(text=[text], images=[img], return_tensors="pt").to(model.device)
             t0 = time.perf_counter()
             with _torch.inference_mode():
-                out = model.generate(
-                    **inputs,
+                with GPU_GENERATE_LOCK:  # never compete with TTS for the GPU
+                    out = model.generate(
+                        **inputs,
                     max_new_tokens=VISION_LOCAL_MAX_NEW_TOKENS,
                     do_sample=False,
                 )
@@ -624,11 +676,10 @@ def _screen_describe_api(image_b64: str, key: str) -> str:
         "temperature": 0.2,
     }
     try:
-        r = httpx.post(
+        r = _vision_http_client().post(
             f"{VISION_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=payload,
-            timeout=VISION_TIMEOUT,
         )
     except httpx.HTTPError as e:
         raise RuntimeError(f"Vision request failed: {e}") from e
@@ -782,13 +833,43 @@ def _screen_cached_desc(client_hash: str = "", wait_s: float = 0.0) -> tuple[str
         evt.wait(timeout=0.3)  # poll; the in-flight describe may finish
 
 
+_latest_vision_job: dict = {"img": None, "hash": "", "force": False}
+_vision_job_lock = threading.Lock()
+_vision_worker_running = False
+
+
+def _vision_drain_worker() -> None:
+    global _vision_worker_running
+    while True:
+        with _vision_job_lock:
+            img = _latest_vision_job.get("img")
+            chash = _latest_vision_job.get("hash", "")
+            force = _latest_vision_job.get("force", False)
+            _latest_vision_job["img"] = None
+        if not img:
+            with _vision_job_lock:
+                _vision_worker_running = False
+            break
+        try:
+            _screen_context(img, chash, force=force)
+        except Exception as e:
+            log.warning("Background screen describe failed: %s", e)
+
+
 def _warm_screen_cache(image_b64: str, client_hash: str = "", force: bool = False) -> None:
-    """Fire-and-forget background describe so the NEXT turn finds a warm cache.
-    force=True re-describes even when the hash is already cached ('check again')."""
-    try:
-        _screen_context(image_b64, client_hash, force=force)
-    except Exception as e:  # noqa: BLE001 — background job, never crash anything
-        log.warning("Background screen describe failed: %s", e)
+    """Queue a background describe, ALWAYS keeping ONLY the newest frame.
+
+    Overwrites older pending frames so threads never queue up on the VLM,
+    eliminating multi-minute backlogs and stale repeat descriptions.
+    """
+    global _vision_worker_running
+    with _vision_job_lock:
+        _latest_vision_job["img"] = image_b64
+        _latest_vision_job["hash"] = client_hash
+        _latest_vision_job["force"] = force
+        if not _vision_worker_running:
+            _vision_worker_running = True
+            threading.Thread(target=_vision_drain_worker, daemon=True).start()
 
 
 # ---------- Screen layer 1: fast OCR text (RapidOCR, ~100-300 ms) ----------
@@ -800,8 +881,9 @@ _ocr_lock = threading.Lock()
 _ocr_engine = None
 _ocr_cuda = False  # set by _load_ocr (CUDA build -> inline recheck OCR is affordable)
 _ocr_disabled = False  # set once if rapidocr is not installed
+_ocr_slow_detected = False  # circuit breaker: if OCR takes > 1.2s, never stall chat inline
 _ocr_cache: dict = {"hash": None, "text": "", "ts": 0.0}
-OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "768"))
+OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "480"))
 OCR_MAX_LINES = int(os.environ.get("VISION_OCR_MAX_LINES", "60"))
 
 def _cuda_libs_loadable() -> bool:
@@ -893,11 +975,17 @@ def _screen_ocr(image_b64: str, client_hash: str = "", force: bool = False) -> s
     engine = _load_ocr()
     t0 = time.perf_counter()
     result, _ = engine(np.asarray(img))
+    elapsed = time.perf_counter() - t0
+    if elapsed > 1.2:
+        global _ocr_slow_detected
+        if not _ocr_slow_detected:
+            _ocr_slow_detected = True
+            log.warning("OCR took %.2fs (>1.2s threshold) — switching to background OCR to protect chat latency", elapsed)
     lines = [r[1].strip() for r in (result or []) if r[1] and r[1].strip()]
     text = "\n".join(lines[:OCR_MAX_LINES])
     with _ocr_lock:
         _ocr_cache.update({"hash": client_hash or None, "text": text, "ts": time.monotonic()})
-    log.info("OCR: %d lines in %.2fs", len(lines), time.perf_counter() - t0)
+    log.info("OCR: %d lines in %.2fs", len(lines), elapsed)
     return text
 
 
@@ -907,11 +995,10 @@ def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
     The client captures the frame AT QUESTION TIME, so the hash is current:
       - hash in OCR cache  -> screen pixels are unchanged -> cached text IS
         the current screen (0 ms)
-      - hash miss          -> screen changed -> OCR runs INLINE (~0.5-1 s on
-        GPU — the price of guaranteed-fresh text; never on CPU, that goes
-        background)
+      - hash miss          -> screen changed -> OCR runs INLINE only if fast (<1.2s);
+        otherwise runs in background so chat latency stays sub-second!
     VLM summary: cache peek with bounded wait only — background warmer fills
-    it (8-12 s/screen is too slow for the reply path, period).
+    it (single-task coalesced queue).
     """
     global _ocr_disabled
     desc, model_used = _screen_cached_desc(client_hash, VISION_REPLY_WAIT_S)
@@ -925,15 +1012,14 @@ def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
             ):
                 ocr = _ocr_cache["text"]
     if not ocr and image_b64 and not _ocr_disabled:
-        if _ocr_engine is not None and _ocr_cuda:
-            # GPU OCR is fast enough to be in the reply path — fresh text
-            # on EVERY turn, automatically. No keywords, no staleness.
+        if _ocr_engine is not None and _ocr_cuda and not _ocr_slow_detected:
+            # Run inline ONLY if OCR is genuinely fast on this GPU
             try:
                 ocr = _screen_ocr(image_b64, client_hash)
             except Exception as e:  # noqa: BLE001 — OCR must never break a reply
                 log.warning("Inline OCR failed: %s", e)
         else:
-            # CPU OCR is far too slow (11 s in the field) — background only.
+            # OCR is slow or CPU-bound — background only so chat response is NEVER delayed!
             threading.Thread(
                 target=_warm_screen_ocr, args=(image_b64, client_hash), daemon=True
             ).start()
@@ -1149,7 +1235,7 @@ def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, ma
         yielded = False
         retry_wait = 0.8
         try:
-            with httpx.stream("POST", MISTRAL_URL, headers=headers, json=payload, timeout=LLM_STREAM_TIMEOUT) as r:
+            with _llm_http_client().stream("POST", MISTRAL_URL, headers=headers, json=payload) as r:
                 if r.status_code != 200:
                     body = r.read()[:300]
                     if r.status_code == 429 or r.status_code >= 500:
@@ -1519,6 +1605,18 @@ async def lifespan(_app: FastAPI):
     voice_prompt = ov_model.create_voice_clone_prompt(ref_audio=str(REF_AUDIO), ref_text=REF_TEXT)
     log.info("OmniVoice loaded + voice prompt cached from %s", REF_AUDIO.name)
 
+    # Warm the GPU pipeline in the background (cuDNN JIT, allocator state) so
+    # the FIRST real turn never pays cold-start on its first audio window.
+    def _warm_gpu():
+        try:
+            _generate(ov_model, voice_prompt, "नमस्ते", 2, 1.0, TEMPERATURE)
+            _GPU_WARM["done"] = True
+            log.info("TTS GPU warm-up complete")
+        except Exception as e:  # best-effort
+            log.warning("TTS GPU warm-up failed: %s", e)
+
+    threading.Thread(target=_warm_gpu, daemon=True).start()
+
     _app.state.ov_model = ov_model
     _app.state.voice_prompt = voice_prompt
     _app.state.gen_lock = asyncio.Lock()  # serialize heavy generation across clients
@@ -1709,7 +1807,10 @@ MAX_CHAT_SENTENCES = int(os.environ.get("VOICE_MAX_SENTENCES", "8"))
 # The FIRST audio window uses at most this many diffusion steps (faster start,
 # like a human replying quickly); later windows use the requested num_step.
 # Set equal to the normal num_step to disable.
-FIRST_WINDOW_STEP = max(4, min(32, int(os.environ.get("VOICE_FIRST_STEP", "6"))))
+FIRST_WINDOW_STEP = max(2, min(32, int(os.environ.get("VOICE_FIRST_STEP", "6"))))  # floor 2 = snappiest first window
+# Conversation history kept per turn (older messages dropped). Kept small so
+# the LLM prefill stays tiny - the #1 lever for first-audio latency.
+MAX_HISTORY = int(os.environ.get("VOICE_MAX_HISTORY", "12"))
 
 
 def _stream_chunks(text: str, max_bytes: int) -> list[str]:
@@ -1797,10 +1898,11 @@ def _generate(model, voice_prompt, text, num_step, speed, temperature):
     # doesn't reclaim on its own, so a long-running server eventually OOMs
     # (fastest on small-VRAM cards). Draining the allocator right before AND
     # after every call, plus pulling outputs onto the CPU, keeps usage flat.
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not _GPU_WARM["done"]:
         torch.cuda.empty_cache()
-    with torch.inference_mode():
-        outs = model.generate(**kwargs)
+    with GPU_GENERATE_LOCK:
+        with torch.inference_mode():
+            outs = model.generate(**kwargs)
     if not outs:
         raise RuntimeError("OmniVoice returned no audio")
     # Move outputs off the GPU before converting so nothing GPU-side lingers.
@@ -2011,6 +2113,15 @@ async def ws_tts(websocket: WebSocket):
                                 threading.Thread(
                                     target=_warm_screen_cache,
                                     args=(img, str(screen.get("hash") or "")),
+                                    daemon=True,
+                                ).start()
+                            else:
+                                # VLM cache already warm. If user explicitly asked about
+                                # the screen ("अब क्या है?"), force-refresh in background
+                                # so next turn gets a NEW description, not a stale repeat.
+                                threading.Thread(
+                                    target=_warm_screen_cache,
+                                    args=(img, str(screen.get("hash") or ""), True),
                                     daemon=True,
                                 ).start()
                         else:
@@ -2947,11 +3058,10 @@ def chat(req: ChatRequest):
         if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
             payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
         try:
-            r = httpx.post(
+            r = _llm_http_client().post(
                 MISTRAL_URL,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json=payload,
-                timeout=60.0,
             )
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"LLM request failed: {e}") from e
