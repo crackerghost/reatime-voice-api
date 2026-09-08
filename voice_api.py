@@ -461,6 +461,10 @@ VISION_DESC_PROMPT = (
 
 _screen_lock = threading.Lock()
 _screen_cache: dict = {"hash": None, "desc": "", "ts": 0.0, "model": ""}
+# monotonic ts of the last proof the user is sharing (frame turn or warm-up)
+# — lets the WS path fall back to recent cached context when a turn arrives
+# without a frame (client bug, dropped field, stale bundle).
+_last_screen_activity = 0.0
 
 
 # RLock, held across load AND generate: model.generate() is NOT safe to run
@@ -993,6 +997,33 @@ def _screen_context_block(layers: dict) -> str | None:
     if not parts:
         return None
     return SCREEN_CONTEXT_TMPL + "\n\n" + "\n\n".join(parts)
+
+
+# A chat turn without a frame is treated as an active sharing session only if
+# we saw screen activity this recently (warm-ups or a frame turn).
+SCREEN_RECENT_S = float(os.environ.get("SCREEN_RECENT_S", "25"))
+
+
+def _recent_screen_block() -> str | None:
+    """Best-effort context from the WARM CACHES when a WS turn arrives WITHOUT
+    a screen frame (stale client bundle, dropped field, any client bug).
+
+    Warm-ups keep hitting /api/vision while the user shares, so the latest
+    desc/OCR is normally a few seconds old — good enough to keep the tutor
+    from ever claiming blindness mid-share. Frame-bearing turns always take
+    precedence (fresh OCR wins over this).
+    """
+    global _last_screen_activity
+    if time.monotonic() - _last_screen_activity > SCREEN_RECENT_S:
+        return None
+    layers: dict = {"ocr": "", "desc": ""}
+    with _screen_lock:
+        if _screen_cache["desc"] and time.monotonic() - _screen_cache["ts"] < SCREEN_CACHE_TTL:
+            layers["desc"] = _screen_cache["desc"]
+    with _ocr_lock:
+        if _ocr_cache["text"] and time.monotonic() - _ocr_cache["ts"] < SCREEN_CACHE_TTL:
+            layers["ocr"] = _ocr_cache["text"]
+    return _screen_context_block(layers)
 
 
 # Serve the built React/Tailwind UI (web/ui/dist). Rebuild with:
@@ -1829,6 +1860,8 @@ async def ws_tts(websocket: WebSocket):
                 # one Qwen2.5-VL call before the LLM starts writing.
                 screen = data.get("screen") if isinstance(data.get("screen"), dict) else None
                 if screen:
+                    global _last_screen_activity
+                    _last_screen_activity = time.monotonic()
                     img = str(screen.get("image") or "").strip()
                     if img.startswith("data:") and "," in img:
                         img = img.split(",", 1)[1]
@@ -1877,6 +1910,21 @@ async def ws_tts(websocket: WebSocket):
                                 args=(img, str(screen.get("hash") or "")),
                                 daemon=True,
                             ).start()
+                else:
+                    # No frame this turn. If screen activity is recent, the user
+                    # IS sharing and the warm caches hold context — inject it so
+                    # the tutor never goes blind mid-share (covers stale client
+                    # bundles / dropped fields / any client-side attach bug).
+                    recent = await asyncio.get_running_loop().run_in_executor(None, _recent_screen_block)
+                    if recent:
+                        log.info(
+                            "WS chat: no frame this turn — using recent cached screen context "
+                            "(activity %.1fs ago)", time.monotonic() - _last_screen_activity,
+                        )
+                        messages[0] = {
+                            "role": "system",
+                            "content": LLM_SYSTEM_PROMPT + "\n\n" + recent,
+                        }
 
                 stop_evt.clear()
                 start = time.perf_counter()
@@ -2758,6 +2806,8 @@ def api_vision(req: VisionRequest):
     client-side), so an idle screen costs nothing and the latest description
     is always warm before the user asks about it.
     """
+    global _last_screen_activity
+    _last_screen_activity = time.monotonic()
     img = req.image.strip()
     if img.startswith("data:") and "," in img:
         img = img.split(",", 1)[1]
