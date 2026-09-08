@@ -353,6 +353,8 @@ LLM_SYSTEM_PROMPT = (
 LLM_SYSTEM_SHORT = "तुम ‘साथी’ ट्यूटर हो।"
 LLM_SYSTEM_SHORT += " पूरी तरह देवनागरी में लिखो।"
 LLM_SYSTEM_SHORT += " छोटा जवाब: सीधा उत्तर, 2-3 आसान कदम, फिर एक छोटा सवाल। ज़्यादा लेक्चर नहीं।"
+LLM_SYSTEM_SHORT += " टोन बोलचाल वाली हिंग्लिश रखो — अंग्रेज़ी शब्द देवनागरी में लिखो जैसे बोले जाते हैं: वेट, सेकंड, लोड, एक्चुअली, बेसिकली; "
+LLM_SYSTEM_SHORT += "शुद्ध फॉर्मल हिंदी (क्षण, कृपया, आवश्यक, एक पल) कभी नहीं।"
 
 # Optional override: point VOICE_PROMPT_FILE at a text file whose contents
 # replace the whole system prompt above (tune the persona without editing code).
@@ -463,6 +465,10 @@ PRONUNCIATION_FIXES = {
     # conjunct + matra clusters the model reads as one garbled syllable
     "क्योंकि": "क्यों कि",
     "इसलिए": "इस लिए",
+    # conversational Hinglish the LLM now uses — respelled at syllable seams
+    # so OmniVoice says them like a speaker, not a textbook
+    "एक्चुअली": "एक चुआ ली",
+    "बेसिकली": "बे सिक ली",
     "समस्या": "सम स्या",
     "इस्तेमाल": "इस्ते माल",
     "क्षमा": "क्ष मा",
@@ -874,11 +880,17 @@ def _screen_context(image_b64: str, client_hash: str = "", force: bool = False) 
             evt.set()  # wake piggybackers (cache now holds the result)
 
 
-# Cold-cache softener: if a describe for THIS screen is ALREADY in flight
+# Cold-cache softener: if a describe for THIS screen is ALWAYS in flight
 # when the user asks, wait up to this long for it. Keep small — OCR now
-# carries the fresh ground truth, so stalling for the slow VLM is rarely
-# worth it (1.2s here used to tax EVERY changed-screen turn).
+# carries the fresh ground truth, so stalling for the slow local VLM (5-7 s)
+# is never worth it.
 VISION_REPLY_WAIT_S = float(os.environ.get("VISION_REPLY_WAIT_S", "0.3"))
+# How old a cached VLM description (of ANY screen) may be and still be used
+# as the visual summary when the CURRENT screen's describe isn't ready. The
+# current screen's exact OCR text still arrives inline in the same block, so
+# the LLM sees today's screen truthfully; the stale summary just saves the
+# "everything is pending / wait a minute" dead end. Set 0 to disable.
+SCREEN_STALE_DESC_S = float(os.environ.get("SCREEN_STALE_DESC_S", "45"))
 
 
 def _screen_cached_desc(client_hash: str = "", wait_s: float = 0.0) -> tuple[str, str]:
@@ -969,6 +981,14 @@ _ocr_cuda = False  # set by _load_ocr (CUDA build -> inline recheck OCR is affor
 _ocr_disabled = False  # set once if rapidocr is not installed
 _ocr_slow_detected = False  # circuit breaker: if OCR takes > 1.2s, never stall chat inline
 _ocr_cache: dict = {"hash": None, "text": "", "ts": 0.0}
+# Coalescing: only ONE OCR run per screen hash at a time. The inline reply path
+# abandons its thread at the 300 ms deadline, but that thread keeps running and
+# stays the winner; the background fallback for the SAME hash piggybacks on its
+# result instead of re-running a second multi-second OCR (seen in the logs as
+# two "OCR: N lines" lines seconds apart for one screen).
+_ocr_pending: dict = {}  # hash -> threading.Event
+_ocr_pending_lock = threading.Lock()
+_OCR_COALESCE_TIMEOUT_S = 20.0
 OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "480"))
 OCR_MAX_LINES = int(os.environ.get("VISION_OCR_MAX_LINES", "60"))
 
@@ -1051,6 +1071,27 @@ def _screen_ocr(image_b64: str, client_hash: str = "", force: bool = False) -> s
                 and time.monotonic() - _ocr_cache["ts"] < SCREEN_CACHE_TTL
             ):
                 return _ocr_cache["text"]
+        # Atomic check-and-register: ONE OCR run per hash at a time. Late
+        # callers (e.g. the background fallback spawned after the inline reply
+        # path abandoned its 300 ms deadline) piggyback on the winner's result
+        # instead of stacking a second multi-second run on the same engine.
+        with _ocr_pending_lock:
+            existing = _ocr_pending.get(client_hash)
+            if existing is None:
+                _ocr_pending[client_hash] = threading.Event()
+                registered = True
+            else:
+                registered = False
+        if not registered:
+            if existing.wait(timeout=_OCR_COALESCE_TIMEOUT_S):
+                with _ocr_lock:
+                    if (
+                        _ocr_cache["hash"] == client_hash
+                        and _ocr_cache["text"]
+                        and time.monotonic() - _ocr_cache["ts"] < SCREEN_CACHE_TTL
+                    ):
+                        return _ocr_cache["text"]
+            return ""  # winner still running or failed — the next turn will retry
     import base64
 
     from PIL import Image
@@ -1060,7 +1101,15 @@ def _screen_ocr(image_b64: str, client_hash: str = "", force: bool = False) -> s
         img.thumbnail((OCR_MAX_SIDE, OCR_MAX_SIDE))
     engine = _load_ocr()
     t0 = time.perf_counter()
-    result, _ = engine(np.asarray(img))
+    try:
+        result, _ = engine(np.asarray(img))
+    finally:
+        # signal piggybackers regardless of success/failure so they never hang
+        if client_hash and not force:
+            with _ocr_pending_lock:
+                evt = _ocr_pending.pop(client_hash, None)
+            if evt is not None:
+                evt.set()
     elapsed = time.perf_counter() - t0
     if elapsed > 1.2:
         global _ocr_slow_detected
@@ -1081,13 +1130,27 @@ def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
     The client captures the frame AT QUESTION TIME, so the hash is current:
       - hash in OCR cache  -> screen pixels are unchanged -> cached text IS
         the current screen (0 ms)
-      - hash miss          -> screen changed -> OCR runs INLINE only if fast (<1.2s);
-        otherwise runs in background so chat latency stays sub-second!
-    VLM summary: cache peek with bounded wait only — background warmer fills
-    it (single-task coalesced queue).
+      - hash miss          -> screen changed -> OCR runs INLINE with a hard
+        300 ms budget; slower environments fall through to background-only
+    VLM summary: cache peek with bounded wait; on a miss, a RECENT describe
+    (any screen, <SCREEN_STALE_DESC_S old) is used so the tutor never falls
+    into the 'analysis pending / wait a minute' dead end mid-share.
     """
     global _ocr_disabled
     desc, model_used = _screen_cached_desc(client_hash, VISION_REPLY_WAIT_S)
+    if not desc and SCREEN_STALE_DESC_S > 0:
+        # This EXACT screen was never (or not yet) described, but a recent
+        # describe of a NEARLY IDENTICAL screen (client keeps streaming frames
+        # while sharing; the user typically hasn't changed much since the last
+        # tick) usually exists. Prefer it over the pending dead-end: the tutor
+        # should lean on the freshest OCR text and never answer 'wait a
+        # minute' when it described a screen seconds ago. Set
+        # SCREEN_STALE_DESC_S=0 to restore the strict old behavior.
+        with _screen_lock:
+            if (_screen_cache["desc"]
+                    and time.monotonic() - _screen_cache["ts"] < SCREEN_STALE_DESC_S):
+                desc = _screen_cache["desc"]
+                model_used = _screen_cache["model"]
     ocr = ""
     if client_hash:
         with _ocr_lock:
@@ -1161,7 +1224,8 @@ SCREEN_CONTEXT_TMPL = (
 
 # Used when a screen frame ARRIVES but neither layer has data yet (first
 # share in a session: VLM still loading, OCR engine cold). The user IS
-# sharing — the tutor must never ask them to share again.
+# sharing — the tutor must never ask them to share again, and the wait must
+# never become the whole reply (the 'एक पल रुको' loop).
 SCREEN_PENDING_TMPL = (
     "स्क्रीन स्थिति — यूज़र अभी स्क्रीन शेयर कर रहा है, पर स्क्रीन का विश्लेषण अभी "
     "तैयार नहीं हुआ (कुछ सेकंड लगेंगे)।\n"
@@ -1170,8 +1234,10 @@ SCREEN_PENDING_TMPL = (
     "2) स्क्रीन शेयर की पुष्टि यूज़र से कभी माँगो नहीं — 'स्क्रीन शेयर बटन दबाया है?', "
     "'शेयर चालू करो', 'स्क्रीन दिखाओ' जैसा कुछ भी नहीं। शेयर पहले से चालू है, बस "
     "विश्लेषण लोड हो रहा है।\n"
-    "3) छोटे जवाब दो: 'एक पल रुको, मैं स्क्रीन देख रहा हूँ — दोबारा बोलो' जैसा कुछ।\n"
-    "4) अगर यूज़र का सवाल स्क्रीन के बिना भी answer हो सकता है तो पहले answer दो।\n"
+    "3) स्क्रीन देखने की बात सिर्फ एक छोटी सी लाइन में निपटाओ — जैसे 'मैं स्क्रीन "
+    "लोड कर रहा हूँ' — और उसके तुरंत बाद यूज़र के सवाल से जुड़ी कोई दूसरी बात जोड़ो "
+    "या एक छोटा सवाल पूछो। इंतज़ार की बात कभी पूरा जवाब नहीं होनी चाहिए।\n"
+    "4) अगर यूज़र का सवाल स्क्रीन के बिना भी answer हो सकता है तो पहले पूरा answer दो।\n"
     "5) स्क्रीन विश्लेषण अगले कुछ सेकंड में तैयार हो जाएगा — यूज़र दोबारा पूछे तो "
     "तब स्क्रीन पूरी तरह दिखेगी।"
 )
@@ -1661,7 +1727,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 break
         if (not emitted_text or (llm_error and not emitted_audio)) and not (stop_evt is not None and stop_evt.is_set()):
             # Always answer out loud — silence reads as "the assistant is broken".
-            fallback = "माफ़ कीजिए, आवाज़ साफ़ नहीं आ पाई। कृपया एक बार फिर बोलिए।"
+            fallback = "अरे, आवाज़ साफ़ नहीं आ पाई। एक बार फिर से बोल दो।"
             out_q.put(("text", fallback))
             win_q.put({"text": fallback, "steps": min(num_step, FIRST_WINDOW_STEP)})
             emitted_audio = True
