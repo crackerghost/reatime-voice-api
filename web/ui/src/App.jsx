@@ -14,7 +14,7 @@ const VISION_URL = `${location.protocol}//${location.host}/api/vision`;
    happens in .env — never by editing this file. Defaults below match the
    current behaviour and apply until the fetch resolves. */
 const CFG = {
-  chatStep: 12, // nfe_step the UI sends for chat replies
+  chatStep: 8, // nfe_step the UI sends for chat replies
   maxHistory: 12,
   wsReconnectMs: 1500,
   recRestartMs: 400,
@@ -34,7 +34,8 @@ const CFG = {
   bargeIdleMs: 900, // recognizer-idle safety-net send delay
   visionEnabled: false, // server has a VISION_API_KEY (screen understanding ready)
   screenTickMs: 1200, // screen change-detection cadence while sharing
-  screenPrefetchMs: 8000, // min gap between background /api/vision warm-ups
+  screenPrefetchMs: 4000, // min gap between background /api/vision warm-ups
+  visionLocalMaxSide: 384, // (server-side; documented here for tuning reference)
 };
 const num = (v, d) => (v === undefined || v === null || Number.isNaN(Number(v)) ? d : Number(v));
 const mergeCfg = (c) => {
@@ -122,6 +123,7 @@ export default function App() {
   const screenFetchBusyRef = useRef(false); // a warm-up fetch is in flight (never queue)
   const screenNoVideoWarnedRef = useRef(false); // [screen] tick diagnostics, once per share
   const screenForceAtRef = useRef(0); // last forced capture (small edits can dodge the diff)
+  const lastDescribeMsRef = useRef(0); // last warm-up roundtrip — stretches the prefetch gap adaptively
   // VAD state — thresholds/initial values come from CFG (env-driven).
   const vadRef = useRef({
     noise: CFG.vadNoiseFloor, // adaptive ambient floor (updated when idle)
@@ -354,22 +356,28 @@ export default function App() {
     //    (the 25s→53s queue growth). One in-flight fetch max — if a newer
     //    frame arrives mid-flight, the next tick sends THAT frame instead.
     const now = Date.now();
+    // Adaptive gap: a slow local describe stretches its own spacing
+    // (max(prefetchMs, last roundtrip x 1.5)) so warm-ups never queue behind
+    // themselves; fast describes keep the tight configured cadence.
+    const prefetchGap = Math.max(CFG.screenPrefetchMs, Math.min(lastDescribeMsRef.current * 1.5, 20000));
     if (
-      now - lastPrefetchAtRef.current >= CFG.screenPrefetchMs &&
+      now - lastPrefetchAtRef.current >= prefetchGap &&
       !screenFetchBusyRef.current
     ) {
       lastPrefetchAtRef.current = now;
       screenFetchBusyRef.current = true;
+      const t0 = performance.now();
       fetch(VISION_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image: b64, hash }),
       })
         .then((r) => (r.ok ? r.json() : null))
-        .then((j) => j && console.info(`[vision] warm cache ${j.cached ? "HIT" : "FILLED"} (${(j.description || "").length} chars)`))
+        .then((j) => j && console.info(`[vision] warm cache ${j.cached ? "HIT" : "FILLED"} (${(j.description || "").length} chars, ${Math.round(performance.now() - t0)}ms)`))
         .catch(() => {})
         .finally(() => {
           screenFetchBusyRef.current = false;
+          lastDescribeMsRef.current = performance.now() - t0;
         });
     }
   };
@@ -613,7 +621,8 @@ export default function App() {
                   : x
               );
             });
-            assistantTextRef.current += m.text;          } else if (m.type === "error") {
+            assistantTextRef.current += m.text;
+          } else if (m.type === "error") {
             if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
             assistantTextRef.current = "";
             openAssistantId.current = null;
@@ -657,13 +666,6 @@ export default function App() {
             if (!currentSourceRef.current && pendingRef.current.length === 0) {
               api.setSpeaking(false);
             }
-          } else if (m.type === "error") {
-            if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
-            assistantTextRef.current = "";
-            openAssistantId.current = null;
-            activeRef.current = false;
-            api.setSpeaking(false);
-            showError("बोलने में त्रुटि: " + m.message);
           }
         } else {
           if (dropRef.current) return; // stale audio frame of an aborted reply

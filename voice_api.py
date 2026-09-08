@@ -87,6 +87,41 @@ def _vision_http_client() -> httpx.Client:
 # runs while a TTS window generates, both slow down and 16 GB VRAM (T4) can
 # spike. TTS windows are short, so the VLM simply waits its turn.
 GPU_GENERATE_LOCK = threading.Lock()
+# Screen-vision pause gate: while a chat/synth turn is streaming, background
+# VLM/OCR warm-ups hold OFF starting a generate (they would queue behind the
+# reply's TTS windows on GPU_GENERATE_LOCK and add to first-audio latency).
+# _screen_resume_evt wakes the paused worker the instant the reply finishes.
+_screen_busy_count = [0]
+_screen_busy_lock = threading.Lock()
+_screen_resume_evt = threading.Event()
+
+
+def _screen_pause_begin() -> None:
+    """Mark a turn as synthesizing — background screen warm-ups pause."""
+    with _screen_busy_lock:
+        _screen_busy_count[0] += 1
+
+
+def _screen_pause_end() -> None:
+    """Turn finished — resume background screen warm-ups."""
+    with _screen_busy_lock:
+        _screen_busy_count[0] = max(0, _screen_busy_count[0] - 1)
+        if _screen_busy_count[0] == 0:
+            _screen_resume_evt.set()
+
+
+@asynccontextmanager
+async def _screen_paused():
+    """Pause background screen warm-ups for the duration of one streaming
+    turn (context-manager form — unwinds on exceptions AND client
+    disconnects, so the pause can never stick)."""
+    _screen_pause_begin()
+    try:
+        yield
+    finally:
+        _screen_pause_end()
+
+
 # True once the boot warm-up JIT'd the OmniVoice kernels — before that the
 # pre-generate empty_cache() device sync stays (cold-start safety).
 _GPU_WARM = {"done": False}
@@ -134,7 +169,7 @@ REF_TEXT = os.environ.get(
 # ---------- Model: OmniVoice (k2-fsa/OmniVoice), 24 kHz output ----------
 OMNIVOICE_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 SAMPLE_RATE = int(os.environ.get("VOICE_SAMPLE_RATE", "24000"))  # OmniVoice always outputs 24 kHz
-NUM_STEP = int(os.environ.get("VOICE_NUM_STEP", "16"))           # diffusion steps; lower = faster
+NUM_STEP = int(os.environ.get("VOICE_NUM_STEP", "8"))            # diffusion steps; lower = faster (8 ≈ realtime)
 TEMPERATURE = float(os.environ.get("VOICE_TEMPERATURE", "0.3"))  # Kaggle demo default
 DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.0"))      # rate when a request omits speed
 # Allowed diffusion-step range and the first-window / greeting caps below are
@@ -142,7 +177,7 @@ DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.0"))      # rate when a r
 STEP_MIN = int(os.environ.get("VOICE_STEP_MIN", "4"))
 STEP_MAX = int(os.environ.get("VOICE_STEP_MAX", "64"))
 GREETING_MAX = int(os.environ.get("VOICE_GREETING_MAX", "2"))  # sentences for small-talk replies
-FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "30"))  # chars in 1st audio window (small = fast first audio)
+FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "18"))  # hard char cap on the 1st audio window (small = fast first audio)
 
 # MPS (Apple Silicon) / CUDA run best in fp16; CPU falls back to fp32.
 # Override with VOICE_API_DEVICE=cpu|mps|cuda and VOICE_API_DTYPE=fp16|fp32.
@@ -224,7 +259,7 @@ def _pick_speed(sent: str, base: float = 1.0) -> float:
 # ---------- LLM: OpenAI-compatible chat endpoint (default Groq, gpt-oss-120b) ----------
 LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.6"))
-LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "1000"))
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "550"))
 # gpt-oss models "think" before answering — reasoning tokens count against
 # max_tokens, so a small budget can end with EMPTY content (silent no-reply).
 # "low" keeps first-audio fast; set LLM_REASONING_EFFORT="" to omit the param.
@@ -477,13 +512,18 @@ VISION_MODEL = os.environ.get("VISION_MODEL", "qwen2.5-vl-7b-instruct")
 # (16 GB) next to OmniVoice + Whisper in fp16 (~7.5 GB weights) and needs NO
 # API key. Loaded lazily on the first screen-share, so boot time is unchanged.
 VISION_LOCAL_MODEL = os.environ.get("VISION_LOCAL_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
-# 2-3 short Hindi sentences ≈ 60-80 tokens; 90 is plenty — cuts decode time dramatically
-VISION_LOCAL_MAX_NEW_TOKENS = int(os.environ.get("VISION_LOCAL_MAX_NEW_TOKENS", "90"))
-# Max image side before vision tower: 512px drops vision tokens from 1024 to 256 (4x faster!)
-VISION_LOCAL_MAX_SIDE = int(os.environ.get("VISION_LOCAL_MAX_SIDE", "512"))
+# 2-3 short Hindi sentences ≈ 60-80 tokens; 90 + the two-line early stop
+# below cuts decode time dramatically
+VISION_LOCAL_MAX_NEW_TOKENS = int(os.environ.get("VISION_LOCAL_MAX_NEW_TOKENS", "60"))
+# Max image side before vision tower: 384px keeps the vision tower tiny (fast
+# prefill AND decode) while OCR carries the exact text ground truth anyway.
+VISION_LOCAL_MAX_SIDE = int(os.environ.get("VISION_LOCAL_MAX_SIDE", "384"))
+# Attention kernel for the local VLM: "sdpa" (default, flash-path on CUDA)
+# | "eager". SDPA alone is ~1.3-1.8x faster prefill+decode vs eager on GPU.
+VISION_LOCAL_ATTN = os.environ.get("VISION_LOCAL_ATTN", "sdpa").strip().lower()
 # 1 = load the local VLM in 4-bit (bitsandbytes): ~2 GB weights, noticeably
 # faster decode on T4. Needs `pip install bitsandbytes`. Default off.
-VISION_LOCAL_4BIT = os.environ.get("VISION_LOCAL_4BIT", "0") == "1"
+VISION_LOCAL_4BIT = os.environ.get("VISION_LOCAL_4BIT", "1") == "1"
 VISION_TIMEOUT = float(os.environ.get("VISION_TIMEOUT", "25.0"))
 # Cached descriptions older than this are considered stale and re-described
 # when the same hash is sent again.
@@ -595,6 +635,9 @@ def _load_local_vlm():
                 log.warning("4-bit load unavailable (%s) — falling back to %s", e, dtype)
         log.info("Loading local vision model %s on %s (%s)…", VISION_LOCAL_MODEL, device, dtype)
         t0 = time.perf_counter()
+        # SDPA attention: large decode speedup on CUDA, no quality change.
+        # Older transformers versions reject the kwarg — degrade gracefully.
+        load_kwargs["attn_implementation"] = VISION_LOCAL_ATTN
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             VISION_LOCAL_MODEL, **load_kwargs
         ).to(device).eval()
@@ -615,6 +658,32 @@ def _screen_describe_local(image_b64: str) -> str:
 
     import torch as _torch
     from PIL import Image
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class _TwoLineStop(StoppingCriteria):
+        """Stop the local VLM the moment the 2-line Hindi describe is done.
+
+        The prompt demands 'exactly 2 lines', but greedy decode otherwise
+        keeps going to the token cap. Cutting at the second newline saves
+        ~30-50% of decode time with zero quality change (1-line 'nothing
+        notable' answers still run to the cap — rare, accepted).
+        """
+
+        def __init__(self, tokenizer, prompt_len: int):
+            self.eos = tokenizer.eos_token_id
+            nl_ids = tokenizer("\n", add_special_tokens=False)["input_ids"]
+            self.nl_id = nl_ids[0] if len(nl_ids) == 1 else None
+            self.prompt_len = prompt_len
+
+        def __call__(self, input_ids, scores, **kwargs) -> bool:
+            gen = input_ids[0, self.prompt_len:]
+            if gen.numel() < 4:
+                return False
+            if self.eos is not None and int(gen[-1]) == self.eos:
+                return True
+            if self.nl_id is not None and int((gen == self.nl_id).sum()) >= 2:
+                return True
+            return False
 
     with _vlm_lock:
         model, processor = _load_local_vlm()
@@ -634,13 +703,17 @@ def _screen_describe_local(image_b64: str) -> str:
             text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = processor(text=[text], images=[img], return_tensors="pt").to(model.device)
             t0 = time.perf_counter()
+            stop = StoppingCriteriaList(
+                [_TwoLineStop(processor.tokenizer, inputs["input_ids"].shape[1])]
+            )
             with _torch.inference_mode():
                 with GPU_GENERATE_LOCK:  # never compete with TTS for the GPU
                     out = model.generate(
                         **inputs,
-                    max_new_tokens=VISION_LOCAL_MAX_NEW_TOKENS,
-                    do_sample=False,
-                )
+                        max_new_tokens=VISION_LOCAL_MAX_NEW_TOKENS,
+                        do_sample=False,
+                        stopping_criteria=stop,
+                    )
             resp = processor.batch_decode(
                 out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
             )[0].strip()
@@ -841,6 +914,17 @@ _vision_worker_running = False
 def _vision_drain_worker() -> None:
     global _vision_worker_running
     while True:
+        # PRIORITY PAUSE: while a chat turn is synthesizing, TTS windows are
+        # grabbed first by GPU_GENERATE_LOCK and this VLM generate would spin
+        # CPU + hold the GPU queue behind TTS — directly adding to the reply's
+        # first-audio latency. When sharing is active the client keeps sending
+        # fresh frames, so a deferred screen is NEVER stale: skip the deferred
+        # one and describe the newest on resume.
+        while _screen_busy_count[0] > 0:
+            with _vision_job_lock:
+                _latest_vision_job["img"] = None  # drop stale frame, keep latest wins
+            if _screen_resume_evt.wait(timeout=1.0):
+                _screen_resume_evt.clear()
         with _vision_job_lock:
             img = _latest_vision_job.get("img")
             chash = _latest_vision_job.get("hash", "")
@@ -861,6 +945,8 @@ def _warm_screen_cache(image_b64: str, client_hash: str = "", force: bool = Fals
 
     Overwrites older pending frames so threads never queue up on the VLM,
     eliminating multi-minute backlogs and stale repeat descriptions.
+    Single worker: the /api/vision warm-up POSTs and per-turn warm calls all
+    collapse into one describe at a time.
     """
     global _vision_worker_running
     with _vision_job_lock:
@@ -1012,17 +1098,29 @@ def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
             ):
                 ocr = _ocr_cache["text"]
     if not ocr and image_b64 and not _ocr_disabled:
-        if _ocr_engine is not None and _ocr_cuda and not _ocr_slow_detected:
-            # Run inline ONLY if OCR is genuinely fast on this GPU
+        # Inline OCR with a HARD 300 ms budget: run in a throwaway thread and
+        # abandon it past the deadline (the chat reply NEVER waits longer —
+        # the abandoned run's result still lands in the OCR cache for the
+        # next turn). Cheap OCR carries the exact text ground truth inline;
+        # slow environments fall through to background-only automatically.
+        result_holder: dict = {}
+
+        def _run_ocr() -> None:
             try:
-                ocr = _screen_ocr(image_b64, client_hash)
-            except Exception as e:  # noqa: BLE001 — OCR must never break a reply
-                log.warning("Inline OCR failed: %s", e)
-        else:
-            # OCR is slow or CPU-bound — background only so chat response is NEVER delayed!
+                result_holder["text"] = _screen_ocr(image_b64, client_hash)
+            except Exception:  # noqa: BLE001 — OCR must never break a reply
+                pass
+
+        t = threading.Thread(target=_run_ocr, daemon=True)
+        t.start()
+        t.join(timeout=0.3)  # 300 ms hard limit
+        if t.is_alive():
+            log.warning("Inline OCR exceeded 300ms, falling back to background")
             threading.Thread(
                 target=_warm_screen_ocr, args=(image_b64, client_hash), daemon=True
             ).start()
+        else:
+            ocr = result_holder.get("text", "")
     return {"ocr": ocr, "desc": desc, "model": model_used}
 
 
@@ -1519,18 +1617,40 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 window.append(piece)
                 window_chars += len(piece)
                 if not emitted_audio:
-                    # first window: wait until it's a real sentence big enough
-                    # to speak (fast start, but never a fragment)
-                    ready = window_chars >= FIRST_WINDOW_CHARS
+                    # HARD CAP for the first window: ship at the first word
+                    # boundary past FIRST_WINDOW_CHARS — the rest carries into
+                    # the next window. This is THE first-audio latency lever:
+                    # a short first window synthesizes in a fraction of the
+                    # time a full sentence needs, and the overflow text is
+                    # never lost (it is spoken in the following window).
+                    if window_chars >= FIRST_WINDOW_CHARS:
+                        text_to_speak = " ".join(window)
+                        if len(text_to_speak) > FIRST_WINDOW_CHARS:
+                            words = text_to_speak.split()
+                            cut_text = ""
+                            for w in words:
+                                if len(cut_text) + len(w) + 1 <= FIRST_WINDOW_CHARS:
+                                    cut_text = (cut_text + " " + w).strip()
+                                else:
+                                    break
+                            if not cut_text:
+                                # single word longer than the cap — speak it whole
+                                cut_text = words[0]
+                            remainder = text_to_speak[len(cut_text):].strip()
+                            window = remainder.split() if remainder else []
+                            window_chars = sum(len(w) for w in window)
+                            text_to_speak = cut_text
+                        else:
+                            window, window_chars = [], 0
+                        win_q.put({"text": text_to_speak, "steps": min(num_step, FIRST_WINDOW_STEP)})
+                        emitted_audio = True
                 else:
                     # later windows: group until there's enough text for a
                     # smooth frame (~2-4 short sentences), never a scrap
-                    ready = window_chars >= MIN_WINDOW_CHARS * 2
-                if ready:
-                    steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
-                    win_q.put({"text": " ".join(window), "steps": steps})
-                    window, window_chars = [], 0
-                    emitted_audio = True
+                    if window_chars >= MIN_WINDOW_CHARS * 2:
+                        win_q.put({"text": " ".join(window), "steps": num_step})
+                        window, window_chars = [], 0
+                        emitted_audio = True
             if is_greeting and sent_count >= GREETING_MAX:
                 if stop_evt is not None:
                     stop_evt.set()  # tell the producer to stop too
@@ -1696,12 +1816,15 @@ def api_config():
         "vision_enabled": _vision_ready(),
         "vision_backend": _vision_ready_backend() or "off",
         "vision_model": (VISION_MODEL if _vision_ready_backend() == "api" else VISION_LOCAL_MODEL),
+        # screen-share capture cadence + warm-up spacing (client-side knobs)
+        "screen_tick_ms": int(os.environ.get("SCREEN_TICK_MS", "1200")),
+        "screen_prefetch_ms": int(os.environ.get("SCREEN_PREFETCH_MS", "4000")),
         # LLM
         "llm_model": LLM_MODEL,
         "llm_temperature": LLM_TEMPERATURE,
         "llm_max_tokens": LLM_MAX_TOKENS,
         # browser-side conversation behaviour (read by web/ui/src/App.jsx)
-        "chat_step": int(os.environ.get("VOICE_CHAT_STEP", "12")),  # nfe_step the UI sends
+        "chat_step": int(os.environ.get("VOICE_CHAT_STEP", "8")),  # nfe_step the UI sends
         "max_history": int(os.environ.get("VOICE_MAX_HISTORY", "12")),
         "ws_reconnect_ms": int(os.environ.get("VOICE_WS_RECONNECT_MS", "1500")),
         "rec_restart_ms": int(os.environ.get("VOICE_REC_RESTART_MS", "400")),
@@ -1795,19 +1918,19 @@ STREAM_MAX_CHARS = int(os.environ.get("VOICE_STREAM_MAX_CHARS", "75"))
 STREAM_WINDOW = max(1, int(os.environ.get("VOICE_STREAM_WINDOW", "2")))
 # Max text chars per audio window and per clause piece — keeps every frame to
 # ~4-5s of speech so a reply starts fast and an interrupt tail stays tiny.
-WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "90"))
+WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "70"))
 # Never ship a TTS audio window smaller than this (except the final tail).
 # Stops the LLM's short sentences from becoming tiny 2-3 word audio chunks
 # that keep breaking the flow — windows only go out once they're worth speaking.
-MIN_WINDOW_CHARS = int(os.environ.get("VOICE_MIN_WINDOW_CHARS", "24"))
+MIN_WINDOW_CHARS = int(os.environ.get("VOICE_MIN_WINDOW_CHARS", "18"))
 _PIECE_MAX = max(40, min(120, WINDOW_CHAR_CAP))  # single unit fed to TTS
 # Hard ceiling on sentences per chat reply (the LLM is told 3-4 but can ramble;
 # this bounds worst-case latency so a turn never turns into a monologue).
-MAX_CHAT_SENTENCES = int(os.environ.get("VOICE_MAX_SENTENCES", "8"))
+MAX_CHAT_SENTENCES = int(os.environ.get("VOICE_MAX_SENTENCES", "6"))
 # The FIRST audio window uses at most this many diffusion steps (faster start,
 # like a human replying quickly); later windows use the requested num_step.
 # Set equal to the normal num_step to disable.
-FIRST_WINDOW_STEP = max(2, min(32, int(os.environ.get("VOICE_FIRST_STEP", "6"))))  # floor 2 = snappiest first window
+FIRST_WINDOW_STEP = max(2, min(32, int(os.environ.get("VOICE_FIRST_STEP", "2"))))  # floor 2 = snappiest first window
 # Conversation history kept per turn (older messages dropped). Kept small so
 # the LLM prefill stays tiny - the #1 lever for first-audio latency.
 MAX_HISTORY = int(os.environ.get("VOICE_MAX_HISTORY", "12"))
@@ -2054,7 +2177,17 @@ async def ws_tts(websocket: WebSocket):
                 ]
                 if not history or history[-1]["role"] != "user":
                     history.append({"role": "user", "content": text})
-                messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}, *history]
+                need_screen = _should_include_screen_context(text, history)
+                # Sub-second latency: SHORT system prompt by default (~100 B vs
+                # ~2.5 KB -> ~0.3-1 s less LLM prefill per turn). The full
+                # persona is used only when the turn actually needs screen/
+                # debug context, or when VOICE_PROMPT_FILE supplied a custom
+                # persona (which must never be silently downgraded).
+                if _LLM_PERSONA_CUSTOM or need_screen:
+                    system_prompt = LLM_SYSTEM_PROMPT
+                else:
+                    system_prompt = LLM_SYSTEM_SHORT
+                messages = [{"role": "system", "content": system_prompt}, *history]
 
                 # Screen understanding: a shared screen arrives as an optional
                 # {"screen": {"image": <b64>, "hash": <change-detection id>}}.
@@ -2062,7 +2195,6 @@ async def ws_tts(websocket: WebSocket):
                 # screen adds ZERO vision latency — only a fresh screen pays
                 # one Qwen2.5-VL call before the LLM starts writing.
                 screen = data.get("screen") if isinstance(data.get("screen"), dict) else None
-                need_screen = _should_include_screen_context(text, history)
                 if screen:
                     global _last_screen_activity
                     _last_screen_activity = time.monotonic()
@@ -2107,28 +2239,31 @@ async def ws_tts(websocket: WebSocket):
                                     "role": "system",
                                     "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_PENDING_TMPL,
                                 }
-                            if not layers.get("desc"):
-                                # VLM summary cold → describe in background for the
-                                # next turn (reply already has fresh OCR text)
-                                threading.Thread(
-                                    target=_warm_screen_cache,
-                                    args=(img, str(screen.get("hash") or "")),
-                                    daemon=True,
-                                ).start()
-                            else:
-                                # VLM cache already warm. If user explicitly asked about
-                                # the screen ("अब क्या है?"), force-refresh in background
-                                # so next turn gets a NEW description, not a stale repeat.
-                                threading.Thread(
-                                    target=_warm_screen_cache,
-                                    args=(img, str(screen.get("hash") or ""), True),
-                                    daemon=True,
-                                ).start()
-                        else:
-                            log.info("WS chat: screen sharing active, but query does not require screen context (saved tokens)")
-                            # Keep background warmer active so cache stays hot for when user asks about screen
+                            # VLM summary cold → describe in background for the
+                            # next turn (reply already has fresh OCR text).
+                            # NOT force=True: a per-turn forced re-describe burns
+                            # 7-15 s of GPU on the SAME screen and the result is
+                            # a near-duplicate. The gated worker skips the turn
+                            # anyway if the client has since sent a newer frame.
                             threading.Thread(
                                 target=_warm_screen_cache,
+                                args=(img, str(screen.get("hash") or "")),
+                                daemon=True,
+                            ).start()
+                        else:
+                            log.info("WS chat: screen sharing active, but query does not require screen context (saved tokens)")
+                            # Keep background warmer active so cache stays hot for
+                            # when the user asks about the screen. Warm OCR TOO —
+                            # without it the next screen-intent turn pays full OCR
+                            # latency for this screen (the old gap: only the VLM
+                            # was warmed here, OCR cache stayed cold).
+                            threading.Thread(
+                                target=_warm_screen_cache,
+                                args=(img, str(screen.get("hash") or "")),
+                                daemon=True,
+                            ).start()
+                            threading.Thread(
+                                target=_warm_screen_ocr,
                                 args=(img, str(screen.get("hash") or "")),
                                 daemon=True,
                             ).start()
@@ -2150,7 +2285,9 @@ async def ws_tts(websocket: WebSocket):
                 start = time.perf_counter()
                 log.info("WS chat request: %s", text[:50])
                 busy[0] = True
-                async with state.gen_lock:
+                # _screen_paused pauses background screen warm-ups until this
+                # reply finishes streaming (covers disconnects/exceptions too)
+                async with state.gen_lock, _screen_paused():
                     out_q: queue.Queue = queue.Queue()
                     threading.Thread(
                         target=_chat_worker,
@@ -2210,7 +2347,7 @@ async def ws_tts(websocket: WebSocket):
             start = time.perf_counter()
             log.info("WS synth request: %s (num_step=%d, speed=%.2f)", text[:50], num_step, speed)
             busy[0] = True
-            async with state.gen_lock:
+            async with state.gen_lock, _screen_paused():
                 out_q: queue.Queue = queue.Queue()
                 threading.Thread(
                     target=_synth_worker,
