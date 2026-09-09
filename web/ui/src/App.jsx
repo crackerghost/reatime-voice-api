@@ -3,7 +3,7 @@ import { FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTrash, FaVolu
 import AuraGlobe from "./AuraGlobe.jsx";
 import { engine } from "./audioEngine.js";
 
-const GREETING = "नमस्ते! मैं आपका हिंदी ट्यूटर हूँ। माइक दबाकर बोलिए, लिखकर पूछिए, या स्क्रीन शेयर करके दिखाइए क्या समझना है — और जब मैं बोलूँ तो बीच में कुछ भी बोलिए, मैं तुरंत रुक जाऊँगा।";
+const GREETING = "नमस्ते! मैं आपका हिंदी ट्यूटर हूँ। माइक दबाकर बोलिए, लिखकर पूछिए — और स्क्रीन दिखाने के लिए X दबाकर रखें, बोलते रहिए, छोड़ते ही मैं स्क्रीन देखकर जवाब दूँगा। जब मैं बोलूँ तो बीच में कुछ भी बोलिए, मैं तुरंत रुक जाऊँगा।";
 const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/tts`;
 const ASR_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/asr`;
 const CONFIG_URL = `${location.protocol}//${location.host}/api/config`;
@@ -121,6 +121,8 @@ export default function App() {
   const pushStartRef = useRef(0); // performance.now() when the hold began
   const pushWarmedHashRef = useRef(""); // hash already sent to /api/vision this hold (dedupe)
   const pushRetryRef = useRef(0); // first-capture retries until video is ready
+  const pushReleasePendingRef = useRef(false); // released before the first frame landed -> flush on first frame
+  const pushTextRef = useRef(""); // mic question heard DURING the hold (sent with the frame on release)
   const screenCanvasRef = useRef(null); // full-size JPEG encoder canvas
   const screenDiffCanvasRef = useRef(null); // 32x24 signature canvas
   const screenFetchBusyRef = useRef(false); // a warm-up fetch is in flight (never queue)
@@ -277,21 +279,27 @@ export default function App() {
     setSpeaking(false);
   }, []);
 
-  /* ---- push-to-see: hold the button → capture → describe → auto-send ----
+  /* ---- push-to-see: hold X (or the screen button) → capture → describe →
+     auto-send on release ----
      Latency design (replaces the continuous 1.2 s screen-share loop):
-     1. Press  → getDisplayMedia ONCE per hold; a 400 ms capture loop grabs
-        frames immediately (NO change-detection — the user IS the trigger).
+     1. Press  → the capture stream is already granted (see below), so frames
+        start immediately (400 ms cadence, NO change-detection — the user IS
+        the trigger). First press of a session shows Chrome's picker ONCE;
+        the stream then stays alive silently between presses (a browser can
+        never capture without the one-time permission picker).
      2. Every captured frame goes to /api/vision in the BACKGROUND with a
         unique hash, so the Qwen2.5-VL describe runs WHILE the user is still
         holding/talking. The last warm-up's result stays in the server cache.
      3. Release (or 5 s cap) → the FRESHEST frame is attached to the turn as
-        {screen: {image, hash, wait_ms}}. The server peeks its warm cache
-        (usually a HIT from step 2) and only pays OCR inline — the VLM
-        description is rarely on the critical path.
-     4. The stream stops the moment the turn is sent — zero GPU/network cost
-        while the user is NOT pressing, unlike the always-on loop. */
+        {screen: {image, hash, wait_ms}}. A question spoken into the mic
+        during the hold is absorbed and sent as the turn text; with no text
+        the turn IS the screen ("इस स्क्रीन के बारे में बताओ").
+     4. No GPU/network vision cost while X is NOT held — only the idle local
+        capture stream (no frames fetched, no uploads). Revoke anytime via
+        Chrome's own "Stop sharing" bar. */
   const stopScreenCapture = useCallback(() => {
     pushActiveRef.current = false;
+    pushReleasePendingRef.current = false;
     if (pushTimerRef.current) { clearTimeout(pushTimerRef.current); pushTimerRef.current = 0; }
     if (screenTickRef.current) { clearInterval(screenTickRef.current); screenTickRef.current = 0; }
     const stream = screenStreamRef.current;
@@ -303,6 +311,30 @@ export default function App() {
     pushFrameRef.current = null;
     setSharing(false);
   }, []);
+
+  /* Grant the capture stream ONCE and keep it alive between holds. Chrome
+     always shows its permission picker on the first getDisplayMedia (no API
+     skips it — security rule), but a live stream can be reused silently, so
+     every X-hold after the first starts at ZERO picker latency. */
+  const ensureCaptureStream = useCallback(async () => {
+    const existing = screenStreamRef.current;
+    if (existing && existing.getVideoTracks()[0]?.readyState === "live") return existing;
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 5 }, audio: false,
+    });
+    const vid = document.createElement("video");
+    vid.srcObject = stream;
+    vid.muted = true;
+    vid.playsInline = true;
+    await vid.play().catch(() => {});
+    screenStreamRef.current = stream;
+    screenVideoRef.current = vid;
+    stream.getVideoTracks()[0]?.addEventListener("ended", () => {
+      // user hit Chrome's "Stop sharing" — revoke fully
+      stopScreenCapture();
+    });
+    return stream;
+  }, [stopScreenCapture]);
 
   /* One capture tick while the button is held: grab the frame NOW (no diff
      gate — during a hold every tick is a deliberate capture) and warm the
@@ -374,36 +406,27 @@ export default function App() {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 5 }, audio: false,
-      });
-      const vid = document.createElement("video");
-      vid.srcObject = stream;
-      vid.muted = true;
-      vid.playsInline = true;
-      await vid.play().catch(() => {});
-      screenStreamRef.current = stream;
-      screenVideoRef.current = vid;
+      // First press of a session: Chrome's picker shows here (unavoidable).
+      // Every later press: this resolves instantly from the live stream.
+      await ensureCaptureStream();
       sharingRef.current = true;
       pushActiveRef.current = true;
       pushStartRef.current = performance.now();
       pushWarmedHashRef.current = "";
       pushRetryRef.current = 0;
+      pushReleasePendingRef.current = false;
+      pushTextRef.current = "";
       setSharing(true);
       // first frame IMMEDIATELY, then every pushTickMs until release/cap
       pushCaptureTick();
       screenTickRef.current = setInterval(pushCaptureTick, CFG.pushTickMs);
-      // hard cap: a held button auto-sends anyway ("not more than 5 sec")
+      // hard cap: a held key auto-sends anyway ("not more than 5 sec")
       pushTimerRef.current = setTimeout(() => {
         if (pushActiveRef.current) {
           console.info("[push] hold exceeded max — auto-sending");
           apiRef.current.releasePush();
         }
       }, CFG.pushMaxMs);
-      stream.getVideoTracks()[0]?.addEventListener("ended", () => {
-        // user hit the browser's "Stop sharing" — cancel the hold silently
-        stopScreenCapture();
-      });
     } catch (e) {
       if (e && e.name === "NotAllowedError") {
         showError("स्क्रीन कैप्चर की अनुमति नहीं मिली — दोबारा कोशिश करें और 'Share' दबाएँ।");
@@ -413,12 +436,10 @@ export default function App() {
       console.warn("[push] getDisplayMedia failed:", e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stopScreenCapture]);
-
-  /* Release the held button: stop capturing, attach the freshest frame to a
-     turn. With no typed text the turn IS the screen — "इस स्क्रीन के बारे में
-     बताओ" so the tutor describes what it sees. With text (or a live mic
-     transcript in flight) the frame rides along as context. */
+  }, [ensureCaptureStream]);  /* Release the held X/button: stop the capture LOOP (the granted stream
+     stays alive for the next hold — no picker again), attach the freshest
+     frame to a turn, and send. A question spoken into the mic while holding
+     becomes the turn text; with no text the turn IS the screen. */
   const releasePush = useCallback(() => {
     if (!pushActiveRef.current) return;
     pushActiveRef.current = false;
@@ -427,15 +448,22 @@ export default function App() {
     const heldMs = Math.round(performance.now() - pushStartRef.current);
     const frame = pushFrameRef.current;
     pushFrameRef.current = null;
-    const stream = screenStreamRef.current;
-    if (stream) stream.getTracks().forEach((t) => t.stop());
-    screenStreamRef.current = null;
-    const vid = screenVideoRef.current;
-    if (vid) { try { vid.srcObject = null; } catch { /* noop */ } }
     sharingRef.current = false;
     setSharing(false);
     if (!frame) {
-      console.warn("[push] released after " + heldMs + "ms but no frame was captured");
+      // First capture hasn't landed yet (very fast tap / picker just closed):
+      // arm a short flush so the first frame STILL becomes the turn instead
+      // of being dropped.
+      if (pushRetryRef.current > 0 || screenVideoRef.current) {
+        pushReleasePendingRef.current = true;
+        setTimeout(() => {
+          if (pushReleasePendingRef.current && pushFrameRef.current) {
+            pushReleasePendingRef.current = false;
+            apiRef.current.releasePush();
+          }
+        }, 300);
+      }
+      console.warn("[push] released after " + heldMs + "ms but no frame was captured yet — flushing on first frame");
       return;
     }
     console.info(`[push] hold ${heldMs}ms -> turn with frame (${Math.round(frame.b64.length * 3 / 4 / 1024)} KB, hash ${frame.hash})`);
@@ -452,11 +480,14 @@ export default function App() {
         body: JSON.stringify({ image: frame.b64, hash: frame.hash }),
       }).catch(() => {});
     }
-    // wait_ms: the release-time warm-up (if one is in flight for THIS hash)
-    // gets up to 2 s to land before the server falls back to recent context.
-    const text = (input || "").trim() || "इस स्क्रीन के बारे में बताओ — क्या दिख रहा है?";
+    // A question spoken during the hold wins; typed text second; screen-only
+    // (no words) makes the turn "describe what you see".
+    const text = (pushTextRef.current || "").trim() || (input || "").trim()
+      || "इस स्क्रीन के बारे में बताओ — क्या दिख रहा है?";
+    pushTextRef.current = "";
     setInput("");
     submitPushChat(text, frame, heldMs);
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [input]);
 
@@ -1065,6 +1096,16 @@ export default function App() {
           // NOW. The authoritative "final" follows and reconciles.
           if (!asrBusyRef.current) return; // stale spec after a watchdog release — ignore
           const t = (m.text || "").trim();
+          if (pushActiveRef.current) {
+            // Holding X: ABSORB the question — it becomes the push turn's text
+            // on release instead of firing a screenless reply now.
+            if (t) pushTextRef.current = (pushTextRef.current ? pushTextRef.current + " " : "") + t;
+            asrBusyRef.current = false;
+            specSentFor = "";
+            lastPartial = "";
+            setInterim("");
+            return;
+          }
           if (CFG.specChat && t && t.replace(/\s/g, "").length >= CFG.sendMinChars) {
             vadRef.current.textHeard = true;
             setInterim("");
@@ -1079,6 +1120,14 @@ export default function App() {
           lastPartial = "";
           asrBusyRef.current = false;
           streamingRef.current = false;
+          if (pushActiveRef.current) {
+            // Holding X: absorb the beam final too (replaces/merges with the
+            // speculative guess) — no turn until the key comes up.
+            if (t) pushTextRef.current = (pushTextRef.current ? pushTextRef.current + " " : "") + t;
+            specSentFor = "";
+            setInterim("");
+            return;
+          }
           if (specSentFor) {
             // A speculative turn already went out: reconcile only on real divergence.
             const norm = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -1434,6 +1483,42 @@ export default function App() {
     };
   }, []);
 
+  /* ---------- Hold X = push-to-see (screen context on demand) ----------
+     keydown X starts the capture+warm hold, keyup releases and sends the turn
+     with the freshest frame plus anything spoken into the mic while holding.
+     Ignored while typing in the input/textarea; window blur releases safely
+     (a lost keyup must never leave a stuck hold). */
+  useEffect(() => {
+    if (!CFG.pushMode) return;
+    const isX = (e) => e.key === "x" || e.key === "X";
+    const isTyping = () => {
+      const el = document.activeElement;
+      return el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+    };
+    const down = (e) => {
+      if (e.repeat || !isX(e) || isTyping()) return;
+      e.preventDefault();
+      apiRef.current.startPush && apiRef.current.startPush();
+    };
+    const up = (e) => {
+      if (!isX(e) || !apiRef.current.pushActiveRef?.current) return;
+      e.preventDefault();
+      apiRef.current.releasePush && apiRef.current.releasePush();
+    };
+    const blur = () => {
+      // lost keyup (alt-tab, minimize) — release so the hold can't stick
+      if (apiRef.current.pushActiveRef?.current) apiRef.current.releasePush();
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("blur", blur);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("blur", blur);
+    };
+  }, []);
+
   /* ---------- UI ---------- */
   return (
     <div className="relative min-h-screen overflow-hidden bg-slate-50 text-slate-800">
@@ -1588,7 +1673,7 @@ export default function App() {
                   }}
                   onContextMenu={(e) => e.preventDefault()}
                   title={CFG.pushMode
-                    ? "दबाकर रखें — मैं स्क्रीन देखूँगा; छोड़ते ही सवाल भेज दूँगा (ज़्यादा से ज़्यादा 5 सेकंड)"
+                    ? "X दबाकर रखें (या यह बटन) — स्क्रीन देखूँगा; छोड़ते ही जवाब (max 5 सेकंड)"
                     : sharing ? "स्क्रीन शेयर बंद करें" : "स्क्रीन शेयर करें — मैं देखकर समझाऊँगा"}
                   disabled={!CFG.visionEnabled}
                   className={`flex h-11 w-11 items-center justify-center rounded-full shadow-md transition disabled:opacity-40 ${
@@ -1649,12 +1734,12 @@ export default function App() {
                 {sharing ? (
                   <>
                     <FaDesktop className="h-3 w-3 animate-pulse text-emerald-500" />
-                    दबाकर रखें — छोड़ते ही जवाब आएगा (max 5 सेकंड)
+                    X दबा हुआ है — बोलिए, छोड़ते ही जवाब आएगा (max 5 सेकंड)
                   </>
                 ) : (
                   <>
-                    <FaMicrophone className="h-3 w-3 text-slate-400" />
-                    माइक चालू करके बोलिए — बीच में बोलने पर मैं रुक जाता हूँ
+                    <FaDesktop className="h-3 w-3 text-slate-400" />
+                    स्क्रीन दिखाने के लिए X दबाकर रखें — या माइक चालू करके बोलिए
                   </>
                 )}
               </p>

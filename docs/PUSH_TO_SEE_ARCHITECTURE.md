@@ -1,10 +1,13 @@
 # Push-to-See Architecture — screen understanding without continuous sharing
 
 **New interaction (default `SCREEN_PUSH_MODE=1`):**
-Hold the screen button → the client captures frames *while you hold* → each
-frame is described by Qwen2.5-VL **in the background during the hold** →
-release (or 5 s cap) auto-sends the turn with the freshest frame → the reply
-starts ~1 s after release with screen context at (almost) zero extra latency.
+**Hold the X key** (or the screen button) → frames are captured *while you
+hold* → each frame is described by Qwen2.5-VL **in the background during the
+hold** → release (or 5 s cap) auto-sends the turn with the freshest frame and
+anything spoken into the mic during the hold → the reply starts ~1 s after
+release with screen context at (almost) zero extra latency. Chrome's capture
+permission picker appears only on the FIRST hold of a session — the granted
+stream stays alive between holds, so every later X-hold starts instantly.
 
 The vision compute now overlaps **the hold**, not the reply.
 
