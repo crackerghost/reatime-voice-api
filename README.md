@@ -233,13 +233,24 @@ Notes:
 
 ## 6. Screen understanding (Qwen2.5-VL, optional)
 
+**Push-to-see (default, `SCREEN_PUSH_MODE=1`):** instead of a continuous share
+loop, **hold the screen button** — frames are captured every 400 ms while you
+hold, and each is described by the vision engine in the BACKGROUND so the
+compute overlaps the hold itself. Release (or hold past 5 s) auto-sends the
+turn with the freshest frame; the reply then starts at the usual ~0.8 s
+first-audio latency with the screen description already warm in the server
+cache. When the button is up, the GPU and network do ZERO vision work — no
+more background describe queue competing with TTS. Full latency analysis and
+the architecture diagram: `docs/PUSH_TO_SEE_ARCHITECTURE.md`.
+
+Legacy continuous mode (`SCREEN_PUSH_MODE=0`) still works: while sharing, the
+browser captures frames, detects changes client-side (32×24 gray block-diff,
+~1.2 s cadence), and describes only CHANGED screens via `POST /api/vision`.
+Descriptions are cached by the client's change hash, so an unchanged screen
+costs ZERO vision calls, and a changed screen is described in the BACKGROUND
+before you ask — the reply itself pays no vision latency.
+
 The UI's screen-share button lights up when a vision engine is available.
-While sharing, the browser captures frames, detects changes client-side
-(32×24 gray block-diff, ~1.2 s cadence), and describes only CHANGED screens
-via `POST /api/vision`. Descriptions are cached by the client's change hash,
-so an unchanged screen costs ZERO vision calls, and a changed screen is
-described in the BACKGROUND before you ask — the reply itself pays no vision
-latency.
 
 Two engines (`VISION_BACKEND`):
 
@@ -260,6 +271,9 @@ VISION_BACKEND=auto                                        # auto | api | local
 VISION_API_KEY=...                                         # hosted engine only (or DASHSCOPE_API_KEY)
 VISION_LOCAL_MODEL=Qwen/Qwen2.5-VL-3B-Instruct             # local engine (default, T4-friendly)
 VISION_MODEL=qwen2.5-vl-7b-instruct                        # hosted engine model
+SCREEN_PUSH_MODE=1                                         # 1 = push-to-see (hold the button); 0 = continuous share
+SCREEN_PUSH_MAX_MS=5000                                    # hold cap — auto-sends the turn
+SCREEN_PUSH_TICK_MS=400                                    # capture cadence during the hold
 ```
 
 Screen context is injected into the chat system prompt for that turn, so you

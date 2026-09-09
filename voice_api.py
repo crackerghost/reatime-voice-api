@@ -1124,7 +1124,7 @@ def _screen_ocr(image_b64: str, client_hash: str = "", force: bool = False) -> s
     return text
 
 
-def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
+def _screen_layers(client_hash: str = "", image_b64: str = "", wait_s: float | None = None) -> dict:
     """ALWAYS-REALTIME screen context for the reply path (executor thread).
 
     The client captures the frame AT QUESTION TIME, so the hash is current:
@@ -1135,9 +1135,16 @@ def _screen_layers(client_hash: str = "", image_b64: str = "") -> dict:
     VLM summary: cache peek with bounded wait; on a miss, a RECENT describe
     (any screen, <SCREEN_STALE_DESC_S old) is used so the tutor never falls
     into the 'analysis pending / wait a minute' dead end mid-share.
+
+    wait_s: how long to wait for an in-flight describe of THIS exact screen
+    (push-to-see turns pass a larger budget — the client warmed the cache
+    during the button hold, so the describe is usually already running and
+    lands well inside the wait). Defaults to VISION_REPLY_WAIT_S.
     """
     global _ocr_disabled
-    desc, model_used = _screen_cached_desc(client_hash, VISION_REPLY_WAIT_S)
+    desc, model_used = _screen_cached_desc(
+        client_hash, VISION_REPLY_WAIT_S if wait_s is None else max(0.0, wait_s)
+    )
     if not desc and SCREEN_STALE_DESC_S > 0:
         # This EXACT screen was never (or not yet) described, but a recent
         # describe of a NEARLY IDENTICAL screen (client keeps streaming frames
@@ -1885,6 +1892,12 @@ def api_config():
         # screen-share capture cadence + warm-up spacing (client-side knobs)
         "screen_tick_ms": int(os.environ.get("SCREEN_TICK_MS", "1200")),
         "screen_prefetch_ms": int(os.environ.get("SCREEN_PREFETCH_MS", "4000")),
+        # Push-to-see mode (new default): hold the button, the client warms the
+        # vision cache for THIS screen DURING the hold, then sends the turn.
+        # 0 = continuous background screen-share (legacy behaviour).
+        "screen_push_mode": os.environ.get("SCREEN_PUSH_MODE", "1") == "1",
+        "screen_push_max_ms": int(os.environ.get("SCREEN_PUSH_MAX_MS", "5000")),  # auto-send cap
+        "screen_push_tick_ms": int(os.environ.get("SCREEN_PUSH_TICK_MS", "400")),  # hold capture cadence
         # LLM
         "llm_model": LLM_MODEL,
         "llm_temperature": LLM_TEMPERATURE,
@@ -2244,6 +2257,13 @@ async def ws_tts(websocket: WebSocket):
                 if not history or history[-1]["role"] != "user":
                     history.append({"role": "user", "content": text})
                 need_screen = _should_include_screen_context(text, history)
+                # Push-to-see: a turn that CARRIES a frame is an explicit
+                # "look at my screen" — the user held the button for it. Never
+                # let the intent regex downgrade it to no-context (a push turn
+                # that lost its context is the #1 source of blind replies).
+                screen = data.get("screen") if isinstance(data.get("screen"), dict) else None
+                if screen and str(screen.get("image") or screen.get("b64") or "").strip():
+                    need_screen = True
                 # Sub-second latency: SHORT system prompt by default (~100 B vs
                 # ~2.5 KB -> ~0.3-1 s less LLM prefill per turn). The full
                 # persona is used only when the turn actually needs screen/
@@ -2260,13 +2280,18 @@ async def ws_tts(websocket: WebSocket):
                 # The description is cache-first (hash-keyed), so an unchanged
                 # screen adds ZERO vision latency — only a fresh screen pays
                 # one Qwen2.5-VL call before the LLM starts writing.
-                screen = data.get("screen") if isinstance(data.get("screen"), dict) else None
                 if screen:
                     global _last_screen_activity
                     _last_screen_activity = time.monotonic()
                     img = str(screen.get("image") or screen.get("b64") or "").strip()
                     if img.startswith("data:") and "," in img:
                         img = img.split(",", 1)[1]
+                    # Push-to-see turns may ask the server to wait a bit longer
+                    # for the describe that the hold-time warm-up started.
+                    try:
+                        screen_wait_s = min(max(float(screen.get("wait_ms", 0) or 0) / 1000.0, 0.0), 3.0)
+                    except (TypeError, ValueError):
+                        screen_wait_s = 0.0
                     if img:
                         if need_screen:
                             # TWO-LAYER context (executor thread, never the event loop):
@@ -2274,19 +2299,22 @@ async def ws_tts(websocket: WebSocket):
                             #               → text is never more than ~1 turn old
                             #   VLM summary — cache peek with bounded wait ONLY;
                             #               background warmer fills it (7 s/screen)
+                            _screen_t0 = time.perf_counter()
                             layers = await asyncio.get_running_loop().run_in_executor(
                                 None,
                                 _screen_layers,
                                 str(screen.get("hash") or ""),
                                 img,
+                                screen_wait_s if screen_wait_s > 0 else None,
+                            )
+                            log.info(
+                                "WS chat: screen context ready in %.2fs (OCR %d chars, VLM %d chars%s)",
+                                time.perf_counter() - _screen_t0,
+                                len(layers.get("ocr") or ""), len(layers.get("desc") or ""),
+                                ", waited for in-flight describe" if screen_wait_s > 0 else "",
                             )
                             block = _screen_context_block(layers)
                             if block:
-                                log.info(
-                                    "WS chat: screen context injected (OCR %d chars, VLM %d chars%s)",
-                                    len(layers.get("ocr") or ""), len(layers.get("desc") or ""),
-                                    ", fresh OCR" if layers.get("ocr") else "",
-                                )
                                 messages[0] = {
                                     "role": "system",
                                     "content": LLM_SYSTEM_PROMPT + "\n\n" + block,
@@ -3229,6 +3257,7 @@ async def ws_asr(websocket: WebSocket):
 class VisionRequest(BaseModel):
     image: str = Field(..., min_length=32, description="JPEG screenshot, base64 (data: prefix optional)")
     hash: str = Field("", description="Client-side change-detection id (cache key)")
+    force: bool = Field(False, description="True = skip cache/coalescing and describe THIS frame now")
 
 
 @app.post("/api/vision")
@@ -3245,7 +3274,7 @@ def api_vision(req: VisionRequest):
     if img.startswith("data:") and "," in img:
         img = img.split(",", 1)[1]
     try:
-        desc, cached, model = _screen_context(img, req.hash)
+        desc, cached, model = _screen_context(img, req.hash, force=req.force)
     except Exception as e:  # noqa: BLE001 — log the WHY, not just the 503
         log.exception("/api/vision failed: %s", e)
         raise HTTPException(status_code=503, detail=str(e)) from e

@@ -32,10 +32,10 @@ const CFG = {
   vadRecActiveMs: 400, // recognizer counts as active within this window
   asrVadMode: "auto", // "server" = Silero VAD on the server owns turn-taking (noise-proof)
   bargeIdleMs: 900, // recognizer-idle safety-net send delay
-  visionEnabled: false, // server has a VISION_API_KEY (screen understanding ready)
-  screenTickMs: 1200, // screen change-detection cadence while sharing
-  screenPrefetchMs: 4000, // min gap between background /api/vision warm-ups
-  visionLocalMaxSide: 384, // (server-side; documented here for tuning reference)
+  visionEnabled: false, // server has a vision engine ready (screen understanding)
+  pushMode: true, // push-to-see: hold the button, auto-send on release (SCREEN_PUSH_MODE)
+  pushMaxMs: 5000, // hold longer than this -> auto-send anyway
+  pushTickMs: 400, // capture cadence DURING the hold (each changed frame warms the VLM)
 };
 const num = (v, d) => (v === undefined || v === null || Number.isNaN(Number(v)) ? d : Number(v));
 const mergeCfg = (c) => {
@@ -59,8 +59,9 @@ const mergeCfg = (c) => {
   CFG.bargeIdleMs = num(c.barge_idle_ms, CFG.bargeIdleMs);
   CFG.specChat = c.spec_chat !== undefined ? !!c.spec_chat : CFG.specChat; // live tunable
   CFG.visionEnabled = c.vision_enabled !== undefined ? !!c.vision_enabled : CFG.visionEnabled;
-  CFG.screenTickMs = num(c.screen_tick_ms, CFG.screenTickMs);
-  CFG.screenPrefetchMs = num(c.screen_prefetch_ms, CFG.screenPrefetchMs);
+  CFG.pushMode = c.screen_push_mode !== undefined ? !!c.screen_push_mode : CFG.pushMode;
+  CFG.pushMaxMs = num(c.screen_push_max_ms, CFG.pushMaxMs);
+  CFG.pushTickMs = num(c.screen_push_tick_ms, CFG.pushTickMs);
 };
 if (typeof fetch === "function") {
   fetch(CONFIG_URL)
@@ -89,7 +90,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
-  const [sharing, setSharing] = useState(false); // screen share active
+  const [sharing, setSharing] = useState(false); // push-to-see capture active (button held)
 
   // ---- mutable runtime state (safe across renders) ----
   const wsRef = useRef(null);
@@ -109,21 +110,21 @@ export default function App() {
   const asrOpenRef = useRef(false);
   const asrBusyRef = useRef(false); // a "final" transcript is on its way
   const streamingRef = useRef(false); // mic PCM currently being sent to the ASR
-  // Screen-share state: hidden <video> + change detection + latest JPEG frame.
-  const sharingRef = useRef(false); // mirror of `sharing` for stable callbacks
+  // Push-to-see state: hidden <video> + hold timer + freshest captured frame.
+  const sharingRef = useRef(false); // a capture session is active (mirror of `sharing`)
   const screenStreamRef = useRef(null);
   const screenVideoRef = useRef(null);
-  const screenTickRef = useRef(0);
+  const screenTickRef = useRef(0); // capture interval DURING the hold
+  const pushTimerRef = useRef(0); // pushMaxMs auto-send cap
+  const pushActiveRef = useRef(false); // button currently held down
+  const pushFrameRef = useRef(null); // { b64, hash, ts } — newest captured frame
+  const pushStartRef = useRef(0); // performance.now() when the hold began
+  const pushWarmedHashRef = useRef(""); // hash already sent to /api/vision this hold (dedupe)
+  const pushRetryRef = useRef(0); // first-capture retries until video is ready
   const screenCanvasRef = useRef(null); // full-size JPEG encoder canvas
-  const screenDiffCanvasRef = useRef(null); // 32x24 grayscale diff canvas
-  const screenDiffRef = useRef(null); // previous downsampled gray frame
-  const screenFrameRef = useRef(null); // { b64, hash, ts } — newest changed frame
-  const lastSentHashRef = useRef(""); // hash already attached to a chat turn
-  const lastPrefetchAtRef = useRef(0); // last background /api/vision warm-up
+  const screenDiffCanvasRef = useRef(null); // 32x24 signature canvas
   const screenFetchBusyRef = useRef(false); // a warm-up fetch is in flight (never queue)
-  const screenNoVideoWarnedRef = useRef(false); // [screen] tick diagnostics, once per share
-  const screenForceAtRef = useRef(0); // last forced capture (small edits can dodge the diff)
-  const lastDescribeMsRef = useRef(0); // last warm-up roundtrip — stretches the prefetch gap adaptively
+  const lastSentHashRef = useRef(""); // hash of the frame attached to the last turn
   // VAD state — thresholds/initial values come from CFG (env-driven).
   const vadRef = useRef({
     noise: CFG.vadNoiseFloor, // adaptive ambient floor (updated when idle)
@@ -276,39 +277,194 @@ export default function App() {
     setSpeaking(false);
   }, []);
 
-  /* ---- screen share: capture + change detection + Qwen2.5-VL warm-up ----
-     Latency design: the vision call NEVER sits on the reply's critical path
-     more than once. While sharing, a 1.2 s loop downsamples each capture to
-     32x24 gray and compares block-wise; only a real change produces a new
-     JPEG, which is sent to /api/vision in the BACKGROUND (warm cache) so the
-     description is ready before the user even asks. submitChat then attaches
-     the freshest frame+hash; the server answers from cache instantly. */
-  const stopScreenShare = useCallback(() => {
-    sharingRef.current = false;
-    setSharing(false);
+  /* ---- push-to-see: hold the button → capture → describe → auto-send ----
+     Latency design (replaces the continuous 1.2 s screen-share loop):
+     1. Press  → getDisplayMedia ONCE per hold; a 400 ms capture loop grabs
+        frames immediately (NO change-detection — the user IS the trigger).
+     2. Every captured frame goes to /api/vision in the BACKGROUND with a
+        unique hash, so the Qwen2.5-VL describe runs WHILE the user is still
+        holding/talking. The last warm-up's result stays in the server cache.
+     3. Release (or 5 s cap) → the FRESHEST frame is attached to the turn as
+        {screen: {image, hash, wait_ms}}. The server peeks its warm cache
+        (usually a HIT from step 2) and only pays OCR inline — the VLM
+        description is rarely on the critical path.
+     4. The stream stops the moment the turn is sent — zero GPU/network cost
+        while the user is NOT pressing, unlike the always-on loop. */
+  const stopScreenCapture = useCallback(() => {
+    pushActiveRef.current = false;
+    if (pushTimerRef.current) { clearTimeout(pushTimerRef.current); pushTimerRef.current = 0; }
     if (screenTickRef.current) { clearInterval(screenTickRef.current); screenTickRef.current = 0; }
     const stream = screenStreamRef.current;
     if (stream) stream.getTracks().forEach((t) => t.stop());
     screenStreamRef.current = null;
     const vid = screenVideoRef.current;
     if (vid) { try { vid.srcObject = null; } catch { /* noop */ } }
-    screenFrameRef.current = null;
-    screenDiffRef.current = null;
-    lastSentHashRef.current = "";
-    screenFetchBusyRef.current = false;
+    sharingRef.current = false;
+    pushFrameRef.current = null;
+    setSharing(false);
   }, []);
 
-  /* One capture tick: downsample -> change detect -> encode JPEG on change ->
-     background warm-up call. Runs every CFG.screenTickMs while sharing. */
-  const screenTick = () => {
+  /* One capture tick while the button is held: grab the frame NOW (no diff
+     gate — during a hold every tick is a deliberate capture) and warm the
+     vision cache in the background. Never queues: one in-flight fetch max. */
+  const pushCaptureTick = () => {
     const vid = screenVideoRef.current;
-    if (!vid || !sharingRef.current || !vid.videoWidth) {
-      if (sharingRef.current && !screenNoVideoWarnedRef.current) {
-        screenNoVideoWarnedRef.current = true;
-        console.warn("[screen] tick skipped — video not ready (videoWidth=0). If this persists, the capture stream died.");
+    if (!vid || !pushActiveRef.current) return;
+    if (!vid.videoWidth) {
+      // The video element needs a moment after .play() — retry quickly instead
+      // of silently dropping the whole hold's warm-up window.
+      if (pushRetryRef.current < 10) {
+        pushRetryRef.current += 1;
+        setTimeout(pushCaptureTick, 100);
       }
       return;
     }
+    if (!screenCanvasRef.current) {
+      screenCanvasRef.current = document.createElement("canvas");
+      screenDiffCanvasRef.current = document.createElement("canvas");
+      screenDiffCanvasRef.current.width = 32;
+      screenDiffCanvasRef.current.height = 24;
+    }
+    // encode at 960px/q0.65 — OCR-grade quality, ~2x smaller upload than 1280
+    const scale = Math.min(1, 960 / vid.videoWidth);
+    const c = screenCanvasRef.current;
+    c.width = Math.round(vid.videoWidth * scale);
+    c.height = Math.round(vid.videoHeight * scale);
+    c.getContext("2d").drawImage(vid, 0, 0, c.width, c.height);
+    const b64 = c.toDataURL("image/jpeg", 0.65).split(",")[1];
+    // per-tick signature — each distinct screen state gets its own cache key,
+    // so the LAST tick's describe is always the freshest one in the cache
+    const dctx = screenDiffCanvasRef.current.getContext("2d", { willReadFrequently: true });
+    dctx.drawImage(vid, 0, 0, 32, 24);
+    const px = dctx.getImageData(0, 0, 32, 24).data;
+    let sig = 0;
+    for (let i = 0, j = 0; i < 32 * 24; i++, j += 4) {
+      sig = (sig * 31 + ((px[j] * 299 + px[j + 1] * 587 + px[j + 2] * 114) / 1000)) | 0;
+    }
+    const hash = `p${sig >>> 0}`;
+    pushFrameRef.current = { b64, hash, ts: Date.now() };
+    // Dedupe: an unchanged screen during a hold has the SAME hash — re-POSTing
+    // it would only burn GPU re-describing (or OCR-ing) identical pixels. Warm
+    // each DISTINCT screen state once per hold.
+    if (hash === pushWarmedHashRef.current || screenFetchBusyRef.current) return;
+    pushWarmedHashRef.current = hash;
+    screenFetchBusyRef.current = true;
+    const t0 = performance.now();
+    fetch(VISION_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: b64, hash }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => j && console.info(
+        `[vision] hold warm-up ${j.cached ? "HIT" : "FILLED"} (${Math.round(performance.now() - t0)}ms)`,
+      ))
+      .catch(() => {})
+      .finally(() => { screenFetchBusyRef.current = false; });
+  };
+
+  const startPushCapture = useCallback(async () => {
+    if (sharingRef.current || pushActiveRef.current) return;
+    if (!CFG.visionEnabled) {
+      showError("सर्वर पर vision चालू नहीं है — .env में VISION_BACKEND जाँचें।");
+      return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      showError("इस ब्राउज़र में स्क्रीन कैप्चर उपलब्ध नहीं है — Chrome/Edge आज़माएँ।");
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 5 }, audio: false,
+      });
+      const vid = document.createElement("video");
+      vid.srcObject = stream;
+      vid.muted = true;
+      vid.playsInline = true;
+      await vid.play().catch(() => {});
+      screenStreamRef.current = stream;
+      screenVideoRef.current = vid;
+      sharingRef.current = true;
+      pushActiveRef.current = true;
+      pushStartRef.current = performance.now();
+      pushWarmedHashRef.current = "";
+      pushRetryRef.current = 0;
+      setSharing(true);
+      // first frame IMMEDIATELY, then every pushTickMs until release/cap
+      pushCaptureTick();
+      screenTickRef.current = setInterval(pushCaptureTick, CFG.pushTickMs);
+      // hard cap: a held button auto-sends anyway ("not more than 5 sec")
+      pushTimerRef.current = setTimeout(() => {
+        if (pushActiveRef.current) {
+          console.info("[push] hold exceeded max — auto-sending");
+          apiRef.current.releasePush();
+        }
+      }, CFG.pushMaxMs);
+      stream.getVideoTracks()[0]?.addEventListener("ended", () => {
+        // user hit the browser's "Stop sharing" — cancel the hold silently
+        stopScreenCapture();
+      });
+    } catch (e) {
+      if (e && e.name === "NotAllowedError") {
+        showError("स्क्रीन कैप्चर की अनुमति नहीं मिली — दोबारा कोशिश करें और 'Share' दबाएँ।");
+      } else {
+        showError("स्क्रीन कैप्चर शुरू नहीं हो पाया: " + (e.message || e.name));
+      }
+      console.warn("[push] getDisplayMedia failed:", e);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stopScreenCapture]);
+
+  /* Release the held button: stop capturing, attach the freshest frame to a
+     turn. With no typed text the turn IS the screen — "इस स्क्रीन के बारे में
+     बताओ" so the tutor describes what it sees. With text (or a live mic
+     transcript in flight) the frame rides along as context. */
+  const releasePush = useCallback(() => {
+    if (!pushActiveRef.current) return;
+    pushActiveRef.current = false;
+    if (pushTimerRef.current) { clearTimeout(pushTimerRef.current); pushTimerRef.current = 0; }
+    if (screenTickRef.current) { clearInterval(screenTickRef.current); screenTickRef.current = 0; }
+    const heldMs = Math.round(performance.now() - pushStartRef.current);
+    const frame = pushFrameRef.current;
+    pushFrameRef.current = null;
+    const stream = screenStreamRef.current;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    screenStreamRef.current = null;
+    const vid = screenVideoRef.current;
+    if (vid) { try { vid.srcObject = null; } catch { /* noop */ } }
+    sharingRef.current = false;
+    setSharing(false);
+    if (!frame) {
+      console.warn("[push] released after " + heldMs + "ms but no frame was captured");
+      return;
+    }
+    console.info(`[push] hold ${heldMs}ms -> turn with frame (${Math.round(frame.b64.length * 3 / 4 / 1024)} KB, hash ${frame.hash})`);
+    lastSentHashRef.current = frame.hash;
+    // If the release-instant frame was NEVER warmed (identical-frame dedupe,
+    // dropped fetch, or a very short tap), describe it now. NOT forced: a
+    // cache-first call piggybacks on any in-flight describe of the same hash
+    // (which the turn's wait_ms then waits on) and costs 0 ms if a previous
+    // hold already described these exact pixels.
+    if (frame.hash !== pushWarmedHashRef.current) {
+      fetch(VISION_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: frame.b64, hash: frame.hash }),
+      }).catch(() => {});
+    }
+    // wait_ms: the release-time warm-up (if one is in flight for THIS hash)
+    // gets up to 2 s to land before the server falls back to recent context.
+    const text = (input || "").trim() || "इस स्क्रीन के बारे में बताओ — क्या दिख रहा है?";
+    setInput("");
+    submitPushChat(text, frame, heldMs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input]);
+
+  /* One capture tick (legacy continuous mode): downsample -> change detect ->
+     encode JPEG on change -> background warm-up call. */
+  const screenTick = () => {
+    const vid = screenVideoRef.current;
+    if (!vid || !sharingRef.current || !vid.videoWidth) return;
     if (!screenCanvasRef.current) {
       screenCanvasRef.current = document.createElement("canvas");
       screenDiffCanvasRef.current = document.createElement("canvas");
@@ -319,71 +475,40 @@ export default function App() {
     const dctx = screenDiffCanvasRef.current.getContext("2d", { willReadFrequently: true });
     dctx.drawImage(vid, 0, 0, 32, 24);
     const px = dctx.getImageData(0, 0, 32, 24).data;
-    const gray = new Uint8Array(32 * 24);
-    let sig = 0;
-    for (let i = 0, j = 0; i < gray.length; i++, j += 4) {
-      gray[i] = (px[j] * 299 + px[j + 1] * 587 + px[j + 2] * 114) / 1000;
-      sig = (sig * 31 + gray[i]) | 0;
+    let prevSig = 0;
+    for (let i = 0, j = 0; i < 32 * 24; i++, j += 4) {
+      prevSig = (prevSig * 31 + ((px[j] * 299 + px[j + 1] * 587 + px[j + 2] * 114) / 1000)) | 0;
     }
-    // 2) block-diff vs previous frame — cursor blinks / tiny animations stay silent
-    const prev = screenDiffRef.current;
-    let changed = !prev;
-    if (prev) {
-      let diff = 0;
-      for (let i = 0; i < gray.length; i++) diff += Math.abs(gray[i] - prev[i]);
-      changed = diff > 320; // ~0.4% of the frame fully flipped
-    }
-    screenDiffRef.current = gray;
-    // Small but meaningful changes (a few edited words) can slip under the
-    // diff threshold and leave the tutor blind. Force a capture every 10 s
-    // so context can never lag further behind than that.
-    const forced = Date.now() - screenForceAtRef.current >= 10000;
-    if (forced) screenForceAtRef.current = Date.now();
-    if (!changed && !forced) return;
+    // 2) skip if the screen looks identical to the last warm-up (cursor blinks
+    //    etc. still sneak through — the hash makes the server cache absorb them)
+    const hash = `s${prevSig >>> 0}`;
+    if (hash === lastSentHashRef.current && !screenFetchBusyRef.current) return;
     // 3) encode the real frame (max 1280px wide, q0.7 ≈ 100-250 KB)
-    const hash = `s${sig >>> 0}`;
     const scale = Math.min(1, 1280 / vid.videoWidth);
     const c = screenCanvasRef.current;
     c.width = Math.round(vid.videoWidth * scale);
     c.height = Math.round(vid.videoHeight * scale);
     c.getContext("2d").drawImage(vid, 0, 0, c.width, c.height);
     const b64 = c.toDataURL("image/jpeg", 0.7).split(",")[1];
-    screenFrameRef.current = { b64, hash, ts: Date.now() };
     // 4) background warm-up: describe the NEW screen now so the reply later
     //    hits the server cache and pays ZERO vision latency.
-    //    NEVER queue: a local VLM takes 7-15 s per screen, so firing one fetch
-    //    per change while the screen keeps changing piles up stale requests
-    //    (the 25s→53s queue growth). One in-flight fetch max — if a newer
-    //    frame arrives mid-flight, the next tick sends THAT frame instead.
-    const now = Date.now();
-    // Adaptive gap: a slow local describe stretches its own spacing
-    // (max(prefetchMs, last roundtrip x 1.5)) so warm-ups never queue behind
-    // themselves; fast describes keep the tight configured cadence.
-    const prefetchGap = Math.max(CFG.screenPrefetchMs, Math.min(lastDescribeMsRef.current * 1.5, 20000));
-    if (
-      now - lastPrefetchAtRef.current >= prefetchGap &&
-      !screenFetchBusyRef.current
-    ) {
-      lastPrefetchAtRef.current = now;
-      screenFetchBusyRef.current = true;
-      const t0 = performance.now();
-      fetch(VISION_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: b64, hash }),
-      })
-        .then((r) => (r.ok ? r.json() : null))
-        .then((j) => j && console.info(`[vision] warm cache ${j.cached ? "HIT" : "FILLED"} (${(j.description || "").length} chars, ${Math.round(performance.now() - t0)}ms)`))
-        .catch(() => {})
-        .finally(() => {
-          screenFetchBusyRef.current = false;
-          lastDescribeMsRef.current = performance.now() - t0;
-        });
-    }
+    //    NEVER queue: a local VLM takes 7-15 s per screen. One in-flight max.
+    if (screenFetchBusyRef.current) return;
+    screenFetchBusyRef.current = true;
+    const t0 = performance.now();
+    fetch(VISION_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: b64, hash }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => j && console.info(`[vision] warm cache ${j.cached ? "HIT" : "FILLED"} (${(j.description || "").length} chars, ${Math.round(performance.now() - t0)}ms)`))
+      .catch(() => {})
+      .finally(() => { screenFetchBusyRef.current = false; });
   };
 
   const startScreenShare = useCallback(async () => {
-    if (sharingRef.current) { stopScreenShare(); return; }
+    if (sharingRef.current) return;
     if (!CFG.visionEnabled) {
       showError("सर्वर पर vision चालू नहीं है — .env में VISION_BACKEND जाँचें।");
       return;
@@ -403,13 +528,21 @@ export default function App() {
       await vid.play().catch(() => {});
       screenStreamRef.current = stream;
       screenVideoRef.current = vid;
-      screenDiffRef.current = null;
       lastSentHashRef.current = "";
       sharingRef.current = true;
       setSharing(true);
-      screenNoVideoWarnedRef.current = false;
-      console.info("[screen] capture loop started (tick " + CFG.screenTickMs + "ms)");
-      stream.getVideoTracks()[0]?.addEventListener("ended", stopScreenShare); // user hit "Stop sharing"
+      console.info("[screen] legacy continuous capture loop started (tick " + CFG.screenTickMs + "ms)");
+      stream.getVideoTracks()[0]?.addEventListener("ended", () => {
+        // user hit "Stop sharing" — tear the loop down
+        const s = screenStreamRef.current;
+        if (s) s.getTracks().forEach((t) => t.stop());
+        screenStreamRef.current = null;
+        const v = screenVideoRef.current;
+        if (v) { try { v.srcObject = null; } catch { /* noop */ } }
+        if (screenTickRef.current) { clearInterval(screenTickRef.current); screenTickRef.current = 0; }
+        sharingRef.current = false;
+        setSharing(false);
+      }); // user hit "Stop sharing"
       screenTickRef.current = setInterval(screenTick, CFG.screenTickMs);
     } catch (e) {
       // VISIBLE failures: a swallowed NotAllowedError made users believe the
@@ -422,7 +555,7 @@ export default function App() {
       console.warn("[screen] getDisplayMedia failed:", e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stopScreenShare]);
+  }, []);
 
   /* Capture the screen RIGHT NOW (used at question time so the tutor always
      sees the screen as it is when you ask — never a stale cached frame).
@@ -457,7 +590,7 @@ export default function App() {
 
   /* ---- submit a new user turn ---- */
   const submitChat = useCallback(
-    (rawText) => {
+    (rawText, screenFrame = null) => {
       const text = (rawText || "").trim();
       if (!text) return;
       hardStop();
@@ -467,8 +600,9 @@ export default function App() {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== 1) {
         if (ws && ws.readyState === 0) {
-          // Socket is reconnecting: wait 350ms and retry rather than dropping turn
-          setTimeout(() => submitChat(rawText), 350);
+          // Socket is reconnecting: wait 350ms and retry rather than dropping
+          // turn — the attached screen frame rides along on the retry too.
+          setTimeout(() => submitChat(rawText, screenFrame), 350);
           return;
         }
         showError("सर्वर कनेक्शन नहीं है — रुकिए, फिर से पूछिए।");
@@ -483,18 +617,25 @@ export default function App() {
       assistantTextRef.current = "";
       setTyping(true);
       const payload = { type: "chat", text, history: historyRef.current, nfe_step: CFG.chatStep };
-      // Screen understanding: while sharing, attach the newest CHANGED frame.
-      // The server describes it cache-first by hash — a warm cache means the
-      // LLM starts with screen context at ZERO extra vision latency.
-      if (sharingRef.current) {
-        // PRODUCTION RULE: capture at question time — the tutor always sees
-        // the screen as it is RIGHT NOW, automatically. No keyword triggers,
-        // no stale frames. Same pixels reuse the server's cached OCR (0 ms);
-        // changed pixels get fresh OCR inline (~0.5-1 s GPU).
+      // Push-to-see: the held button already captured + warmed the frame.
+      // Attach it (with wait_ms) so the server waits briefly for the in-flight
+      // describe instead of answering blind. Legacy continuous-share path
+      // (CFG.pushMode off) still captures at question time below.
+      if (screenFrame) {
+        payload.screen = {
+          image: screenFrame.b64,
+          hash: screenFrame.hash,
+          wait_ms: 2000, // release-time warm-up gets a bounded window to land
+        };
+        console.info(
+          `[screen] push frame attached (${Math.round(screenFrame.b64.length * 3 / 4 / 1024)} KB, hash ${screenFrame.hash}, hold ${screenFrame.heldMs}ms)`,
+        );
+      } else if (!CFG.pushMode && sharingRef.current) {
+        // PRODUCTION RULE (legacy continuous mode): capture at question time —
+        // the tutor always sees the screen as it is RIGHT NOW, automatically.
         const shot = grabScreen();
         if (shot) {
           payload.screen = shot;
-          screenFrameRef.current = { b64: shot.b64, hash: shot.hash, ts: Date.now() };
           lastSentHashRef.current = shot.hash;
           console.info(`[screen] frame attached to turn (${Math.round(shot.b64.length * 3 / 4 / 1024)} KB, hash ${shot.hash})`);
         } else {
@@ -506,10 +647,21 @@ export default function App() {
     [hardStop]
   );
 
+  /* Push-to-see turn: text + the frame captured during the hold. */
+  const submitPushChat = useCallback(
+    (text, frame, heldMs) => submitChat(text, { ...frame, heldMs }),
+    [submitChat],
+  );
+
   apiRef.current = {
     submitChat,
     hardStop,
-    toggleScreenShare: () => (sharingRef.current ? stopScreenShare() : startScreenShare()),
+    // Push-to-see: press starts a capture session, release sends the turn.
+    startPush: () => startPushCapture(),
+    releasePush: () => releasePush(),
+    pushActiveRef,
+    // Legacy continuous-share toggle (SCREEN_PUSH_MODE=0)
+    toggleScreenShare: () => startPushCapture(),
     setSpeaking: (v) => {
       speakingRef.current = v;
       setSpeaking(v);
@@ -1413,8 +1565,31 @@ export default function App() {
               {/* composer */}
               <div className="flex items-center gap-2 border-t border-slate-100 p-3">
                 <button
-                  onClick={() => apiRef.current.toggleScreenShare && apiRef.current.toggleScreenShare()}
-                  title={sharing ? "स्क्रीन शेयर बंद करें" : "स्क्रीन शेयर करें — मैं देखकर समझाऊँगा"}
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    if (!CFG.pushMode) {
+                      // legacy continuous mode: press toggles the share loop
+                      if (sharingRef.current) stopScreenCapture();
+                      else startScreenShare();
+                      return;
+                    }
+                    apiRef.current.startPush && apiRef.current.startPush();
+                  }}
+                  onPointerUp={() => {
+                    if (CFG.pushMode && apiRef.current.pushActiveRef?.current) {
+                      apiRef.current.releasePush();
+                    }
+                  }}
+                  onPointerLeave={() => {
+                    // pointer slid off while held — still release (prevents a stuck hold)
+                    if (CFG.pushMode && apiRef.current.pushActiveRef?.current) {
+                      apiRef.current.releasePush();
+                    }
+                  }}
+                  onContextMenu={(e) => e.preventDefault()}
+                  title={CFG.pushMode
+                    ? "दबाकर रखें — मैं स्क्रीन देखूँगा; छोड़ते ही सवाल भेज दूँगा (ज़्यादा से ज़्यादा 5 सेकंड)"
+                    : sharing ? "स्क्रीन शेयर बंद करें" : "स्क्रीन शेयर करें — मैं देखकर समझाऊँगा"}
                   disabled={!CFG.visionEnabled}
                   className={`flex h-11 w-11 items-center justify-center rounded-full shadow-md transition disabled:opacity-40 ${
                     sharing
@@ -1473,8 +1648,8 @@ export default function App() {
               <p className="flex items-center gap-1.5 text-[11px] text-slate-400">
                 {sharing ? (
                   <>
-                    <FaDesktop className="h-3 w-3 text-emerald-500" />
-                    स्क्रीन देख रहा हूँ — बदलाव पर नए सवाल का जवाब तुरंत मिलेगा
+                    <FaDesktop className="h-3 w-3 animate-pulse text-emerald-500" />
+                    दबाकर रखें — छोड़ते ही जवाब आएगा (max 5 सेकंड)
                   </>
                 ) : (
                   <>
