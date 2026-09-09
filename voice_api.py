@@ -1173,6 +1173,13 @@ def _screen_layers(client_hash: str = "", image_b64: str = "", wait_s: float | N
         # the abandoned run's result still lands in the OCR cache for the
         # next turn). Cheap OCR carries the exact text ground truth inline;
         # slow environments fall through to background-only automatically.
+        #
+        # COLD-START RETRY: the FIRST OCR after boot pays the engine's lazy
+        # init (~3-7 s on CPU), so the first inline attempt ALWAYS times out —
+        # but the abandoned run warms the engine, and a SECOND immediate
+        # attempt then completes in ~100-300 ms. Retry once inside the same
+        # 300 ms gate so turn #1 keeps its exact on-screen text instead of
+        # shipping VLM-only context.
         result_holder: dict = {}
 
         def _run_ocr() -> None:
@@ -1181,16 +1188,28 @@ def _screen_layers(client_hash: str = "", image_b64: str = "", wait_s: float | N
             except Exception:  # noqa: BLE001 — OCR must never break a reply
                 pass
 
-        t = threading.Thread(target=_run_ocr, daemon=True)
-        t.start()
-        t.join(timeout=0.3)  # 300 ms hard limit
-        if t.is_alive():
-            log.warning("Inline OCR exceeded 300ms, falling back to background")
+        for attempt in (1, 2):
+            t = threading.Thread(target=_run_ocr, daemon=True)
+            t.start()
+            t.join(timeout=0.3)  # 300 ms hard limit per attempt
+            if not t.is_alive():
+                ocr = result_holder.get("text", "")
+                break
+            if attempt == 1:
+                # Winner still running (engine init or slow first pass) — wait
+                # a moment for the abandoned run's result, then try once more.
+                t.join(timeout=6.0)
+                if result_holder.get("text"):
+                    with _ocr_lock:
+                        if _ocr_cache["hash"] == client_hash and _ocr_cache["text"]:
+                            ocr = _ocr_cache["text"]
+                            break
+                    log.warning("Inline OCR attempt 1 exceeded budget; retrying once (engine may have been cold)")
+        else:
+            log.warning("Inline OCR exceeded 300ms twice, falling back to background")
             threading.Thread(
                 target=_warm_screen_ocr, args=(image_b64, client_hash), daemon=True
             ).start()
-        else:
-            ocr = result_holder.get("text", "")
     return {"ocr": ocr, "desc": desc, "model": model_used}
 
 
@@ -2321,18 +2340,33 @@ async def ws_tts(websocket: WebSocket):
                                 }
                             else:
                                 # A frame ARRIVED, so the user IS sharing — never let
-                                # the tutor say "share your screen". Tell the LLM the
-                                # analysis is still warming and it should ask the user
-                                # to repeat in a moment; the background warmers below
-                                # fill both layers for the very next turn.
-                                log.info(
-                                    "WS chat: screen frame received but analysis pending — "
-                                    "using pending-context block"
+                                # the tutor say "share your screen". First try the
+                                # recent cached context (a describe from seconds ago
+                                # is far better than a pending dead-end — and for
+                                # push auto-ask turns it is the CORRECT context: the
+                                # screen usually hasn't changed since the last
+                                # describe). Only when there is truly nothing do we
+                                # tell the LLM analysis is still warming.
+                                recent = await asyncio.get_running_loop().run_in_executor(
+                                    None, _recent_screen_block
                                 )
-                                messages[0] = {
-                                    "role": "system",
-                                    "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_PENDING_TMPL,
-                                }
+                                if recent:
+                                    log.info(
+                                        "WS chat: frame layers empty — using recent cached screen context instead of pending dead-end"
+                                    )
+                                    messages[0] = {
+                                        "role": "system",
+                                        "content": LLM_SYSTEM_PROMPT + "\n\n" + recent,
+                                    }
+                                else:
+                                    log.info(
+                                        "WS chat: screen frame received but analysis pending — "
+                                        "using pending-context block"
+                                    )
+                                    messages[0] = {
+                                        "role": "system",
+                                        "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_PENDING_TMPL,
+                                    }
                             # VLM summary cold → describe in background for the
                             # next turn (reply already has fresh OCR text).
                             # NOT force=True: a per-turn forced re-describe burns

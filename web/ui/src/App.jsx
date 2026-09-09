@@ -1096,9 +1096,10 @@ export default function App() {
           // NOW. The authoritative "final" follows and reconciles.
           if (!asrBusyRef.current) return; // stale spec after a watchdog release — ignore
           const t = (m.text || "").trim();
-          if (pushActiveRef.current) {
-            // Holding X: ABSORB the question — it becomes the push turn's text
-            // on release instead of firing a screenless reply now.
+          if (pushActiveRef.current || pushReleasePendingRef.current) {
+            // Holding X (or just released, turn assembling): ABSORB the
+            // question — it becomes the push turn's text on release instead of
+            // firing a screenless reply now.
             if (t) pushTextRef.current = (pushTextRef.current ? pushTextRef.current + " " : "") + t;
             asrBusyRef.current = false;
             specSentFor = "";
@@ -1123,6 +1124,15 @@ export default function App() {
           if (pushActiveRef.current) {
             // Holding X: absorb the beam final too (replaces/merges with the
             // speculative guess) — no turn until the key comes up.
+            if (t) pushTextRef.current = (pushTextRef.current ? pushTextRef.current + " " : "") + t;
+            specSentFor = "";
+            setInterim("");
+            return;
+          }
+          if (pushReleasePendingRef.current) {
+            // X was JUST released but the turn is still assembling (waiting
+            // for the first frame). Attach this transcript to the push turn's
+            // text instead of firing a separate screenless reply now.
             if (t) pushTextRef.current = (pushTextRef.current ? pushTextRef.current + " " : "") + t;
             specSentFor = "";
             setInterim("");
