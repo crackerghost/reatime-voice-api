@@ -1,0 +1,16 @@
+# Taste
+- Prefers thorough, full-file explanations when asked to explain code — reads the entire file (not just the referenced line) and provides a structured, comprehensive walkthrough. Confidence: 0.6
+- Values candid, professional architectural critique over reassurance — explicitly asks what a senior developer would have done differently and wants honest assessment of structural flaws. Confidence: 0.7
+- Deployment target is a single NVIDIA T4 / any 16GB GPU, so recommendations should assume that VRAM budget and quantify latency against it. Confidence: 0.6
+- Wants concrete, quantified performance estimates (per-stage latency budgets in ms) rather than vague or hand-wavy answers. Confidence: 0.6
+- Keeps the LLM on a remote/cloud provider (Groq) rather than hosting it locally on the GPU, reserving local VRAM for TTS/ASR/VLM — architecture advice should respect that split. Confidence: 0.6
+- Targets sub-1s first-audio latency for realtime voice; evaluates architecture recommendations against that latency SLO. Confidence: 0.6
+- Wants architecture advice to deeply and proactively search for overlooked bottlenecks and fundamental protocol/topology changes (such as WebRTC), rather than stopping at obvious configuration and code-path optimizations. Confidence: 0.7
+- Presents their own architecture proposals and expects the assistant to critique/correct them honestly, compare them against the assistant's approach, and synthesize a merged "best of both" design rather than a one-sided answer. Confidence: 0.7
+- Committed to a fully open-source, locally-hosted stack — rejects proprietary/cloud SaaS components (e.g. Cartesia, ElevenLabs, Deepgram) and wants open-source self-hosted alternatives; the LLM is the only component allowed as a cloud API. Confidence: 0.8
+- Willing to accept ~1.5s first-audio latency as workable (relaxing from the sub-1s target) as long as the silence gap can be masked, rather than chasing sub-1s at any cost. Confidence: 0.7
+- Values perceived-latency UX techniques — specifically pre-generated filler/backchannel phrases in the cloned voice played instantly at turn end to mask processing time and make responses feel realtime. Confidence: 0.7
+- When optimizing for latency, deprioritizes perceived-latency masking (fillers) and wants to reduce real first-audio latency within the existing toolset (e.g., OmniVoice kept fixed) via pipeline overlap, streaming, and speculative endpointing rather than swapping components. Confidence: 0.6
+- Wants implementation work done properly and to a professional standard ("be a professional AI developer") — careful, verified changes rather than quick or hacky edits. Confidence: 0.6
+- Cares about robustness (correctness under load: race conditions, bounded queues, interruptibility, admission control) as an explicit goal alongside raw latency when optimizing realtime systems — not just first-response speed. Confidence: 0.5
+- Gives terse go-aheads ("ok do it") to delegate implementation and expects the assistant to proceed with the full recommended plan rather than re-confirming each step. Confidence: 0.4

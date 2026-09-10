@@ -644,6 +644,11 @@ export default function App() {
       framesRef.current = 0;
       turnStartRef.current = performance.now(); // browser-measured first-audio latency
       activeRef.current = false;
+      // SELF-BARGE-IN GUARD: hardStop() just stopped the mic's echo gate; the
+      // barge path sees speakingRef=false but an old VAD burst can STILL fire
+      // hardStop again AFTER this submission, killing the turn server-side
+      // (0 frames, silent reply). Latch barge-in for a moment so our own turn
+      // can never cut itself off (a real user interrupt re-arms it via text).
       openAssistantId.current = null;
       assistantTextRef.current = "";
       setTyping(true);
@@ -1322,7 +1327,14 @@ export default function App() {
       }
 
       // ---- BARGE-IN (real sustained speech cuts the assistant) --------
-      if (assistantBusy && !v.bargeLatched) {
+      // Grace window: for ~1.2 s after WE submit a turn, ignore barge-in —
+      // the tail of the user's own just-ended utterance (or its echo) can
+      // otherwise kill the turn server-side and the reply comes back EMPTY
+      // (the mysterious 0-frame replies). Real interrupts still work: 1.2 s
+      // is shorter than the first TTS window, and sustained speech AFTER the
+      // grace cuts normally.
+      const bargeGrace = turnStartRef.current && (performance.now() - turnStartRef.current) < 1200;
+      if (assistantBusy && !bargeGrace && !v.bargeLatched) {
         const enough =
           (v.textHeard && v.hotTicks >= textTicks) || v.strongTicks >= failsafeTicks;
         if (enough) {

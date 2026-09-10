@@ -1175,12 +1175,14 @@ def _screen_layers(client_hash: str = "", image_b64: str = "", wait_s: float | N
         # slow environments fall through to background-only automatically.
         #
         # COLD-START RETRY: the FIRST OCR after boot pays the engine's lazy
-        # init (~3-7 s on CPU), so the first inline attempt ALWAYS times out —
-        # but the abandoned run warms the engine, and a SECOND immediate
-        # attempt then completes in ~100-300 ms. Retry once inside the same
-        # 300 ms gate so turn #1 keeps its exact on-screen text instead of
-        # shipping VLM-only context.
+        # init (~3-7 s), so the first inline attempt ALWAYS times out — but
+        # the abandoned run warms the engine, and a SECOND immediate attempt
+        # then completes in ~100-300 ms. IMPORTANT: the retry must never
+        # BLOCK the reply on a genuinely slow engine (CPU OCR can take 3-7 s
+        # per run even warm) — the whole inline path is capped well under a
+        # second; anything slower falls through to background-only.
         result_holder: dict = {}
+        _inline_ocr_deadline = time.monotonic() + 0.85  # total inline budget
 
         def _run_ocr() -> None:
             try:
@@ -1188,28 +1190,25 @@ def _screen_layers(client_hash: str = "", image_b64: str = "", wait_s: float | N
             except Exception:  # noqa: BLE001 — OCR must never break a reply
                 pass
 
-        for attempt in (1, 2):
-            t = threading.Thread(target=_run_ocr, daemon=True)
-            t.start()
-            t.join(timeout=0.3)  # 300 ms hard limit per attempt
-            if not t.is_alive():
-                ocr = result_holder.get("text", "")
-                break
-            if attempt == 1:
-                # Winner still running (engine init or slow first pass) — wait
-                # a moment for the abandoned run's result, then try once more.
-                t.join(timeout=6.0)
-                if result_holder.get("text"):
-                    with _ocr_lock:
-                        if _ocr_cache["hash"] == client_hash and _ocr_cache["text"]:
-                            ocr = _ocr_cache["text"]
-                            break
-                    log.warning("Inline OCR attempt 1 exceeded budget; retrying once (engine may have been cold)")
+        t = threading.Thread(target=_run_ocr, daemon=True)
+        t.start()
+        t.join(timeout=0.3)  # 300 ms first attempt
+        if t.is_alive():
+            # Cold engine: a retry can't finish either — but if the FIRST run
+            # lands shortly (engine warmed mid-flight), grab its result while
+            # it is still fresh. NEVER join longer than the total budget.
+            t.join(timeout=max(0.0, _inline_ocr_deadline - time.monotonic()))
+            if result_holder.get("text"):
+                ocr = result_holder["text"]
+            elif not t.is_alive():
+                ocr = result_holder.get("text", "")  # finished just past deadline
+            else:
+                log.warning("Inline OCR exceeded budget, falling back to background")
+                threading.Thread(
+                    target=_warm_screen_ocr, args=(image_b64, client_hash), daemon=True
+                ).start()
         else:
-            log.warning("Inline OCR exceeded 300ms twice, falling back to background")
-            threading.Thread(
-                target=_warm_screen_ocr, args=(image_b64, client_hash), daemon=True
-            ).start()
+            ocr = result_holder.get("text", "")
     return {"ocr": ocr, "desc": desc, "model": model_used}
 
 
@@ -1392,20 +1391,37 @@ class _LLMRetryable(Exception):
     """Transient LLM API failure (429/5xx/network) worth retrying."""
 
 
-def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, max_tokens: int | None = None):
-    """Stream LLM tokens and yield complete Devanagari sentences as they finish.
+def _cut_phrase(buf: str, max_chars: int) -> tuple[str, str]:
+    """Cut `buf` at a word boundary within the first `max_chars` characters.
 
-    The LLM effectively does the chunking: each yielded sentence is a TTS
-    chunk, so the first sentence can be spoken while the model is still
-    writing the rest of the reply (kills the "whole reply first, then audio"
-    lag).
+    Returns (phrase, rest). Used to flush a partial phrase to TTS before the
+    LLM has finished the sentence.
+    """
+    window = buf[:max_chars]
+    cut = window.rfind(" ")
+    if cut > 0:
+        return window[:cut].strip(), (window[cut + 1:] + buf[max_chars:]).lstrip()
+    return window.strip(), buf[max_chars:].lstrip()
 
-    Robustness: transient failures (429 rate-limit, 5xx, connect/read
-    timeouts) are retried with backoff while NOTHING has been yielded yet —
-    a mid-stream failure can't be resumed cleanly, so those propagate. An
-    attempt that finishes with ZERO content (reasoning models can burn the
-    whole token budget "thinking") also retries once with double max_tokens
-    before giving up.
+
+def _llm_stream_phrases(
+    key: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int | None = None,
+    phrase_chars: int = FIRST_WINDOW_CHARS,
+):
+    """Stream LLM tokens and yield speakable phrases as soon as they're ready.
+
+    Each item is (text, complete). `complete` is True when the phrase ends at a
+    sentence boundary (। ? ! . \\n); False when it was flushed early at a word
+    boundary because phrase_chars was reached. The first phrase can be fed to
+    TTS before the LLM finishes the sentence — removing the "wait for a full
+    sentence" latency from the first audio window.
+
+    Retry behaviour is unchanged: transient failures are retried with backoff
+    while NOTHING has been yielded yet, and an empty-success attempt is retried
+    once with double max_tokens.
     """
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     total_attempts = 1 + max(0, LLM_RETRIES)
@@ -1452,24 +1468,28 @@ def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, ma
                     if not delta:
                         continue
                     buf += delta
-                    # flush every complete sentence that has finished streaming
                     while True:
                         m = SENT_END_RE.search(buf)
-                        if not m:
-                            break
-                        sent = buf[: m.end()].strip()
-                        buf = buf[m.end():]
-                        if sent:
-                            yielded = True
-                            yield sent
-                    if len(buf) > 200:  # pathological run with no punctuation yet
-                        yielded = True
-                        yield buf.strip()
-                        buf = ""
+                        if m:
+                            sent = buf[: m.end()].strip()
+                            buf = buf[m.end():]
+                            if sent:
+                                yielded = True
+                                yield sent, True
+                            continue
+                        # No sentence boundary yet: flush a partial phrase once
+                        # we have enough text so the first TTS window can start.
+                        if len(buf) >= phrase_chars:
+                            phrase, buf = _cut_phrase(buf, phrase_chars)
+                            if phrase:
+                                yielded = True
+                                yield phrase, False
+                            continue
+                        break
             tail = buf.strip()
             if tail:
                 yielded = True
-                yield tail
+                yield tail, True
             if not yielded:
                 # Stream "succeeded" but produced nothing speakable — treat as
                 # transient (the next attempt gets double tokens) instead of
@@ -1486,7 +1506,6 @@ def _llm_stream_sentences(key: str, messages: list[dict], temperature: float, ma
             time.sleep(retry_wait)
             retry_wait = min(retry_wait * 2, 8.0)
         except httpx.HTTPError as e:
-            # connect/read errors — retryable only if nothing was yielded yet
             if yielded or attempt + 1 >= total_attempts:
                 raise RuntimeError(f"Mistral stream failed: {e}") from e
             attempt += 1
@@ -1526,14 +1545,18 @@ def _convert_numbers_to_hindi(text: str) -> str:
     return re.sub(r"\d+", _repl, text)
 
 
-def _speech_sentence(sent: str) -> str:
-    """Make one streamed sentence speakable (strip markup, convert numbers, Devanagari accent)."""
+def _speech_sentence(sent: str, complete: bool = True) -> str:
+    """Make one streamed phrase speakable (strip markup, convert numbers, Devanagari accent).
+
+    complete=False leaves off the terminal danda/full-stop so a phrase that was
+    flushed early (mid-sentence) doesn't get an artificial full stop.
+    """
     sent = _speechify(sent)
     sent = _convert_numbers_to_hindi(sent)
     sent = _devanagari_only(sent)
     if not sent:
         return ""
-    if sent[-1] not in "।?!.":
+    if complete and sent[-1] not in "।?!.":
         sent += "।" if any("\u0900" <= ch <= "\u097F" for ch in sent) else "."
     return sent
 
@@ -1623,13 +1646,13 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
 
     def llm_producer():
         try:
-            for raw in _llm_stream_sentences(key, messages, temperature):
+            for raw, complete in _llm_stream_phrases(key, messages, temperature):
                 if stop_evt is not None and stop_evt.is_set():
                     return
-                sent = _speech_sentence(raw)
+                sent = _speech_sentence(raw, complete)
                 if not sent or len(sent) <= 2:  # junk like "." or ")." from stray punctuation
                     continue
-                sent_q.put(sent)
+                sent_q.put((sent, complete))
         except Exception as e:  # noqa: BLE001 — reported at the consumer end
             llm_error.append(f"{type(e).__name__}: {e}")
         finally:
@@ -1677,31 +1700,35 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     threading.Thread(target=audio_synth, daemon=True).start()
 
     try:
-        window = []          # sentences buffered for the next audio window
+        window = []          # phrases buffered for the next audio window
         window_chars = 0
         emitted_audio = False
         emitted_text = False  # did the LLM produce ANY speakable sentence?
+        text_buf = ""        # partial phrases pending a complete sentence (caption)
         while True:
-            sent = sent_q.get()
-            if sent is None:
+            item = sent_q.get()
+            if item is None:
                 break  # LLM stream ended (or was stopped)
             if stop_evt is not None and stop_evt.is_set():
                 break
-            sent_count += 1
-            if sent_count > MAX_CHAT_SENTENCES:
-                break  # hard ceiling — never let one turn become a monologue
-            out_q.put(("text", sent))  # text streams live, never behind TTS
-            emitted_text = True
+            text, complete = item
+            if complete:
+                sent_count += 1
+                if sent_count > MAX_CHAT_SENTENCES:
+                    break  # hard ceiling — never let one turn become a monologue
+                caption = (text_buf + " " + text).strip() if text_buf else text
+                out_q.put(("text", caption))  # text streams live, never behind TTS
+                emitted_text = True
+                text_buf = ""
+            else:
+                text_buf = (text_buf + " " + text).strip()
             # Bound window sizes with clause pieces so one long run-on sentence
             # never delays the first frame (units get re-joined inside a window).
-            # Whole sentences feed the audio windows — the LLM decides where
-            # a sentence ends and we never cut mid-thought. Windows ship on
-            # CHARACTER thresholds, never on piece-counts, so short sentences
-            # group into one continuous utterance instead of tiny 2-3 word
-            # chunks that keep interrupting the flow.
-            for piece in _clause_units(sent):
+            # Complete and partial phrases both feed the audio windows; windows
+            # ship on CHARACTER thresholds, so the first window starts as soon as
+            # enough text has streamed instead of waiting for a full sentence.
+            for piece in _clause_units(text):
                 if window and window_chars + len(piece) > WINDOW_CHAR_CAP:
-                    # would overflow -> ship what we have first
                     steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
                     win_q.put({"text": " ".join(window), "steps": steps})
                     window, window_chars = [], 0
@@ -1709,12 +1736,6 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 window.append(piece)
                 window_chars += len(piece)
                 if not emitted_audio:
-                    # HARD CAP for the first window: ship at the first word
-                    # boundary past FIRST_WINDOW_CHARS — the rest carries into
-                    # the next window. This is THE first-audio latency lever:
-                    # a short first window synthesizes in a fraction of the
-                    # time a full sentence needs, and the overflow text is
-                    # never lost (it is spoken in the following window).
                     if window_chars >= FIRST_WINDOW_CHARS:
                         text_to_speak = " ".join(window)
                         if len(text_to_speak) > FIRST_WINDOW_CHARS:
@@ -1726,7 +1747,6 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                                 else:
                                     break
                             if not cut_text:
-                                # single word longer than the cap — speak it whole
                                 cut_text = words[0]
                             remainder = text_to_speak[len(cut_text):].strip()
                             window = remainder.split() if remainder else []
@@ -1737,8 +1757,6 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                         win_q.put({"text": text_to_speak, "steps": min(num_step, FIRST_WINDOW_STEP)})
                         emitted_audio = True
                 else:
-                    # later windows: group until there's enough text for a
-                    # smooth frame (~2-4 short sentences), never a scrap
                     if window_chars >= MIN_WINDOW_CHARS * 2:
                         win_q.put({"text": " ".join(window), "steps": num_step})
                         window, window_chars = [], 0
@@ -2604,6 +2622,11 @@ SILERO_ON_MS = int(os.environ.get("VOICE_SILERO_ON_MS", "150"))          # speec
 # Silence this long closes it. 550ms balances conversational speed and natural
 # pauses without splitting utterances.
 SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "550"))
+# Once silence has lasted this long AND the overlapped early decode has already
+# produced a transcript, close the utterance early instead of waiting the full
+# 550ms. This is the sub-second endpointing lever: the early decode (P2) runs
+# during silence, so its result is usually ready by ~250ms.
+SILERO_SILENCE_MIN_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MIN_MS", "250"))
 SERVER_PRE_ROLL_S = float(os.environ.get("VOICE_SERVER_PRE_ROLL_S", "0.4"))  # kept before the open decision
 MIN_UTT_MS = int(os.environ.get("VOICE_MIN_UTT_MS", "300"))              # shorter utterances are discarded as blips
 
@@ -3050,6 +3073,9 @@ async def ws_asr(websocket: WebSocket):
         early = False        # early decode ran during silence confirmation
         held = None          # that pre-decoded transcript (reused at finish)
         total_at_early = 0   # buffer size when the early decode ran (reuse check)
+        early_thread = None   # background greedy decode started at silence onset
+        in_trailing_silence = False  # silence began: stop buffering trailing silence
+        spec_emitted = False  # speculative transcript already sent for this utterance
         # --- server-side Silero VAD state (used when server_mode is on) ---
         server_mode = False  # flipped by the client's {"type":"mode","vad":"server"}
         vad = None           # lazily created _Silero for this connection
@@ -3066,10 +3092,12 @@ async def ws_asr(websocket: WebSocket):
             path (Silero silence timeout) so both get: early-decode reuse,
             speculative greedy, and the authoritative beam final.
             """
-            nonlocal open_utt, early, held, total_at_early, buf, total, new_since
+            nonlocal open_utt, early, held, total_at_early, buf, total, new_since, spec_emitted
             open_utt = False
             samples = np.concatenate(buf) if total else np.zeros(0, dtype=np.float32)
             dur_s = total / ASR_SR
+            if early and held is None and early_thread is not None:
+                early_thread.join(timeout=0.5)  # wait for the in-flight greedy decode
             reused = early and held is not None and 0 <= total - total_at_early <= int(0.05 * ASR_SR)
             held_text = held or ""
             early = False; held = None; total_at_early = 0
@@ -3105,12 +3133,13 @@ async def ws_asr(websocket: WebSocket):
                         log.exception("ASR decode failed")
                         out_q.put(("error", f"ASR decode failed: {type(e).__name__}: {e}"))
                         return
-                if ASR_SPECULATIVE and final:
+                if ASR_SPECULATIVE and final and not spec_emitted:
+                    spec_emitted = True
                     out_q.put(("speculative", final))
                 out_q.put(("final", final))
                 return
 
-            if ASR_SPECULATIVE:
+            if ASR_SPECULATIVE and not spec_emitted:
                 if reused:
                     spec = held_text
                     log.info("ASR greedy: reused early decode (0.00s on critical path)")
@@ -3122,6 +3151,7 @@ async def ws_asr(websocket: WebSocket):
                     except Exception:  # noqa: BLE001 — greedy is best-effort
                         spec = ""
                 if spec:
+                    spec_emitted = True
                     out_q.put(("speculative", spec))
             try:
                 t = time.perf_counter()
@@ -3132,6 +3162,36 @@ async def ws_asr(websocket: WebSocket):
                 out_q.put(("error", f"ASR decode failed: {type(e).__name__}: {e}"))
                 return
             out_q.put(("final", final))
+
+        def start_early_decode():
+            """Snapshot the speech so far and decode it greedily in the background.
+
+            Runs during the silence confirmation so finish_utterance() can reuse
+            the transcript instead of paying for a greedy decode on the critical
+            path. The VAD loop keeps running while this thread works.
+            """
+            nonlocal early, held, total_at_early, early_thread
+            if early or total < int(0.25 * ASR_SR):
+                return
+            early = True
+            held = None  # a previous (stale) early decode must never leak into this run
+            snap = np.concatenate(buf)
+            total_at_early = total
+
+            def _run():
+                nonlocal held
+                t0 = time.perf_counter()
+                try:
+                    result = _whisper_text(snap)
+                except Exception:  # noqa: BLE001 — best-effort pre-decode
+                    result = None
+                held = result
+                if result:
+                    log.info("ASR early decode: %.2fs for %.2fs audio (overlapped)",
+                             time.perf_counter() - t0, total_at_early / ASR_SR)
+
+            early_thread = threading.Thread(target=_run, daemon=True)
+            early_thread.start()
 
         while not stop_evt.is_set():
             try:
@@ -3157,20 +3217,39 @@ async def ws_asr(websocket: WebSocket):
                                 log.error("Silero unavailable (%s) — falling back to client VAD", e)
                                 server_mode = False
                                 break
-                        if open_utt:
+                        if open_utt and not in_trailing_silence:
                             buf.append(frame)
                             total += len(frame)
                             new_since += len(frame) / ASR_SR
                         p_voice = vad.p(frame)
                         if p_voice >= SILERO_ON_THRESH:
                             speech_run += 32.0; silence_run = 0.0
+                            if open_utt and in_trailing_silence:
+                                # speech resumed — the early decode is now stale
+                                in_trailing_silence = False
+                                early = False
+                                held = None
+                                total_at_early = 0
                         elif p_voice < SILERO_HOLD_THRESH:
                             speech_run = 0.0
                             if open_utt:
                                 silence_run += 32.0
+                                if not in_trailing_silence:
+                                    # first silence frame after speech: stop
+                                    # buffering trailing silence and pre-decode
+                                    # the speech we have
+                                    in_trailing_silence = True
+                                    start_early_decode()
                         else:  # hysteresis band: keep current state, no counters
                             if open_utt:
                                 silence_run = 0.0
+                        # Speculative turn: ship the overlapped greedy transcript as
+                        # soon as it's ready so the client can start the LLM while
+                        # the remaining silence confirmation + beam decode run.
+                        if open_utt and not spec_emitted and early and held:
+                            spec_emitted = True
+                            out_q.put(("speculative", held))
+                            log.info("ASR speculative sent at silence onset (%.0fms)", silence_run)
                         if not open_utt:
                             if speech_run >= SILERO_ON_MS:
                                 if assistant_active:
@@ -3182,6 +3261,11 @@ async def ws_asr(websocket: WebSocket):
                                 total += sum(len(f) for f in pre_roll)
                                 pre_roll.clear()
                                 open_utt = True
+                                in_trailing_silence = False
+                                early = False
+                                held = None
+                                total_at_early = 0
+                                spec_emitted = False
                                 speech_run = 0.0; silence_run = 0.0
                                 last_partial = time.monotonic()
                                 vad.reset()
@@ -3189,6 +3273,11 @@ async def ws_asr(websocket: WebSocket):
                                 log.info("Server VAD: utterance OPENED")
                             else:
                                 pre_roll.append(frame)
+                        elif silence_run >= SILERO_SILENCE_MIN_MS and held:
+                            log.info("Server VAD: utterance CLOSING early after %.0fms silence (early decode ready)", silence_run)
+                            silence_run = 0.0
+                            out_q.put(("vad_end", ""))
+                            finish_utterance("silence")
                         elif silence_run >= SILERO_SILENCE_MS:
                             log.info("Server VAD: utterance CLOSING after %.0fms silence", silence_run)
                             silence_run = 0.0
@@ -3218,10 +3307,14 @@ async def ws_asr(websocket: WebSocket):
                 buf.clear(); total = 0; new_since = 0.0; open_utt = True
                 last_partial = time.monotonic()
                 early = False; held = None; total_at_early = 0
+                in_trailing_silence = False
+                spec_emitted = False
                 continue
             if ctl == "cancel":
                 buf.clear(); total = 0; new_since = 0.0; open_utt = False
                 early = False; held = None; total_at_early = 0
+                in_trailing_silence = False
+                spec_emitted = False
                 continue
             if ctl == "early_end" and open_utt:
                 # Overlap trick (client VAD path): the client reports the moment
@@ -3301,14 +3394,40 @@ def api_vision(req: VisionRequest):
     The browser UI calls this when the screen CHANGES (change detection runs
     client-side), so an idle screen costs nothing and the latest description
     is always warm before the user asks about it.
+
+    Reply-priority: warm-ups are routed through the single vision drain
+    worker, which PAUSES whenever a chat turn is synthesizing — a describe
+    that lands mid-reply used to steal the GPU from TTS window #2 (seen as
+    RTF 1.58 spikes in the logs). The synchronous path is kept ONLY for
+    cache hits and `force` (explicit re-describe) requests.
     """
     global _last_screen_activity
     _last_screen_activity = time.monotonic()
     img = req.image.strip()
     if img.startswith("data:") and "," in img:
         img = img.split(",", 1)[1]
+    if not req.force:
+        # Cache peek first — an already-described screen answers instantly.
+        with _screen_lock:
+            if (
+                _screen_cache["hash"] == req.hash
+                and _screen_cache["desc"]
+                and time.monotonic() - _screen_cache["ts"] < SCREEN_CACHE_TTL
+            ):
+                return {
+                    "description": _screen_cache["desc"], "cached": True,
+                    "model": _screen_cache["model"], "backend": _screen_backend_choice(),
+                }
+        # Not cached: enqueue as the worker's newest job and report
+        # accepted-async. The turn's bounded wait (screen.wait_ms) catches the
+        # result when it lands; the reply NEVER competes with the describe.
+        _warm_screen_cache(img, req.hash, force=False)
+        return {
+            "description": "", "cached": False, "queued": True,
+            "model": "", "backend": _screen_backend_choice(),
+        }
     try:
-        desc, cached, model = _screen_context(img, req.hash, force=req.force)
+        desc, cached, model = _screen_context(img, req.hash, force=True)
     except Exception as e:  # noqa: BLE001 — log the WHY, not just the 503
         log.exception("/api/vision failed: %s", e)
         raise HTTPException(status_code=503, detail=str(e)) from e

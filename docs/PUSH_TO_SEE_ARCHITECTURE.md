@@ -84,6 +84,19 @@ release)**, while the model knows exactly what is on your screen.
    400 ms and ships the *release-instant* frame.
 4. **Privacy** — the screen only leaves the machine while the button is held.
 
+## Live-log regression fixes (second audit, from real T4 logs)
+
+- **Inline OCR total budget capped at 0.85 s** — the earlier cold-start retry
+  could block the reply up to 6 s on a CPU-slow OCR engine
+  (`screen context ready in 5.60s` in the log). Never blocks past ~0.9 s now.
+- **`/api/vision` warm-ups routed through the pausable drain worker** — a
+  describe landing mid-reply used to steal the GPU from TTS window #2
+  (`RTF 1.58` spikes). Warm-ups now PAUSE while a reply synthesizes; only
+  cache hits answer synchronously.
+- **Post-submit barge-in grace (1.2 s)** — the tail of the user's own
+  utterance could barge-in on the turn we just submitted, killing it
+  server-side → the mysterious `0 frame(s)` empty replies.
+
 ## Hardened for lowest latency (audit results)
 
 - **Frame-bearing turns always inject screen context** — the intent regex can
