@@ -256,8 +256,11 @@ def _pick_speed(sent: str, base: float = 1.0) -> float:
     return max(SPEED_MIN, min(SPEED_MAX, round(s, 3)))
 
 
-# ---------- LLM: OpenAI-compatible chat endpoint (default Groq, gpt-oss-120b) ----------
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+# ---------- LLM: OpenAI-compatible chat endpoint (default Groq, gpt-oss-20b) ----------
+# gpt-oss-20b is the fastest model still available on Groq's developer tier
+# (1000 tps). llama-3.3-70b-versatile moved to the Enterprise tier, so it now
+# returns 404 for developer keys — do not use it as the default.
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-20b")
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.6"))
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "550"))
 # gpt-oss models "think" before answering — reasoning tokens count against
@@ -350,11 +353,13 @@ LLM_SYSTEM_PROMPT = (
 # The full persona below is ~2.5 KB -> ~0.3-1 s of LLM prefill before the first
 # token. Default turns use this compact prompt; the full persona is used only
 # when a turn needs it (screen/debug context). VOICE_PROMPT_FILE overrides both.
-LLM_SYSTEM_SHORT = "तुम ‘साथी’ ट्यूटर हो।"
-LLM_SYSTEM_SHORT += " पूरी तरह देवनागरी में लिखो।"
-LLM_SYSTEM_SHORT += " छोटा जवाब: सीधा उत्तर, 2-3 आसान कदम, फिर एक छोटा सवाल। ज़्यादा लेक्चर नहीं।"
-LLM_SYSTEM_SHORT += " टोन बोलचाल वाली हिंग्लिश रखो — अंग्रेज़ी शब्द देवनागरी में लिखो जैसे बोले जाते हैं: वेट, सेकंड, लोड, एक्चुअली, बेसिकली; "
-LLM_SYSTEM_SHORT += "शुद्ध फॉर्मल हिंदी (क्षण, कृपया, आवश्यक, एक पल) कभी नहीं।"
+LLM_SYSTEM_SHORT = (
+    "तुम ‘साथी’ ट्यूटर हो। पूरी तरह देवनागरी में लिखो। "
+    "जवाब छोटा और सीधा रखो — पहले सीधा उत्तर, फिर ज़रूरत हो तो २-३ आसान कदम, आखिर में एक छोटा सवाल। "
+    "लंबा लेक्चर मत दो। टोन बोलचाल वाली हिंग्लिश रखो — अंग्रेज़ी शब्द देवनागरी में लिखो जैसे बोले जाते हैं: वेट, सेकंड, लोड, एक्चुअली, बेसिकली। "
+    "शुद्ध फॉर्मल हिंदी (क्षण, कृपया, आवश्यक, एक पल) कभी नहीं। "
+    "अगर यूज़र सिर्फ़ अभिवादन या हालचाल पूछे (नमस्ते, हाय, कैसे हो, क्या हाल), तो १-२ वाक्य का छोटा स्वाभाविक जवाब दो — कोई स्टडी टिप्स, कोई कदम, कोई टेम्पलेट मत दो।"
+)
 
 # Optional override: point VOICE_PROMPT_FILE at a text file whose contents
 # replace the whole system prompt above (tune the persona without editing code).
@@ -369,6 +374,14 @@ def _system_prompt_for(need_full: bool, block: str | None = None) -> str:
     else:
         base = LLM_SYSTEM_PROMPT if need_full else LLM_SYSTEM_SHORT
     return (base + "\n\n" + block) if block else base
+
+
+def _screen_system_prompt(block: str) -> str:
+    """Screen turns use the COMPACT persona + screen rules, not the full 2.5KB
+    persona, so the LLM prefill stays small. A custom persona is never
+    downgraded."""
+    base = LLM_SYSTEM_PROMPT if _LLM_PERSONA_CUSTOM else LLM_SYSTEM_SHORT
+    return base + "\n\n" + block
 
 
 _PROMPT_FILE = os.environ.get("VOICE_PROMPT_FILE", "")
@@ -885,6 +898,10 @@ def _screen_context(image_b64: str, client_hash: str = "", force: bool = False) 
 # carries the fresh ground truth, so stalling for the slow local VLM (5-7 s)
 # is never worth it.
 VISION_REPLY_WAIT_S = float(os.environ.get("VISION_REPLY_WAIT_S", "0.3"))
+# Hard cap on how long a push-to-see turn may wait for the slow local VLM. The
+# reply is OCR-first now, so a long wait only adds latency without improving
+# accuracy. Keep this small (~500ms) so an in-flight describe can still land.
+SCREEN_WAIT_MAX_S = float(os.environ.get("VOICE_SCREEN_WAIT_MAX_MS", "500")) / 1000.0
 # How old a cached VLM description (of ANY screen) may be and still be used
 # as the visual summary when the CURRENT screen's describe isn't ready. The
 # current screen's exact OCR text still arrives inline in the same block, so
@@ -989,7 +1006,7 @@ _ocr_cache: dict = {"hash": None, "text": "", "ts": 0.0}
 _ocr_pending: dict = {}  # hash -> threading.Event
 _ocr_pending_lock = threading.Lock()
 _OCR_COALESCE_TIMEOUT_S = 20.0
-OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "480"))
+OCR_MAX_SIDE = int(os.environ.get("VISION_OCR_MAX_SIDE", "768"))
 OCR_MAX_LINES = int(os.environ.get("VISION_OCR_MAX_LINES", "60"))
 
 def _cuda_libs_loadable() -> bool:
@@ -1234,7 +1251,9 @@ def _warm_screen_ocr(image_b64: str, client_hash: str = "") -> None:
 SCREEN_CONTEXT_TMPL = (
     "स्क्रीन कॉन्टेक्स्ट — यूज़र अभी अपनी स्क्रीन शेयर कर रहा है और तुम उसे देख सकते हो।\n"
     "नियम:\n"
-    "1) इसे १००% सच मानो — यूज़र को यही दिख रहा है।\n"
+    "1) OCR text सबसे सटीक ground truth है — उसे १००% सच मानो। visual summary सिर्फ़ "
+    "layout/मोटा अंदाज़ा है और ग़लत हो सकता है; अगर दोनों में टकराव हो तो OCR text को "
+    "मानो और visual summary के हिसाब से चीज़ें मत गढ़ो।\n"
     "2) Active tutor बनो: स्क्रीन पर दिख रही चीज़ों को सीधे reference करो — "
     "'आपके कोड में ये undefined दिख रहा है', 'ये लाइन गलत है'। OCR text से exact "
     "शब्द/एरर quote करो।\n"
@@ -1643,11 +1662,14 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     win_q: queue.Queue = queue.Queue()
     llm_error: list[str] = []
     audio_done = threading.Event()
+    producer_stop = threading.Event()  # stop the LLM producer only (graceful small-talk/max cut)
 
     def llm_producer():
         try:
             for raw, complete in _llm_stream_phrases(key, messages, temperature):
                 if stop_evt is not None and stop_evt.is_set():
+                    return
+                if producer_stop.is_set():
                     return
                 sent = _speech_sentence(raw, complete)
                 if not sent or len(sent) <= 2:  # junk like "." or ")." from stray punctuation
@@ -1761,13 +1783,10 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                         win_q.put({"text": " ".join(window), "steps": num_step})
                         window, window_chars = [], 0
                         emitted_audio = True
-            if is_greeting and sent_count >= GREETING_MAX:
-                if stop_evt is not None:
-                    stop_evt.set()  # tell the producer to stop too
-                break
-            if sent_count >= MAX_CHAT_SENTENCES:
-                if stop_evt is not None:
-                    stop_evt.set()  # tell the producer to stop too
+            if (is_greeting and sent_count >= GREETING_MAX) or sent_count >= MAX_CHAT_SENTENCES:
+                # Graceful cut: stop the LLM producer but still speak what is
+                # already buffered. stop_evt is reserved for barge-in (drop).
+                producer_stop.set()
                 break
         if (not emitted_text or (llm_error and not emitted_audio)) and not (stop_evt is not None and stop_evt.is_set()):
             # Always answer out loud — silence reads as "the assistant is broken".
@@ -2228,6 +2247,7 @@ async def ws_tts(websocket: WebSocket):
     stop_evt = threading.Event()
     ctrl: asyncio.Queue = asyncio.Queue()
     busy = [False]  # a generation/chat is currently streaming to this client
+    turn_started = [0.0]  # monotonic time the latest turn started (stop-grace guard)
 
     async def reader():
         try:
@@ -2245,6 +2265,11 @@ async def ws_tts(websocket: WebSocket):
                         pass
                     continue
                 if mtype == "stop":
+                    # Ignore a stale self-barge that fires immediately after a
+                    # fresh turn was submitted (the browser's previous VAD burst
+                    # re-sends hardStop and would otherwise kill this reply).
+                    if busy[0] and time.monotonic() - turn_started[0] < STOP_GRACE_S:
+                        continue
                     stop_evt.set()  # explicit user interrupt
                     continue
                 if busy[0] and (mtype == "chat" or data.get("text")):
@@ -2301,12 +2326,12 @@ async def ws_tts(websocket: WebSocket):
                 screen = data.get("screen") if isinstance(data.get("screen"), dict) else None
                 if screen and str(screen.get("image") or screen.get("b64") or "").strip():
                     need_screen = True
-                # Sub-second latency: SHORT system prompt by default (~100 B vs
-                # ~2.5 KB -> ~0.3-1 s less LLM prefill per turn). The full
-                # persona is used only when the turn actually needs screen/
-                # debug context, or when VOICE_PROMPT_FILE supplied a custom
-                # persona (which must never be silently downgraded).
-                if _LLM_PERSONA_CUSTOM or need_screen:
+                # Sub-second latency: SHORT system prompt by default (~0.5 KB vs
+                # ~2.5 KB -> ~0.3-1 s less LLM prefill per turn). Screen turns
+                # also use the compact persona (the screen rules are appended in
+                # the context block), so only a custom VOICE_PROMPT_FILE keeps
+                # the full persona.
+                if _LLM_PERSONA_CUSTOM:
                     system_prompt = LLM_SYSTEM_PROMPT
                 else:
                     system_prompt = LLM_SYSTEM_SHORT
@@ -2326,7 +2351,7 @@ async def ws_tts(websocket: WebSocket):
                     # Push-to-see turns may ask the server to wait a bit longer
                     # for the describe that the hold-time warm-up started.
                     try:
-                        screen_wait_s = min(max(float(screen.get("wait_ms", 0) or 0) / 1000.0, 0.0), 3.0)
+                        screen_wait_s = min(max(float(screen.get("wait_ms", 0) or 0) / 1000.0, 0.0), SCREEN_WAIT_MAX_S)
                     except (TypeError, ValueError):
                         screen_wait_s = 0.0
                     if img:
@@ -2354,7 +2379,7 @@ async def ws_tts(websocket: WebSocket):
                             if block:
                                 messages[0] = {
                                     "role": "system",
-                                    "content": LLM_SYSTEM_PROMPT + "\n\n" + block,
+                                    "content": _screen_system_prompt(block),
                                 }
                             else:
                                 # A frame ARRIVED, so the user IS sharing — never let
@@ -2374,7 +2399,7 @@ async def ws_tts(websocket: WebSocket):
                                     )
                                     messages[0] = {
                                         "role": "system",
-                                        "content": LLM_SYSTEM_PROMPT + "\n\n" + recent,
+                                        "content": _screen_system_prompt(recent),
                                     }
                                 else:
                                     log.info(
@@ -2383,7 +2408,7 @@ async def ws_tts(websocket: WebSocket):
                                     )
                                     messages[0] = {
                                         "role": "system",
-                                        "content": LLM_SYSTEM_PROMPT + "\n\n" + SCREEN_PENDING_TMPL,
+                                        "content": _screen_system_prompt(SCREEN_PENDING_TMPL),
                                     }
                             # VLM summary cold → describe in background for the
                             # next turn (reply already has fresh OCR text).
@@ -2424,9 +2449,10 @@ async def ws_tts(websocket: WebSocket):
                             )
                             messages[0] = {
                                 "role": "system",
-                                "content": LLM_SYSTEM_PROMPT + "\n\n" + recent,
+                                "content": _screen_system_prompt(recent),
                             }
 
+                turn_started[0] = time.monotonic()
                 stop_evt.clear()
                 start = time.perf_counter()
                 log.info("WS chat request: %s", text[:50])
@@ -2489,6 +2515,7 @@ async def ws_tts(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"type": "error", "message": "bad numeric params"}))
                 continue
 
+            turn_started[0] = time.monotonic()
             stop_evt.clear()
             start = time.perf_counter()
             log.info("WS synth request: %s (num_step=%d, speed=%.2f)", text[:50], num_step, speed)
@@ -2629,6 +2656,11 @@ SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "550"))
 SILERO_SILENCE_MIN_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MIN_MS", "250"))
 SERVER_PRE_ROLL_S = float(os.environ.get("VOICE_SERVER_PRE_ROLL_S", "0.4"))  # kept before the open decision
 MIN_UTT_MS = int(os.environ.get("VOICE_MIN_UTT_MS", "300"))              # shorter utterances are discarded as blips
+# Client self-barge guard: right after a new turn is submitted, the browser can
+# still fire a stale hardStop() from the PREVIOUS turn's VAD burst, which sends
+# "stop" and kills the fresh reply (0 frames). Ignore "stop" for this long after
+# a turn starts; real user barge-in happens after the first audio, later.
+STOP_GRACE_S = float(os.environ.get("VOICE_STOP_GRACE_MS", "250")) / 1000.0
 
 
 def _pick_vad_mode() -> str:
