@@ -15,6 +15,7 @@ const VISION_URL = `${location.protocol}//${location.host}/api/vision`;
    current behaviour and apply until the fetch resolves. */
 const CFG = {
   chatStep: 8, // nfe_step the UI sends for chat replies
+  jitterFrames: 2, // wait until this many TTS frames are queued (or the reply is done) before starting playback — prevents mid-sentence underruns when TTS RTF > 1
   maxHistory: 12,
   wsReconnectMs: 1500,
   recRestartMs: 400,
@@ -41,6 +42,7 @@ const num = (v, d) => (v === undefined || v === null || Number.isNaN(Number(v)) 
 const mergeCfg = (c) => {
   if (!c) return;
   CFG.chatStep = num(c.chat_step, CFG.chatStep);
+  CFG.jitterFrames = num(c.jitter_frames, CFG.jitterFrames);
   CFG.maxHistory = num(c.max_history, CFG.maxHistory);
   CFG.wsReconnectMs = num(c.ws_reconnect_ms, CFG.wsReconnectMs);
   CFG.recRestartMs = num(c.rec_restart_ms, CFG.recRestartMs);
@@ -101,6 +103,8 @@ export default function App() {
   const currentSourceRef = useRef(null);
   const speakingRef = useRef(false);
   const dropRef = useRef(false);
+  const drainRestartRef = useRef(false); // queue underran mid-reply — next frame starts playback at once
+  const drainStartedRef = useRef(false); // drain() already kicked for the current turn (start-event opens speaking early)
   const activeRef = useRef(false); // a reply is being streamed from the server
   const framesRef = useRef(0);
   const turnStartRef = useRef(0); // browser-side: when the current turn was submitted (first-audio stopwatch)
@@ -258,6 +262,10 @@ export default function App() {
       }
       nxt = await pre; // cache for the next iteration
     }
+    // Queue drained while the reply is still streaming — remember it so the
+    // NEXT arriving frame restarts playback immediately instead of waiting
+    // for the jitter buffer to refill (which would add dead air).
+    if (activeRef.current) drainRestartRef.current = true;
     speakingRef.current = false;
     setSpeaking(false);
   }, [playBuf]);
@@ -265,6 +273,8 @@ export default function App() {
   /* ---- hard stop: instant audio cut + server cancel (barge-in) ---- */
   const hardStop = useCallback(() => {
     dropRef.current = true; // drop stale frames/text until the next "start"
+    drainRestartRef.current = false;
+    drainStartedRef.current = false;
     if (currentSourceRef.current) {
       try {
         currentSourceRef.current.stop();
@@ -792,7 +802,27 @@ export default function App() {
             dropRef.current = false;
             activeRef.current = true;
             framesRef.current = 0;
+            drainRestartRef.current = false;
+            drainStartedRef.current = false;
             setTyping(false);
+            // Mark the reply "speaking" from the START of the stream, not
+            // when the first sample plays. The mic echo-gates and the server
+            // VAD assistant-gate key off this flag; during the jitter-buffer
+            // wait (no audio yet) they must already be closed, or the mic
+            // hears speaker echo and barge-in kills the reply before it plays.
+            if (!speakingRef.current) {
+              speakingRef.current = true;
+              api.setSpeaking(true);
+            }
+          } else if (m.type === "window") {
+            // Debug: how the LLM stream was divided into TTS chunks + their
+            // generation cost. RTF > 1 means that chunk generates slower than
+            // it plays — the direct cause of mid-reply underruns.
+            console.info(
+              `[voice] TTS window #${m.n}: ${m.chars} ch, ${m.steps} steps, speed ${m.speed}` +
+              ` | audio ${m.audio_s}s / gen ${m.gen_s}s (RTF ${m.rtf})` +
+              ` | "${m.text}"`,
+            );
           } else if (m.type === "text") {
             if (dropRef.current) return; // stale sentence of an aborted reply
             setTyping(false);
@@ -849,6 +879,14 @@ export default function App() {
             assistantTextRef.current = "";
             openAssistantId.current = null;
             activeRef.current = false;
+            // Reply stream is complete — if the jitter buffer is still holding
+            // frames (never reached jitterFrames), start playback NOW so the
+            // tail isn't stranded silent until the next turn.
+            if (!speakingRef.current && pendingRef.current.length > 0) {
+              speakingRef.current = true;
+              api.setSpeaking(true);
+              drain();
+            }
             // audio may still be playing its last frame — aura keeps pulsing
             // until drain() ends; only force-stop if nothing is left.
             if (!currentSourceRef.current && pendingRef.current.length === 0) {
@@ -864,10 +902,27 @@ export default function App() {
             );
           }
           pendingRef.current.push(new Blob([ev.data], { type: "audio/wav" }));
-          if (!speakingRef.current) {
+          // Jitter buffer: don't start playing on the first frame alone. The
+          // first window is a tiny ~1s fragment; starting immediately means
+          // playback runs dry before window #2 is generated (RTF > 1 on
+          // MPS/CPU) — heard as mid-word cutoffs. Wait until jitterFrames
+          // are queued, or the reply stream ends (done/error), to start.
+          const wantStart =
+            CFG.jitterFrames <= 0 ||
+            pendingRef.current.length >= CFG.jitterFrames ||
+            drainRestartRef.current ||
+            !activeRef.current;
+          if (!speakingRef.current && wantStart) {
+            drainRestartRef.current = false;
             speakingRef.current = true;
             api.setSpeaking(true);
             drain();
+          }
+          // If the "start" event already opened the speaking state, just kick
+          // playback when the jitter condition is met.
+          else if (speakingRef.current && !currentSourceRef.current && !drainStartedRef.current && wantStart) {
+            drainStartedRef.current = true;
+            drain().finally(() => { drainStartedRef.current = false; });
           }
           // keep the playback watchdog honest: a new frame just landed
           if (speakWatchdog) {

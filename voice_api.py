@@ -1701,6 +1701,18 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 timing["windows"] += 1
                 timing["total_gen"] += gen_s
                 timing["total_dur"] += dur_s
+                # Debug event: show the client exactly how the LLM stream was
+                # divided into TTS windows, with per-window gen cost + RTF.
+                out_q.put(("window", {
+                    "n": timing["windows"],
+                    "chars": len(win["text"]),
+                    "steps": win["steps"],
+                    "speed": _pick_speed(win["text"], speed),
+                    "audio_s": round(dur_s, 2),
+                    "gen_s": round(gen_s, 2),
+                    "rtf": round(rtf, 2) if rtf else 0,
+                    "text": win["text"],
+                }))
                 if timing["first_audio"] == 0.0:
                     timing["first_audio"] = time.perf_counter() - t0
                     log.info(
@@ -2475,6 +2487,10 @@ async def ws_tts(websocket: WebSocket):
                         kind, payload = await asyncio.get_running_loop().run_in_executor(None, out_q.get)
                         if kind == "text":
                             await websocket.send_text(json.dumps({"type": "text", "text": payload}))
+                        elif kind == "window":
+                            await websocket.send_text(
+                                json.dumps({"type": "window", **payload})
+                            )
                         elif kind == "audio":
                             frames += 1
                             if frames == 1:
