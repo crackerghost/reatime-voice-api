@@ -45,7 +45,7 @@ from server.schemas import make_schemas
 from server.runtime import VoiceRuntime
 from server.settings import Settings
 
-from server.llm.diagrams import generate as _generate_diagram, should_generate as _should_generate_diagram
+from server.llm.diagrams import generate as _generate_diagram, generate_for_step as _generate_step, should_generate as _should_generate_diagram
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("voice_api")
@@ -256,6 +256,7 @@ from server.llm.prompts import (
 from server.speech.normalization import (
     _devanagari_only,
     _fix_pronunciation,
+    _naturalize,
     _speechify,
 )
 from server.speech.tts_engine import TTSConfig, TTSEngine
@@ -605,6 +606,7 @@ def _speech_sentence(sent: str, complete: bool = True) -> str:
     flushed early (mid-sentence) doesn't get an artificial full stop.
     """
     sent = _speechify(sent)
+    sent = _naturalize(sent)
     sent = _convert_numbers_to_hindi(sent)
     sent = _devanagari_only(sent)
     if not sent:
@@ -671,7 +673,7 @@ def _clause_units(sent: str) -> list[str]:
 
 
 def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt, t0=None,
-                 http_client: httpx.Client | None = None):
+                 http_client: httpx.Client | None = None, diagram_ctx: dict | None = None):
     """3-thread pipeline: LLM producer -> text/windowing -> audio synth.
 
     Pipeline (all three run concurrently, so nothing serializes):
@@ -684,6 +686,9 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
       3. audio thread         — pulls finished windows off win_q and runs the
          OmniVoice generate() calls. The GPU works while the LLM is still
          writing later sentences.
+      4. watcher threads      — one best-effort diagram planner per audio
+         window (when diagram_ctx is set). Voice is master: planner failure
+         or lateness only skips a board delta, never blocks audio.
 
     Text events therefore stream live at LLM speed (first one lands ~0.5-1s),
     while the first audio window is synthesized at FIRST_WINDOW_STEP (fast
@@ -691,7 +696,8 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     continuous intonation arc instead of choppy per-sentence restarts.
 
     Events on out_q, in order: ("text", sentence)... then ("audio", wav) per
-    window, ending with ("done", None) or ("error", msg).
+    window, ("diagram", {window_n, elements}) interleaved best-effort,
+    ending with ("done", None) or ("error", msg).
     """
     if http_client is None:
         http_client = state.runtime.provider_clients.llm()
@@ -778,6 +784,38 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     threading.Thread(target=llm_producer, daemon=True).start()
     threading.Thread(target=audio_synth, daemon=True).start()
 
+    # ---- watcher sidecar: one planner thread per shipped audio window ----
+    win_seq = [0]  # ship order == audio order (single producer)
+
+    def _diagram_watch(n: int, win_text: str) -> None:
+        try:
+            if stop_evt is not None and stop_evt.is_set():
+                return
+            d = _generate_step(
+                diagram_ctx["key"], win_text, diagram_ctx.get("topic", ""),
+                stop_evt, client=http_client, url=MISTRAL_URL,
+                model=LLM_MODEL, reasoning_effort=LLM_REASONING_EFFORT,
+                id_prefix=f"w{n}",
+            )
+            if not d or (stop_evt is not None and stop_evt.is_set()):
+                return
+            out_q.put(("diagram", {
+                "window_n": n, "mode": "append",
+                "elements": d["elements"],
+                "turn_id": diagram_ctx.get("turn_id", ""),
+                "client_turn_id": diagram_ctx.get("client_turn_id", ""),
+            }))
+            log.info("Diagram watcher: window #%d -> %d element(s)", n, len(d["elements"]))
+        except Exception as e:  # noqa: BLE001 — board must never break voice
+            log.warning("Diagram watcher window #%d skipped: %s", n, e)
+
+    def _ship_window(win_text: str, steps: int, watch: bool = True) -> None:
+        win_seq[0] += 1
+        n = win_seq[0]
+        win_q.put({"text": win_text, "steps": steps, "n": n})
+        if watch and diagram_ctx:
+            threading.Thread(target=_diagram_watch, args=(n, win_text), daemon=True).start()
+
     try:
         window = []          # phrases buffered for the next audio window
         window_chars = 0
@@ -817,7 +855,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             for piece in _clause_units(text):
                 if window and window_chars + len(piece) > WINDOW_CHAR_CAP:
                     steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
-                    win_q.put({"text": " ".join(window), "steps": steps})
+                    _ship_window(" ".join(window), steps)
                     window, window_chars = [], 0
                     emitted_audio = True
                 window.append(piece)
@@ -845,11 +883,11 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                             text_to_speak = cut_text
                         else:
                             window, window_chars = [], 0
-                        win_q.put({"text": text_to_speak, "steps": min(num_step, FIRST_WINDOW_STEP)})
+                        _ship_window(text_to_speak, min(num_step, FIRST_WINDOW_STEP))
                         emitted_audio = True
                 else:
                     if sentence_done or window_chars >= MIN_WINDOW_CHARS * 2:
-                        win_q.put({"text": " ".join(window), "steps": num_step})
+                        _ship_window(" ".join(window), num_step)
                         window, window_chars = [], 0
                         emitted_audio = True
             if (is_greeting and sent_count >= GREETING_MAX) or sent_count >= MAX_CHAT_SENTENCES:
@@ -861,11 +899,11 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             # Always answer out loud — silence reads as "the assistant is broken".
             fallback = "अरे, आवाज़ साफ़ नहीं आ पाई। एक बार फिर से बोल दो।"
             out_q.put(("text", fallback))
-            win_q.put({"text": fallback, "steps": min(num_step, FIRST_WINDOW_STEP)})
+            _ship_window(fallback, min(num_step, FIRST_WINDOW_STEP), watch=False)
             emitted_audio = True
         if window and not (stop_evt is not None and stop_evt.is_set()):
             steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
-            win_q.put({"text": " ".join(window), "steps": steps})  # final tail window
+            _ship_window(" ".join(window), steps)  # final tail window
         win_q.put(None)  # stop the audio thread
         audio_done.wait(timeout=180)
         if llm_error and not emitted_audio:
@@ -1475,26 +1513,18 @@ async def ws_tts(websocket: WebSocket):
                 async with state.gen_lock, _screen_paused():
                     out_q: queue.Queue = queue.Queue()
                     llm_client = state.runtime.provider_clients.llm()
+                    # Watcher sidecar: per-window board deltas stream via out_q
+                    # ("diagram") alongside voice — voice never waits for them.
+                    diagram_ctx = (
+                        {"key": key, "topic": text, "turn_id": turn_id,
+                         "client_turn_id": client_turn_id}
+                        if should_diagram else None
+                    )
                     threading.Thread(
                         target=_chat_worker,
-                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client),
+                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client, diagram_ctx),
                         daemon=True,
                     ).start()
-                    if should_diagram:
-                        diagram_event = asyncio.create_task(
-                            _send_diagram_when_ready(
-                                websocket,
-                                key,
-                                text,
-                                history,
-                                stop_evt,
-                                turn_id,
-                                client_turn_id,
-                                llm_client,
-                            )
-                        )
-                        diagram_tasks.add(diagram_event)
-                        diagram_event.add_done_callback(diagram_tasks.discard)
 
                     await websocket.send_text(
                         json.dumps({"type": "start", "sample_rate": SAMPLE_RATE, "text": text})
@@ -2094,6 +2124,7 @@ def chat(req: ChatRequest, request: Request):
     reply = _call(messages)
 
     reply = _speechify(reply)
+    reply = _naturalize(reply)
     reply = _devanagari_only(reply)
     # Never speak a half sentence — cut at the last complete sentence if truncated
     if reply and reply[-1] not in "।?!.":

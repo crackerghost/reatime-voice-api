@@ -56,7 +56,111 @@ HINGLISH_TO_DEVANAGARI = {
     "practice": "प्रैक्टिस", "english": "इंग्लिश", "science": "साइंस",
     "teacher": "टीचर", "student": "स्टूडेंट", "college": "कॉलेज",
     "class": "क्लास", "time": "टाइम", "video": "वीडियो",
+    # ---- daily courtesy / reactions (rose-roz wale) ----
+    "hello": "हेलो", "hey": "हे", "hi": "हाय", "bye": "बाय",
+    "thanks": "थैंक्स", "thank": "थैंक", "thankyou": "थैंक्यू",
+    "sorry": "सॉरी", "please": "प्लीज़", "welcome": "वेलकम",
+    "ok": "ओके", "okay": "ओके", "sure": "श्योर", "great": "ग्रेट",
+    "nice": "नाइस", "awesome": "ऑसम", "perfect": "परफेक्ट",
+    "done": "डन", "good": "गुड", "cool": "कूल",
+    "congrats": "कॉन्ग्रैट्स", "allright": "ऑलराइट", "alright": "ऑलराइट",
+    # ---- tutor classroom (tution wale) ----
+    "learn": "लर्न", "teach": "टीच", "lesson": "लेसन",
+    "topic": "टॉपिक", "topics": "टॉपिक्स", "chapter": "चैप्टर",
+    "subject": "सब्जेक्ट", "exam": "एग्ज़ाम", "exams": "एग्ज़ाम्स",
+    "test": "टेस्ट", "marks": "मार्क्स", "homework": "होमवर्क",
+    "doubt": "डाउट", "doubts": "डाउट्स", "explain": "एक्सप्लेन",
+    "concept": "कॉन्सेप्ट", "concepts": "कॉन्सेप्ट्स",
+    "revision": "रिविज़न", "syllabus": "सिलेबस",
+    "notes": "नोट्स", "note": "नोट", "home": "होम",
+    "school": "स्कूल", "homeworkdone": "होमवर्क डन",
+    # ---- daily verbs (bol-chaal wale) ----
+    "help": "हेल्प", "try": "ट्राई", "check": "चेक",
+    "start": "स्टार्ट", "stop": "स्टॉप", "wait": "वेट",
+    "hold": "होल्ड", "see": "सी", "look": "लुक", "show": "शो",
+    "tell": "टेल", "talk": "टॉक", "speak": "स्पीक",
+    "listen": "लिसन", "understand": "अंडरस्टैंड",
+    "clear": "क्लियर", "confirm": "कन्फर्म", "share": "शेयर",
+    "open": "ओपन", "close": "क्लोज़", "save": "सेव",
+    "delete": "डिलीट", "edit": "एडिट", "send": "सेंड",
+    "receive": "रिसीव", "use": "यूज़", "using": "यूज़िंग",
+    "work": "वर्क", "working": "वर्किंग", "donework": "डन वर्क",
+    "thinkthink": "थिंक", "manage": "मैनेज",
+    # ---- adjectives / fillers ----
+    "hard": "हार्ड", "difficult": "डिफिकल्ट", "fast": "फास्ट",
+    "slow": "स्लो", "right": "राइट", "wrong": "रॉन्ग",
+    "actually": "एक्चुअली", "generally": "जनरली",
+    "normally": "नॉर्मली", "usually": "यूज़ुअली",
+    "seriously": "सीरियसली", "obviously": "ऑब्वियसली",
+    "definitely": "डेफिनेटली", "problem": "प्रॉब्लम",
+    "solution": "सॉल्यूशन", "idea": "आइडिया",
+    "moment": "मोमिंट", "second": "सेकंड", "minute": "मिनट",
+    # ---- extra tech (code-debug wale) ----
+    "error": "एरर", "errors": "एरर्स", "bug": "बग", "bugs": "बग्स",
+    "debug": "डिबग", "deploy": "डिप्लॉय", "frontend": "फ्रंटएंड",
+    "backend": "बैकएंड", "database": "डेटाबेस", "client": "क्लाइंट",
+    "login": "लॉगिन", "logout": "लॉगआउट", "password": "पासवर्ड",
+    "account": "अकाउंट", "profile": "प्रोफाइल", "settings": "सेटिंग्स",
+    "notification": "नोटिफिकेशन", "link": "लिंक",
+    # ---- connectors / helpers (missed = letter-spell, so keep explicit) ----
+    "need": "नीड", "needs": "नीड्स", "and": "एंड", "or": "ऑर",
+    "but": "बट", "because": "बिकॉज़", "with": "विद",
+    "without": "विदाउट", "for": "फॉर", "from": "फ्रॉम",
+    "you": "यू", "your": "योर", "we": "वी", "they": "दे",
+    "this": "दिस", "that": "दैट", "what": "व्हाट", "when": "व्हेन",
+    "how": "हाउ", "why": "व्हाई",
 }
+
+# Shuddh Hindi -> roz-marra bol-chaal (robotic feel ka root cause).
+# LLM shuddh likh bhi de to TTS natural bolega. Longest-first apply.
+SHUDDH_TO_BOLCHAAL = {
+    "मैं आपकी क्या सहायता कर सकता हूँ": "बोलो, मेरी क्या हेल्प चाहिए",
+    "मैं आपकी क्या सहायता कर सकती हूँ": "बोलो, मेरी क्या हेल्प चाहिए",
+    "क्या सहायता कर सकता हूँ": "क्या हेल्प चाहिए",
+    "सहायता": "हेल्प",
+    "आवश्यकता": "ज़रूरत",
+    "आवश्यक": "ज़रूरी",
+    "जानकारी": "इंफो",
+    "उदाहरण": "एग्ज़ाम्पल",
+    "कृपया": "प्लीज़",
+    "क्षण": "सेकंड",
+    "निश्चित": "पक्का",
+    "निश्चित रूप से": "पक्का",
+    "शुभ": "अच्छा",
+    "क्षमता": "पावर",
+    "उपयोग": "यूज़",
+    "प्रयोग": "ट्राई",
+    "समस्या": "प्रॉब्लम",
+    "समाधान": "सॉल्यूशन",
+    "प्रश्न": "क्वेश्चन",
+    "उत्तर": "आंसर",
+    "शिक्षक": "टीचर",
+    "विद्यार्थी": "स्टूडेंट",
+    "पुस्तक": "बुक",
+    "प्रतीक्षा": "वेट",
+    "तुरंत": "जल्दी से",
+    "शीघ्र": "जल्दी",
+    "वार्तालाप": "बातचीत",
+    "अनुभव": "एक्सपीरियंस",
+    "महत्वपूर्ण": "इम्पॉर्टेंट",
+    "अत्यंत": "बहुत",
+    "एवं": "और",
+    "तथा": "और",
+    "किंतु": "लेकिन",
+    "परंतु": "लेकिन",
+    "अतः": "इसलिए",
+    "यथाशीघ्र": "जल्दी से",
+}
+_SHUDDH_RE = re.compile(
+    "|".join(re.escape(k) for k in sorted(SHUDDH_TO_BOLCHAAL, key=len, reverse=True))
+)
+
+
+def _naturalize(text: str) -> str:
+    """Shuddh Hindi -> daily bol-chaal before TTS (sounds identical in meaning)."""
+    if not text:
+        return text
+    return _SHUDDH_RE.sub(lambda m: SHUDDH_TO_BOLCHAAL[m.group(0)], text)
 
 # Letter NAMES (not bare consonants) so ANY leftover Latin text spells out
 # correctly: "vpn" -> "वी पी एन", not "वपन". This is the root-cause fix for

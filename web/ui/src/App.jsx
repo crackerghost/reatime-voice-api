@@ -840,9 +840,23 @@ export default function App() {
               ` | "${m.text}"`,
             );
           } else if (m.type === "diagram") {
-            if (dropRef.current || !m.turn_id || m.client_turn_id !== String(activeTurnIdRef.current) || !m.diagram?.elements?.length) return;
-            diagramTurnRef.current = m.turn_id;
-            setDiagram(m.diagram);
+            if (dropRef.current) return;
+            if (m.client_turn_id && m.client_turn_id !== String(activeTurnIdRef.current)) return;
+            // Whole-board (legacy) or window delta (watcher sidecar) — both merge by id.
+            const incoming = m.diagram?.elements?.length ? m.diagram.elements : (m.elements?.length ? m.elements : null);
+            if (!incoming) return;
+            if (m.turn_id) diagramTurnRef.current = m.turn_id;
+            console.info(`[diagram] ${m.mode === "append" ? `delta window #${m.window_n ?? "?"}` : "board"}: +${incoming.length} element(s)`);
+            setDiagram((prev) => {
+              const seen = new Set();
+              const merged = [];
+              for (const el of [...(prev?.elements || []), ...incoming]) {
+                if (!el || !el.id || seen.has(el.id)) continue;
+                seen.add(el.id);
+                merged.push(el);
+              }
+              return { elements: merged.slice(-40) };
+            });
           } else if (m.type === "diagram_error") {
             if (!dropRef.current) console.info("[diagram] visual explanation unavailable", m.message || "");
           } else if (m.type === "text") {

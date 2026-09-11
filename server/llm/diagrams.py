@@ -48,18 +48,135 @@ DIAGRAM_TOOL = {
 }
 
 
+_GREETING_ONLY_RE = re.compile(
+    r"^(नमस्ते|हेलो|हाय|हैलो|नमस्कार|कैसे\s+हो|क्या\s+हाल|hello|hi|hey|"
+    r"good\s+(morning|afternoon|evening|night)|how\s+are\s+you|"
+    r"हाँ|हां|अच्छा|ओके|ok|okay|thanks|थैंक्स?|शुक्रिया)\W*$",
+    re.IGNORECASE,
+)
+
+
 def should_generate(text: str, history: list[dict] | None, enabled: bool) -> bool:
+    """Auto-decide: every teaching turn gets an LLM judge call.
+
+    No keyword gate — the judge prompt itself decides whether a diagram
+    materially improves THIS explanation (tool call) or not (no call).
+    Voice never waits: the judge runs parallel to TTS, diagram pops when ready.
+    Only pure greetings / tiny acks are skipped to save the extra LLM call.
+    """
     if not enabled:
         return False
     clean_text = (text or "").strip()
-    if not clean_text:
+    if not clean_text or len(clean_text) < 8:
         return False
+    if _GREETING_ONLY_RE.search(clean_text):
+        return False
+    # Explicit ask always wins (no LLM judgement needed to trigger).
     if DIAGRAM_INTENT_RE.search(clean_text):
         return True
-    if history:
-        user_msgs = [m.get("content", "") for m in history if m.get("role") == "user"]
-        return bool(user_msgs and len(clean_text) < 48 and DIAGRAM_INTENT_RE.search(user_msgs[-1]))
-    return False
+    # Everything else: let the judge decide (explain html, क्या है, कैसे...).
+    return True
+
+
+def _step_prompt(step_text: str, topic: str) -> list[dict]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a visual teaching assistant drawing ONE step of an explanation "
+                "on a shared whiteboard. Return a draw_flowchart_or_diagram tool call with "
+                "3-6 concise nodes (max 6 words each) plus arrows for THIS step only. "
+                "Node ids must be unique — prefix every id with the given STEP tag. "
+                "Coordinates: top-to-bottom flow, x in 80..640, y in 80..900. "
+                "If this step has nothing drawable (greeting, opinion, meta talk), "
+                "return no tool call."
+            ),
+        },
+        {"role": "user", "content": f"TOPIC: {topic[:200]}\nSTEP: {step_text[:600]}"},
+    ]
+
+
+def generate_for_step(
+    key: str,
+    step_text: str,
+    topic: str,
+    stop_evt: threading.Event,
+    *,
+    client,
+    url: str,
+    model: str,
+    reasoning_effort: str,
+    id_prefix: str = "w",
+) -> dict | None:
+    """Watcher planner: one small board delta for ONE spoken window.
+
+    Best-effort by design — None means 'nothing drawable this step', never an
+    error. Voice never waits for this; the caller tags the result with window_n
+    and the client merges it on arrival.
+    """
+    if stop_evt.is_set() or not (step_text or "").strip():
+        return None
+    payload = {
+        "model": model,
+        "messages": _step_prompt(step_text, topic),
+        "tools": [DIAGRAM_TOOL],
+        "tool_choice": "auto",
+        "temperature": 0.2,
+        "max_tokens": 450,
+    }
+    if reasoning_effort and "gpt-oss" in model:
+        payload["reasoning_effort"] = reasoning_effort
+    try:
+        response = client.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+    except Exception:
+        return None
+    message = (response.json().get("choices") or [{}])[0].get("message") or {}
+    arguments = None
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        if function.get("name") == "draw_flowchart_or_diagram":
+            arguments = function.get("arguments")
+            break
+    if not arguments:
+        return None
+    try:
+        diagram = normalize(json.loads(arguments))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not diagram or stop_evt.is_set():
+        return None
+    # Namespace ids per window so deltas merge without collisions.
+    nodes = {}
+    out = []
+    for item in diagram["elements"]:
+        old_id = item["id"]
+        new_id = f"{id_prefix}-{old_id}"[:80]
+        nodes[old_id] = new_id
+        item["id"] = new_id
+        out.append(item)
+    for item in out:
+        if item["type"] == "arrow":
+            if item.get("startNodeId") in nodes:
+                item["startNodeId"] = nodes[item["startNodeId"]]
+            if item.get("endNodeId") in nodes:
+                item["endNodeId"] = nodes[item["endNodeId"]]
+    # Y-offset per window so steps stack downward instead of overlapping.
+    try:
+        win_n = int(id_prefix.lstrip("w") or 1)
+    except ValueError:
+        win_n = 1
+    y_off = max(0, (win_n - 1)) * 220
+    for item in out:
+        try:
+            item["y"] = max(-2000, min(2000, float(item.get("y", 80)) + y_off))
+        except (TypeError, ValueError):
+            pass
+    return {"elements": out}
 
 
 def _prompt(text: str, history: list[dict]) -> list[dict]:
