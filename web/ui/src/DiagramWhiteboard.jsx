@@ -1,29 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Excalidraw } from "@excalidraw/excalidraw";
+import { Excalidraw, convertToExcalidrawElements } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
 
 const DEFAULT_WIDTH = 180;
 const DEFAULT_HEIGHT = 84;
 const MAX_TEXT = 180;
+// Devanagari is voice-only. Never draw Hindi on the board.
+const DEVANAGARI_RE = /[\u0900-\u097F]+/g;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-const safeText = (value) => String(value || "").trim().slice(0, MAX_TEXT);
-
-/* Stable numeric seed per id — id.length collides across nodes and makes
-   Excalidraw render duplicates with identical roughness. */
-const seedOf = (id) => {
-  let h = 2166136261;
-  const s = String(id);
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return Math.abs(h % 2147483647);
-};
+const safeText = (value) =>
+  String(value || "")
+    .replace(DEVANAGARI_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_TEXT);
 
 function toExcalidrawElements(items) {
   const nodes = new Map();
-  const elements = [];
+  const skeletons = [];
 
   for (const item of items || []) {
     if (!item || !item.id || !item.type) continue;
@@ -34,109 +29,52 @@ function toExcalidrawElements(items) {
     const height = clamp(Number(item.height) || DEFAULT_HEIGHT, 44, 260);
     const text = safeText(item.text);
 
-    if (item.type === "arrow") continue;
-    if (!["rectangle", "ellipse", "diamond", "text"].includes(item.type)) continue;
-
     if (item.type === "text") {
-      elements.push({
-        id,
-        type: "text",
-        x,
-        y,
-        width,
-        height,
-        angle: 0,
-        text: text || " ",
-        fontSize: 18,
-        fontFamily: 2,
-        textAlign: "left",
-        verticalAlign: "middle",
-        strokeColor: "#12304a",
-        backgroundColor: "transparent",
-        fillStyle: "solid",
-        strokeWidth: 1,
-        roughness: 0,
-        opacity: 100,
-        seed: seedOf(id),
-        version: 1,
-        versionNonce: seedOf(`nonce-${id}`),
-        isDeleted: false,
-        groupIds: [],
-        frameId: null,
-        index: null,
-        roundness: null,
-        boundElements: null,
-        updated: Date.now(),
-        link: null,
-        locked: false,
-      });
+      if (text) {
+        skeletons.push({
+          id,
+          type: "text",
+          x,
+          y,
+          text,
+          fontSize: 18,
+          fontFamily: 2,
+          textAlign: "left",
+          verticalAlign: "middle",
+          strokeColor: "#12304a",
+          backgroundColor: "transparent",
+          strokeWidth: 1,
+          roughness: 0,
+        });
+      }
       continue;
     }
 
-    const node = {
+    if (!["rectangle", "ellipse", "diamond"].includes(item.type)) continue;
+    if (!text) continue;
+
+    nodes.set(id, { id, type: item.type });
+    skeletons.push({
       id,
       type: item.type,
       x,
       y,
       width,
       height,
-      angle: 0,
       strokeColor: item.type === "diamond" ? "#ff5a5f" : "#34566b",
       backgroundColor: item.backgroundColor === "transparent" ? "transparent" : (item.backgroundColor || "#fff1f1"),
       fillStyle: "solid",
       strokeWidth: 2,
       roughness: 0,
-      opacity: 100,
-      seed: seedOf(id),
-      version: 1,
-      versionNonce: seedOf(`nonce-${id}`),
-      isDeleted: false,
-      groupIds: [],
-      frameId: null,
       roundness: item.type === "rectangle" ? { type: 3 } : null,
-      boundElements: [],
-      updated: Date.now(),
-      link: null,
-      locked: false,
-    };
-    nodes.set(id, node);
-    elements.push(node);
-
-    if (text) {
-      const labelId = `${id}-label`;
-      elements.push({
-        id: labelId,
-        type: "text",
-        x: x + 14,
-        y: y + Math.max(8, height / 2 - 12),
-        width: Math.max(40, width - 28),
-        height: 28,
-        angle: 0,
+      label: {
         text,
         fontSize: 16,
         fontFamily: 2,
         textAlign: "center",
         verticalAlign: "middle",
-        strokeColor: "#12304a",
-        backgroundColor: "transparent",
-        fillStyle: "solid",
-        strokeWidth: 1,
-        roughness: 0,
-        opacity: 100,
-        seed: labelId.length * 97,
-        version: 1,
-        versionNonce: labelId.length * 193,
-        isDeleted: false,
-        groupIds: [],
-        frameId: null,
-        roundness: null,
-        boundElements: null,
-        updated: Date.now(),
-        link: null,
-        locked: false,
-      });
-      node.boundElements.push({ type: "text", id: labelId });
-    }
+      },
+    });
   }
 
   for (const item of items || []) {
@@ -145,51 +83,20 @@ function toExcalidrawElements(items) {
     const end = nodes.get(String(item.endNodeId || ""));
     if (!start || !end) continue;
 
-    // Direction-aware: vertical flow (stacked steps) vs horizontal (comparisons).
-    const vertical = Math.abs(end.y - start.y) >= Math.abs(end.x - start.x);
-    const startX = vertical ? start.x + start.width / 2 : start.x + start.width;
-    const startY = vertical ? start.y + start.height : start.y + start.height / 2;
-    const endX = vertical ? end.x + end.width / 2 : end.x;
-    const endY = vertical ? end.y : end.y + end.height / 2;
-    const arrowId = String(item.id).slice(0, 80);
-    const arrow = {
-      id: arrowId,
+    skeletons.push({
+      id: String(item.id).slice(0, 80),
       type: "arrow",
-      x: startX,
-      y: startY,
-      width: endX - startX,
-      height: endY - startY,
-      angle: 0,
-      points: [[0, 0], [endX - startX, endY - startY]],
-      lastCommittedPoint: null,
-      startBinding: { elementId: start.id, focus: 0, gap: 8 },
-      endBinding: { elementId: end.id, focus: 0, gap: 8 },
-      startArrowhead: null,
+      start: { id: start.id, type: start.type },
+      end: { id: end.id, type: end.type },
       endArrowhead: "arrow",
       strokeColor: "#ff5a5f",
       backgroundColor: "transparent",
-      fillStyle: "solid",
       strokeWidth: 2,
       roughness: 0,
-      opacity: 100,
-      seed: seedOf(arrowId),
-      version: 1,
-      versionNonce: seedOf(`nonce-${arrowId}`),
-      isDeleted: false,
-      groupIds: [],
-      frameId: null,
-      roundness: { type: 2 },
-      boundElements: null,
-      updated: Date.now(),
-      link: null,
-      locked: false,
-    };
-    elements.push(arrow);
-    start.boundElements.push({ type: "arrow", id: arrow.id });
-    end.boundElements.push({ type: "arrow", id: arrow.id });
+    });
   }
 
-  return elements;
+  return convertToExcalidrawElements(skeletons, { regenerateIds: false });
 }
 
 export default function DiagramWhiteboard({ diagram }) {

@@ -6,6 +6,8 @@ import threading
 
 DIAGRAM_MAX_ELEMENTS = 40
 DIAGRAM_MAX_TEXT = 180
+# Board text is English-only. Devanagari is voice-only.
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]+")
 DIAGRAM_INTENT_RE = re.compile(
     r"(?:draw|diagram|flowchart|visuali[sz]e|mind\s*map|architecture|timeline|process|relationship|"
     r"चित्र|डायग्राम|फ्लोचार्ट|दिखाओ|समझाने के लिए|तुलना|टाइमलाइन|प्रोसेस)",
@@ -54,6 +56,11 @@ _GREETING_ONLY_RE = re.compile(
     r"हाँ|हां|अच्छा|ओके|ok|okay|thanks|थैंक्स?|शुक्रिया)\W*$",
     re.IGNORECASE,
 )
+
+
+def _board_text(value: object) -> str:
+    """Strip Devanagari and collapse whitespace so the canvas stays English."""
+    return DEVANAGARI_RE.sub(" ", str(value or "")).strip()
 
 
 def should_generate(text: str, history: list[dict] | None, enabled: bool) -> bool:
@@ -226,7 +233,9 @@ def _prompt(text: str, history: list[dict]) -> list[dict]:
                 "You are a visual teaching assistant. Decide whether a diagram materially improves "
                 "this explanation. If yes, call draw_flowchart_or_diagram. If no, return no tool call. "
                 "Use 3-10 concise nodes, max 6 words per node, and connect related nodes with arrows. "
-                "Use logical coordinates, top-to-bottom for sequences and side-by-side for comparisons."
+                "Use logical coordinates, top-to-bottom for sequences and side-by-side for comparisons. "
+                "Board text is always English — short English labels, code/tag/file names exactly "
+                "as-is. Never Devanagari on the board; Hindi is voice-only."
             ),
         },
         {"role": "user", "content": f"Recent context:\n{recent}\n\nCurrent question:\n{text}"},
@@ -259,7 +268,7 @@ def normalize(raw: object) -> dict | None:
             except (TypeError, ValueError):
                 normalized[key] = default
         if item_type in {"rectangle", "ellipse", "diamond", "text"}:
-            normalized["text"] = str(item.get("text", "")).strip()[:DIAGRAM_MAX_TEXT]
+            normalized["text"] = _board_text(item.get("text", ""))[:DIAGRAM_MAX_TEXT]
         if item_type == "arrow":
             normalized["startNodeId"] = str(item.get("startNodeId", "")).strip()[:80]
             normalized["endNodeId"] = str(item.get("endNodeId", "")).strip()[:80]
@@ -267,10 +276,19 @@ def normalize(raw: object) -> dict | None:
         if color == "transparent" or re.fullmatch(r"#[0-9a-fA-F]{6}", color):
             normalized["backgroundColor"] = color
         elements.append(normalized)
-    nodes = {item["id"] for item in elements if item["type"] != "arrow"}
+    nodes = {
+        item["id"]
+        for item in elements
+        if item["type"] != "arrow" and str(item.get("text", "")).strip()
+    }
     elements = [
         item for item in elements
-        if item["type"] != "arrow" or (item.get("startNodeId") in nodes and item.get("endNodeId") in nodes)
+        if (item["type"] != "arrow" and str(item.get("text", "")).strip())
+        or (
+            item["type"] == "arrow"
+            and item.get("startNodeId") in nodes
+            and item.get("endNodeId") in nodes
+        )
     ]
     return {"elements": elements} if elements else None
 

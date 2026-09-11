@@ -1,9 +1,9 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FaBars, FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTrash, FaVolumeHigh, FaWandMagicSparkles, FaXmark } from "react-icons/fa6";
 import Sidebar from "./Sidebar.jsx";
 import BottomBar from "./BottomBar.jsx";
 import AuroraBg from "./AuroraBg.jsx";
-const DiagramWhiteboard = lazy(() => import("./DiagramWhiteboard.jsx"));
+import DiagramWhiteboard from "./DiagramWhiteboard.jsx";
 import { engine } from "./audioEngine.js";
 import { chatMessage, pingMessage, stopMessage } from "./services/ttsProtocol.js";
 
@@ -97,7 +97,7 @@ export default function App() {
   const [typing, setTyping] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
   const [sharing, setSharing] = useState(false); // push-to-see capture active (button held)
-  const [diagram, setDiagram] = useState(null);
+  const [diagram, setDiagram] = useState({ elements: [] });
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   // ---- mutable runtime state (safe across renders) ----
@@ -1692,7 +1692,7 @@ export default function App() {
     historyRef.current = [];
     openAssistantId.current = null;
     assistantTextRef.current = "";
-    setDiagram(null);
+    setDiagram({ elements: [] });
     setMessages([{ id: nextId(), role: "assistant", text: GREETING }]);
   }, [hardStop]);
 
@@ -1724,7 +1724,7 @@ export default function App() {
         listening={listening}
         asrReady={asrReady}
         messageCount={messages.length}
-        hasDiagram={!!diagram}
+        hasDiagram={!!(diagram?.elements?.length)}
         onClear={clearChat}
         onToggleMic={handleToggleMic}
         onShareScreen={shareDown}
@@ -1870,15 +1870,7 @@ export default function App() {
                 </div>
               </div>
               <div className="min-h-0 flex-1">
-                <Suspense
-                  fallback={
-                    <div className="grid h-full min-h-[320px] place-items-center text-[0.82rem] tracking-wide text-slate-500">
-                      Preparing the whiteboard…
-                    </div>
-                  }
-                >
-                  <DiagramWhiteboard diagram={diagram} />
-                </Suspense>
+                <DiagramWhiteboard diagram={diagram} />
               </div>
             </aside>
           ) : null}
