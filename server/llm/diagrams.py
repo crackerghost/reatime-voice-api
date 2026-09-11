@@ -91,7 +91,10 @@ def _step_prompt(step_text: str, topic: str) -> list[dict]:
                 "tool call for those. When drawing, return a draw_flowchart_or_diagram "
                 "tool call with 3-6 concise nodes (max 6 words each) plus arrows for "
                 "THIS step only. Node ids must be unique — prefix every id with the "
-                "given STEP tag. Coordinates: top-to-bottom flow, x in 80..640, y in 80..900."
+                "given STEP tag. Layout is dynamic per step: top-to-bottom flow for "
+                "sequences/processes (x ~80..400, y growing), side-by-side for "
+                "comparisons (x spread 80..640). Shapes: rectangle = component/step, "
+                "ellipse = start/end, diamond = decision, arrow = flow."
             ),
         },
         {"role": "user", "content": f"TOPIC: {topic[:200]}\nSTEP: {step_text[:600]}"},

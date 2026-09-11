@@ -43,7 +43,7 @@
 
   body {
     min-width: 320px;
-    background: #f4f8f8;
+    background: #ffffff;
     -webkit-font-smoothing: antialiased;
   }
 
@@ -55,7 +55,7 @@
   input:focus-visible,
   textarea:focus-visible,
   [role="button"]:focus-visible {
-    outline: 3px solid rgba(13, 148, 136, 0.38);
+    outline: 3px solid rgba(255, 90, 95, 0.4);
     outline-offset: 5px;
   }
 }

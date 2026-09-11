@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Excalidraw } from "@excalidraw/excalidraw";
 import "@excalidraw/excalidraw/index.css";
 
@@ -8,6 +8,18 @@ const MAX_TEXT = 180;
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const safeText = (value) => String(value || "").trim().slice(0, MAX_TEXT);
+
+/* Stable numeric seed per id — id.length collides across nodes and makes
+   Excalidraw render duplicates with identical roughness. */
+const seedOf = (id) => {
+  let h = 2166136261;
+  const s = String(id);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return Math.abs(h % 2147483647);
+};
 
 function toExcalidrawElements(items) {
   const nodes = new Map();
@@ -45,9 +57,9 @@ function toExcalidrawElements(items) {
         strokeWidth: 1,
         roughness: 0,
         opacity: 100,
-        seed: id.length * 97,
+        seed: seedOf(id),
         version: 1,
-        versionNonce: id.length * 193,
+        versionNonce: seedOf(`nonce-${id}`),
         isDeleted: false,
         groupIds: [],
         frameId: null,
@@ -69,15 +81,15 @@ function toExcalidrawElements(items) {
       width,
       height,
       angle: 0,
-      strokeColor: "#34566b",
-      backgroundColor: item.backgroundColor === "transparent" ? "transparent" : (item.backgroundColor || "#e6f4f2"),
+      strokeColor: item.type === "diamond" ? "#ff5a5f" : "#34566b",
+      backgroundColor: item.backgroundColor === "transparent" ? "transparent" : (item.backgroundColor || "#fff1f1"),
       fillStyle: "solid",
       strokeWidth: 2,
       roughness: 0,
       opacity: 100,
-      seed: id.length * 97,
+      seed: seedOf(id),
       version: 1,
-      versionNonce: id.length * 193,
+      versionNonce: seedOf(`nonce-${id}`),
       isDeleted: false,
       groupIds: [],
       frameId: null,
@@ -133,10 +145,12 @@ function toExcalidrawElements(items) {
     const end = nodes.get(String(item.endNodeId || ""));
     if (!start || !end) continue;
 
-    const startX = start.x + start.width / 2;
-    const startY = start.y + start.height;
-    const endX = end.x + end.width / 2;
-    const endY = end.y;
+    // Direction-aware: vertical flow (stacked steps) vs horizontal (comparisons).
+    const vertical = Math.abs(end.y - start.y) >= Math.abs(end.x - start.x);
+    const startX = vertical ? start.x + start.width / 2 : start.x + start.width;
+    const startY = vertical ? start.y + start.height : start.y + start.height / 2;
+    const endX = vertical ? end.x + end.width / 2 : end.x;
+    const endY = vertical ? end.y : end.y + end.height / 2;
     const arrowId = String(item.id).slice(0, 80);
     const arrow = {
       id: arrowId,
@@ -152,15 +166,15 @@ function toExcalidrawElements(items) {
       endBinding: { elementId: end.id, focus: 0, gap: 8 },
       startArrowhead: null,
       endArrowhead: "arrow",
-      strokeColor: "#587080",
+      strokeColor: "#ff5a5f",
       backgroundColor: "transparent",
       fillStyle: "solid",
       strokeWidth: 2,
       roughness: 0,
       opacity: 100,
-      seed: arrowId.length * 97,
+      seed: seedOf(arrowId),
       version: 1,
-      versionNonce: arrowId.length * 193,
+      versionNonce: seedOf(`nonce-${arrowId}`),
       isDeleted: false,
       groupIds: [],
       frameId: null,
@@ -180,12 +194,27 @@ function toExcalidrawElements(items) {
 
 export default function DiagramWhiteboard({ diagram }) {
   const [api, setApi] = useState(null);
+  const fittedRef = useRef(false);
   const elements = useMemo(() => toExcalidrawElements(diagram?.elements), [diagram]);
 
   useEffect(() => {
+    fittedRef.current = false;
+  }, [diagram?.elements?.length === 0]);
+
+  useEffect(() => {
     if (!api || !elements.length) return;
-    api.updateScene({ elements });
-    api.scrollToContent(elements, { fitToContent: true, animate: true, duration: 450 });
+    try {
+      // Remote deltas must not pollute the user's undo stack.
+      api.updateScene({ elements, commitToHistory: false });
+      // Auto-fit once per board — never steal the viewport on later deltas
+      // while the user may be panning/zooming or voice is mid-step.
+      if (!fittedRef.current) {
+        fittedRef.current = true;
+        api.scrollToContent(elements, { fitToContent: true, animate: true, duration: 450 });
+      }
+    } catch {
+      // Excalidraw API torn down (unmount/strict-mode) — next update recovers.
+    }
   }, [api, elements]);
 
   return (
