@@ -2188,11 +2188,11 @@ from server.routes import system as system_routes
 from server.routes import tts as tts_routes
 from server.routes import vision as vision_routes
 
-system_routes.register(app, health=health, ready=ready, api_config=api_config, web_dir=WEB_DIR)
 tts_routes.register(app, tts=tts, ws_tts=ws_tts)
 asr_routes.register(app, ws_asr=ws_asr)
 vision_routes.register(app, api_vision=api_vision)
 chat_routes.register(app, chat=chat)
+system_routes.register(app, health=health, ready=ready, api_config=api_config, web_dir=WEB_DIR)
 
 
 if __name__ == "__main__":
