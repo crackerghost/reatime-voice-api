@@ -30,13 +30,13 @@ export default function BottomBar({
     let raf = 0;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
-    // Aurora blobs: [color, baseX, baseY, baseR, speed, phase]
+    // Soft aurora wash: huge radii, flat core, slow drift — no ball glows.
     const blobs = [
-      { c: [59, 70, 255], x: 0.22, y: 1.05, r: 0.55, s: 0.5, p: 0.0 }, // deep blue
-      { c: [124, 93, 250], x: 0.42, y: 1.12, r: 0.48, s: 0.7, p: 2.1 }, // violet
-      { c: [255, 179, 122], x: 0.58, y: 1.08, r: 0.42, s: 0.6, p: 4.2 }, // warm peach
-      { c: [92, 255, 157], x: 0.78, y: 1.02, r: 0.4, s: 0.55, p: 1.2 }, // mint
-      { c: [255, 90, 95], x: 0.5, y: 1.2, r: 0.5, s: 0.4, p: 3.0 }, // brand red undertow
+      { c: [59, 70, 255], x: 0.22, y: 1.05, r: 1.0, s: 0.14, p: 0.0 }, // deep blue
+      { c: [124, 93, 250], x: 0.42, y: 1.12, r: 0.95, s: 0.16, p: 2.1 }, // violet
+      { c: [255, 179, 122], x: 0.58, y: 1.08, r: 0.9, s: 0.14, p: 4.2 }, // warm peach
+      { c: [92, 255, 157], x: 0.78, y: 1.02, r: 0.88, s: 0.14, p: 1.2 }, // mint
+      { c: [255, 90, 95], x: 0.5, y: 1.2, r: 0.95, s: 0.11, p: 3.0 }, // brand red undertow
     ];
     let drift = blobs.map(() => Math.random() * 100);
 
@@ -67,26 +67,26 @@ export default function BottomBar({
       );
       const pitch = speaking ? spk.pitch : mic.pitch || 0;
       const t = performance.now() / 1000;
-      const agitation = active ? 1 : 0.25;
+      const agitation = active ? 0.5 : 0.12;
 
       // near-black base like the reference
       ctx.globalCompositeOperation = "source-over";
       ctx.fillStyle = "#060609";
       ctx.fillRect(0, 0, W, H);
 
-      // dancing blobs — pitch moves them, volume swells them, random drift
+      // slow blended wash — voice gently breathes the field, no hotspots
       ctx.globalCompositeOperation = "lighter";
       blobs.forEach((b, i) => {
-        if (active) drift[i] += 0.02 + Math.random() * 0.05 * (pitch > 0 ? 1 : 0.3);
-        const px = (pitch > 0 ? (pitch / 480) * 0.22 : 0) * (i % 2 === 0 ? 1 : -1);
-        const cx = (b.x + px) * W + Math.sin(t * b.s * agitation * 2 + b.p + drift[i] * 0.05) * W * 0.09 * (0.4 + level);
-        const cy = b.y * H + Math.cos(t * b.s * agitation * 1.6 + b.p * 1.7) * H * 0.35 * (0.4 + level);
-        const rad = Math.max(10, b.r * Math.min(W, H * 2.4) * (0.65 + level * 1.1));
-        const alpha = active ? 0.5 + level * 0.5 : 0.32;
+        if (active) drift[i] += 0.004 + Math.random() * 0.008 * (pitch > 0 ? 1 : 0.3);
+        const px = (pitch > 0 ? (pitch / 480) * 0.1 : 0) * (i % 2 === 0 ? 1 : -1);
+        const cx = (b.x + px) * W + Math.sin(t * b.s * agitation * 2 + b.p + drift[i] * 0.02) * W * 0.04 * (0.4 + level);
+        const cy = b.y * H + Math.cos(t * b.s * agitation * 1.6 + b.p * 1.7) * H * 0.12 * (0.4 + level);
+        const rad = Math.max(20, b.r * Math.min(W, H * 3.2) * (0.9 + level * 0.35));
+        const alpha = active ? 0.2 + level * 0.14 : 0.15;
         const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
         const [cr, cg, cb] = b.c;
         g.addColorStop(0, `rgba(${cr},${cg},${cb},${alpha.toFixed(3)})`);
-        g.addColorStop(0.55, `rgba(${cr},${cg},${cb},${(alpha * 0.45).toFixed(3)})`);
+        g.addColorStop(0.7, `rgba(${cr},${cg},${cb},${(alpha * 0.55).toFixed(3)})`);
         g.addColorStop(1, "rgba(6,6,9,0)");
         ctx.fillStyle = g;
         ctx.fillRect(0, 0, W, H);

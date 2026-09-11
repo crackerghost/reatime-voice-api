@@ -6,11 +6,11 @@ import { engine } from "./audioEngine.js";
    pitch/volume. Top edge fades into the page via CSS mask. */
 
 const BLOBS = [
-  { c: [48, 64, 220], x: 0.14, y: 0.62, r: 0.75, s: 0.45, p: 0.0 }, // deep blue
-  { c: [110, 80, 235], x: 0.34, y: 0.78, r: 0.7, s: 0.6, p: 2.1 }, // violet
-  { c: [255, 165, 110], x: 0.56, y: 0.74, r: 0.62, s: 0.5, p: 4.2 }, // warm peach
-  { c: [90, 230, 150], x: 0.8, y: 0.6, r: 0.6, s: 0.5, p: 1.2 }, // mint
-  { c: [235, 120, 160], x: 0.45, y: 0.9, r: 0.66, s: 0.38, p: 3.0 }, // rose undertow
+  { c: [48, 64, 220], x: 0.14, y: 0.62, r: 1.1, s: 0.12, p: 0.0 }, // deep blue
+  { c: [110, 80, 235], x: 0.34, y: 0.78, r: 1.05, s: 0.15, p: 2.1 }, // violet
+  { c: [255, 165, 110], x: 0.56, y: 0.74, r: 0.95, s: 0.13, p: 4.2 }, // warm peach
+  { c: [90, 230, 150], x: 0.8, y: 0.6, r: 0.92, s: 0.13, p: 1.2 }, // mint
+  { c: [235, 120, 160], x: 0.45, y: 0.9, r: 1.0, s: 0.1, p: 3.0 }, // rose undertow
 ];
 
 export default function AuroraBg({ listening, speaking, userTalking }) {
@@ -55,28 +55,29 @@ export default function AuroraBg({ listening, speaking, userTalking }) {
       );
       const pitch = speaking ? spk.pitch : mic.pitch || 0;
       const t = performance.now() / 1000;
-      const agitation = active ? 1 : 0.22;
+      const agitation = active ? 0.5 : 0.12;
 
       ctx.globalCompositeOperation = "source-over";
       ctx.clearRect(0, 0, W, H);
 
-      // Big overlapping radii + low alpha = one blended wash, not balls.
+      // Ultra-soft wash: huge radii, flat soft core (no glowing hotspot),
+      // slow drift only. Voice gently breathes the whole field.
       ctx.globalCompositeOperation = "lighter";
       BLOBS.forEach((b, i) => {
-        if (active) drift[i] += 0.015 + Math.random() * 0.04 * (pitch > 0 ? 1 : 0.3);
-        const px = (pitch > 0 ? (pitch / 480) * 0.3 : 0) * (i % 2 === 0 ? 1 : -1);
+        if (active) drift[i] += 0.004 + Math.random() * 0.008 * (pitch > 0 ? 1 : 0.3);
+        const px = (pitch > 0 ? (pitch / 480) * 0.12 : 0) * (i % 2 === 0 ? 1 : -1);
         const cx =
           (b.x + px) * W +
-          Math.sin(t * b.s * agitation * 2 + b.p + drift[i] * 0.04) * W * 0.12 * (0.35 + level);
+          Math.sin(t * b.s * agitation * 2 + b.p + drift[i] * 0.02) * W * 0.05 * (0.4 + level);
         const cy =
           b.y * H +
-          Math.cos(t * b.s * agitation * 1.5 + b.p * 1.7) * H * 0.22 * (0.35 + level);
-        const rad = Math.max(20, b.r * Math.max(W * 0.6, H * 1.6) * (0.8 + level * 0.9));
-        const alpha = active ? 0.34 + level * 0.3 : 0.22;
+          Math.cos(t * b.s * agitation * 1.5 + b.p * 1.7) * H * 0.1 * (0.4 + level);
+        const rad = Math.max(30, b.r * Math.max(W * 0.7, H * 2.2) * (0.9 + level * 0.4));
+        const alpha = active ? 0.13 + level * 0.1 : 0.1;
         const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
         const [cr, cg, cb] = b.c;
         g.addColorStop(0, `rgba(${cr},${cg},${cb},${alpha.toFixed(3)})`);
-        g.addColorStop(0.6, `rgba(${cr},${cg},${cb},${(alpha * 0.5).toFixed(3)})`);
+        g.addColorStop(0.7, `rgba(${cr},${cg},${cb},${(alpha * 0.55).toFixed(3)})`);
         g.addColorStop(1, "rgba(255,255,255,0)");
         ctx.fillStyle = g;
         ctx.fillRect(0, 0, W, H);
