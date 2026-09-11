@@ -2,6 +2,18 @@
 
 import re
 
+def _preserve_code_tokens(text: str) -> str:
+    """Keep code/HTML tokens speakable BEFORE _speechify strips markup.
+
+    <html> / </head> -> " html टैग " (later maps to एचटीएमएल टैग via
+    HINGLISH_TO_DEVANAGARI). Without this, teaching HTML speaks as
+    "टैग्स – आदि" with every tag name eaten by the <tag> stripper.
+    """
+    if not text or "<" not in text:
+        return text
+    return re.sub(r"</?\s*([A-Za-z][A-Za-z0-9]*)\s*/?>", r" \1 टैग ", text)
+
+
 def _speechify(text: str) -> str:
     """Strip markdown/symbols/emoji and flatten to plain spoken sentences."""
     text = re.sub(r"<[^>]+>", " ", text)                    # <tag> leftovers
@@ -101,7 +113,13 @@ HINGLISH_TO_DEVANAGARI = {
     "backend": "बैकएंड", "database": "डेटाबेस", "client": "क्लाइंट",
     "login": "लॉगिन", "logout": "लॉगआउट", "password": "पासवर्ड",
     "account": "अकाउंट", "profile": "प्रोफाइल", "settings": "सेटिंग्स",
-    "notification": "नोटिफिकेशन", "link": "लिंक",
+    "notification": "नोटिफिकेशन", "link": "लिंक",     "tag": "टैग",
+    "tags": "टैग्स", "element": "एलिमेंट", "elements": "एलिमेंट्स",
+    "attribute": "एट्रिब्यूट", "attributes": "एट्रिब्यूट्स",
+    # HTML tag names as spoken (so <head> says हेड, not एच ई ए डी)
+    "head": "हेड", "body": "बॉडी", "title": "टाइटल", "div": "डिव",
+    "span": "स्पैन", "para": "पैरा", "image": "इमेज", "img": "इमेज",
+    "script": "स्क्रिप्ट", "style": "स्टाइल", "href": "एचरेफ",
     # ---- connectors / helpers (missed = letter-spell, so keep explicit) ----
     "need": "नीड", "needs": "नीड्स", "and": "एंड", "or": "ऑर",
     "but": "बट", "because": "बिकॉज़", "with": "विद",

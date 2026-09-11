@@ -90,8 +90,10 @@ def _step_prompt(step_text: str, topic: str) -> list[dict]:
                 "yes/no answers, opinions, single facts, jokes, or meta talk — return no "
                 "tool call for those. When drawing, return a draw_flowchart_or_diagram "
                 "tool call with 3-6 concise nodes (max 6 words each) plus arrows for "
-                "THIS step only. Node ids must be unique — prefix every id with the "
-                "given STEP tag. Layout is dynamic per step: top-to-bottom flow for "
+                "THIS step only. Every rectangle/ellipse/diamond MUST carry non-empty "
+                "text naming the concrete thing from the STEP (tag names, file names, "
+                "exact terms — never blank labels). Node ids must be unique — prefix "
+                "every id with the given STEP tag. Layout is dynamic per step: top-to-bottom flow for "
                 "sequences/processes (x ~80..400, y growing), side-by-side for "
                 "comparisons (x spread 80..640). Shapes: rectangle = component/step, "
                 "ellipse = start/end, diamond = decision, arrow = flow."
@@ -127,10 +129,13 @@ def generate_for_step(
         "tools": [DIAGRAM_TOOL],
         "tool_choice": "auto",
         "temperature": 0.2,
-        "max_tokens": 450,
+        # gpt-oss spends tokens thinking before answering — 450 starves the
+        # tool arguments and Groq answers 400. 800 matches the whole-turn judge.
+        "max_tokens": 800,
     }
     if reasoning_effort and "gpt-oss" in model:
         payload["reasoning_effort"] = reasoning_effort
+    response = None
     try:
         response = client.post(
             url,
@@ -138,7 +143,15 @@ def generate_for_step(
             json=payload,
         )
         response.raise_for_status()
-    except Exception:
+    except Exception as e:
+        # Log the body once — Groq 400s carry the real reason (bad tool
+        # payload, token budget, model capability). Voice is unaffected.
+        try:
+            body = response.text[:300] if response is not None else ""
+        except Exception:
+            body = ""
+        import logging as _logging
+        _logging.getLogger("voice_api").warning("Diagram planner skipped (%s) %s", e, body)
         return None
     message = (response.json().get("choices") or [{}])[0].get("message") or {}
     arguments = None

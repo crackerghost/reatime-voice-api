@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { FaBars, FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTrash, FaVolumeHigh, FaWandMagicSparkles, FaXmark } from "react-icons/fa6";
 import Sidebar from "./Sidebar.jsx";
 import BottomBar from "./BottomBar.jsx";
+import AuroraBg from "./AuroraBg.jsx";
 const DiagramWhiteboard = lazy(() => import("./DiagramWhiteboard.jsx"));
 import { engine } from "./audioEngine.js";
 import { chatMessage, pingMessage, stopMessage } from "./services/ttsProtocol.js";
@@ -1671,7 +1672,8 @@ export default function App() {
 
   /* ---------- UI: single screen + sidebar + Gemini bottom bar ---------- */
   return (
-    <div className="flex h-screen overflow-hidden bg-white text-slate-900">
+    <div className="relative flex h-screen overflow-hidden bg-white text-slate-900">
+      <AuroraBg listening={listening} speaking={speaking} userTalking={userTalking} />
       <Sidebar
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
@@ -1694,8 +1696,8 @@ export default function App() {
         />
       )}
 
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center gap-3 border-b border-slate-200/70 px-4 py-3 sm:px-6">
+      <div className="relative z-10 flex min-w-0 flex-1 flex-col">
+        <header className="flex items-center gap-3 border-b border-slate-200/70 bg-white/70 px-4 py-3 backdrop-blur sm:px-6">
           <button
             onClick={() => setSidebarOpen((v) => !v)}
             className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 hover:text-[#ff5a5f]"

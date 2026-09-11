@@ -257,6 +257,7 @@ from server.speech.normalization import (
     _devanagari_only,
     _fix_pronunciation,
     _naturalize,
+    _preserve_code_tokens,
     _speechify,
 )
 from server.speech.tts_engine import TTSConfig, TTSEngine
@@ -605,6 +606,7 @@ def _speech_sentence(sent: str, complete: bool = True) -> str:
     complete=False leaves off the terminal danda/full-stop so a phrase that was
     flushed early (mid-sentence) doesn't get an artificial full stop.
     """
+    sent = _preserve_code_tokens(sent)
     sent = _speechify(sent)
     sent = _naturalize(sent)
     sent = _convert_numbers_to_hindi(sent)
@@ -2123,6 +2125,7 @@ def chat(req: ChatRequest, request: Request):
     messages = [{"role": "system", "content": LLM_SYSTEM_PROMPT}, *history]
     reply = _call(messages)
 
+    reply = _preserve_code_tokens(reply)
     reply = _speechify(reply)
     reply = _naturalize(reply)
     reply = _devanagari_only(reply)
