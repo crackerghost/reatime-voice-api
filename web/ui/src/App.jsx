@@ -116,6 +116,50 @@ export default function App() {
   const turnStartRef = useRef(0); // browser-side: when the current turn was submitted (first-audio stopwatch)
   const activeTurnIdRef = useRef(0);
   const diagramTurnRef = useRef(null);
+  const diagramQueueRef = useRef([]); // staged board deltas for smooth step-by-step draw
+  const diagramTimerRef = useRef(0);
+
+  /* Merge one staged board batch into state (id-keyed, capped). */
+  const mergeDiagramBatch = useCallback((incoming) => {
+    setDiagram((prev) => {
+      const seen = new Set();
+      const merged = [];
+      for (const el of [...(prev?.elements || []), ...incoming]) {
+        if (!el || !el.id || seen.has(el.id)) continue;
+        seen.add(el.id);
+        merged.push(el);
+      }
+      return { elements: merged.slice(-40) };
+    });
+  }, []);
+
+  /* Staggered drain: one board batch per beat so steps draw one-by-one
+     instead of dumping all divs at once. */
+  const drainDiagramQueue = useCallback(() => {
+    const batch = diagramQueueRef.current.shift();
+    if (!batch) {
+      diagramTimerRef.current = 0;
+      return;
+    }
+    mergeDiagramBatch(batch);
+    diagramTimerRef.current = setTimeout(() => {
+      // re-dispatch through the ref so unmount/new-turn clears still apply
+      if (diagramQueueRef.current.length) drainDiagramQueue();
+      else diagramTimerRef.current = 0;
+    }, 450);
+  }, [mergeDiagramBatch]);
+
+  const clearDiagramQueue = useCallback(() => {
+    diagramQueueRef.current = [];
+    if (diagramTimerRef.current) {
+      clearTimeout(diagramTimerRef.current);
+      diagramTimerRef.current = 0;
+    }
+  }, []);
+
+  useEffect(() => () => {
+    if (diagramTimerRef.current) clearTimeout(diagramTimerRef.current);
+  }, []);
   const openAssistantId = useRef(null);
   const assistantTextRef = useRef("");
   const asrWsRef = useRef(null); // /ws/asr connection (streaming faster-whisper)
@@ -643,6 +687,7 @@ export default function App() {
       const text = (rawText || "").trim();
       if (!text) return;
       hardStop();
+      clearDiagramQueue();
       activeTurnIdRef.current += 1;
       diagramTurnRef.current = null;
       setDiagram(null);
@@ -845,21 +890,18 @@ export default function App() {
           } else if (m.type === "diagram") {
             if (dropRef.current) return;
             if (m.client_turn_id && m.client_turn_id !== String(activeTurnIdRef.current)) return;
-            // Whole-board (legacy) or window delta (watcher sidecar) — both merge by id.
+            // Whole-board (legacy) or window delta (watcher sidecar).
             const incoming = m.diagram?.elements?.length ? m.diagram.elements : (m.elements?.length ? m.elements : null);
             if (!incoming) return;
             if (m.turn_id) diagramTurnRef.current = m.turn_id;
             console.info(`[diagram] ${m.mode === "append" ? `delta window #${m.window_n ?? "?"}` : "board"}: +${incoming.length} element(s)`);
-            setDiagram((prev) => {
-              const seen = new Set();
-              const merged = [];
-              for (const el of [...(prev?.elements || []), ...incoming]) {
-                if (!el || !el.id || seen.has(el.id)) continue;
-                seen.add(el.id);
-                merged.push(el);
-              }
-              return { elements: merged.slice(-40) };
-            });
+            if (m.mode === "append" && m.window_n != null) {
+              // Stage window deltas — one batch per beat draws step-by-step.
+              diagramQueueRef.current.push(incoming);
+              if (!diagramTimerRef.current) drainDiagramQueue();
+            } else {
+              mergeDiagramBatch(incoming);
+            }
           } else if (m.type === "diagram_error") {
             if (!dropRef.current) console.info("[diagram] visual explanation unavailable", m.message || "");
           } else if (m.type === "text") {
@@ -1646,6 +1688,7 @@ export default function App() {
   /* ---------- single-screen shell handlers (UI only — voice logic untouched) ---------- */
   const clearChat = useCallback(() => {
     hardStop();
+    clearDiagramQueue();
     historyRef.current = [];
     openAssistantId.current = null;
     assistantTextRef.current = "";

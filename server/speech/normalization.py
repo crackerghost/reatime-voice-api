@@ -86,6 +86,10 @@ HINGLISH_TO_DEVANAGARI = {
     "revision": "रिविज़न", "syllabus": "सिलेबस",
     "notes": "नोट्स", "note": "नोट", "home": "होम",
     "school": "स्कूल", "homeworkdone": "होमवर्क डन",
+    # hinglish postpositions (latin slip -> sahi hindi word)
+    "se": "से", "tak": "तक", "par": "पर", "ko": "को",
+    "ka": "का", "ki": "की", "mein": "में", "me": "में",
+    "ne": "ने",
     # ---- daily verbs (bol-chaal wale) ----
     "help": "हेल्प", "try": "ट्राई", "check": "चेक",
     "start": "स्टार्ट", "stop": "स्टॉप", "wait": "वेट",
@@ -120,6 +124,17 @@ HINGLISH_TO_DEVANAGARI = {
     "head": "हेड", "body": "बॉडी", "title": "टाइटल", "div": "डिव",
     "span": "स्पैन", "para": "पैरा", "image": "इमेज", "img": "इमेज",
     "script": "स्क्रिप्ट", "style": "स्टाइल", "href": "एचरेफ",
+    # web-dev vocabulary the tutor speaks daily (missing = letter-spelled)
+    "hypertext": "हाइपरटेक्स्ट", "hyper": "हाइपर", "text": "टेक्स्ट",
+    "heading": "हेडिंग", "headings": "हेडिंग्स",
+    "paragraph": "पैराग्राफ", "paragraphs": "पैराग्राफ्स",
+    "list": "लिस्ट", "lists": "लिस्ट्स", "hyperlink": "हाइपरलिंक",
+    "src": "सोर्स", "alt": "ऑल्ट", "index": "इंडेक्स",
+    "h1": "एच वन", "h2": "एच टू", "h3": "एच थ्री",
+    "h4": "एच फोर", "h5": "एच फाइव", "h6": "एच सिक्स",
+    "ul": "यू एल", "ol": "ओ एल", "li": "एल आई",
+    "doctype": "डॉकटाइप", "meta": "मेटा", "footer": "फुटर",
+    "header": "हेडर", "section": "सेक्शन", "article": "आर्टिकल",
     # ---- connectors / helpers (missed = letter-spell, so keep explicit) ----
     "need": "नीड", "needs": "नीड्स", "and": "एंड", "or": "ऑर",
     "but": "बट", "because": "बिकॉज़", "with": "विद",
@@ -235,14 +250,29 @@ def _fix_pronunciation(text: str) -> str:
 
 HAS_LATIN = re.compile(r"[A-Za-z]")
 
+_DIGIT_HINDI = {
+    "0": "शून्य", "1": "वन", "2": "टू", "3": "थ्री", "4": "फोर",
+    "5": "फाइव", "6": "सिक्स", "7": "सेवन", "8": "एट", "9": "नाइन",
+}
+
 
 def _devanagari_only(text: str) -> str:
-    """Rewrite leftover Latin words as Devanagari so speech keeps the Hindi accent."""
+    """Rewrite leftover Latin words as Devanagari so speech keeps the Hindi accent.
+
+    Captures trailing digits with the word (h1 -> एच वन, not एचएक): full-token
+    dict hit first, else letter NAMES + spoken digits.
+    """
     def repl(m):
         low = m.group(0).lower()
         if low in HINGLISH_TO_DEVANAGARI:
             return HINGLISH_TO_DEVANAGARI[low]
-        return "".join(LATIN_TO_DEVANAGARI.get(ch, "") for ch in low)
+        out = []
+        for ch in low:
+            if ch.isdigit():
+                out.append(_DIGIT_HINDI.get(ch, ch))
+            else:
+                out.append(LATIN_TO_DEVANAGARI.get(ch, ""))
+        return " ".join(o for o in out if o)
 
-    return re.sub(r"[A-Za-z]+", repl, text) if HAS_LATIN.search(text) else text
+    return re.sub(r"[A-Za-z]+\d*", repl, text) if HAS_LATIN.search(text) else text
 

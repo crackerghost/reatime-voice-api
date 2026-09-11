@@ -597,7 +597,9 @@ def _convert_numbers_to_hindi(text: str) -> str:
         except Exception:
             return s
 
-    return re.sub(r"\d+", _repl, text)
+    # Skip digits glued to Latin letters (h1, html5) — _devanagari_only
+    # speaks those as एच वन, एचटीएमएल फाइव. Standalone numbers convert here.
+    return re.sub(r"(?<![A-Za-z])\d+", _repl, text)
 
 
 def _speech_sentence(sent: str, complete: bool = True) -> str:
@@ -729,7 +731,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 sent = _speech_sentence(raw, complete)
                 if not sent or len(sent) <= 2:  # junk like "." or ")." from stray punctuation
                     continue
-                sent_q.put((sent, complete))
+                sent_q.put((raw.strip(), sent, complete))
         except Exception as e:  # noqa: BLE001 — reported at the consumer end
             llm_error.append(f"{type(e).__name__}: {e}")
         finally:
@@ -789,12 +791,14 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     # ---- watcher sidecar: one planner thread per shipped audio window ----
     win_seq = [0]  # ship order == audio order (single producer)
 
-    def _diagram_watch(n: int, win_text: str) -> None:
+    def _diagram_watch(n: int, win_text: str, raw_text: str = "") -> None:
         try:
             if stop_evt is not None and stop_evt.is_set():
                 return
+            # Planner reads RAW LLM text (code/tag names intact) — the spoken
+            # window had them mangled for TTS (एचटीएमएल टैग, एच वन...).
             d = _generate_step(
-                diagram_ctx["key"], win_text, diagram_ctx.get("topic", ""),
+                diagram_ctx["key"], raw_text or win_text, diagram_ctx.get("topic", ""),
                 stop_evt, client=http_client, url=MISTRAL_URL,
                 model=LLM_MODEL, reasoning_effort=LLM_REASONING_EFFORT,
                 id_prefix=f"w{n}",
@@ -807,30 +811,40 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 "turn_id": diagram_ctx.get("turn_id", ""),
                 "client_turn_id": diagram_ctx.get("client_turn_id", ""),
             }))
-            log.info("Diagram watcher: window #%d -> %d element(s)", n, len(d["elements"]))
+            _labels = [str(e.get("text", ""))[:28] for e in d["elements"] if e.get("type") != "arrow"][:4]
+            log.info("Diagram watcher: window #%d -> %d element(s) [%s]", n, len(d["elements"]), " | ".join(_labels))
         except Exception as e:  # noqa: BLE001 — board must never break voice
             log.warning("Diagram watcher window #%d skipped: %s", n, e)
 
-    def _ship_window(win_text: str, steps: int, watch: bool = True) -> None:
+    def _ship_window(win_text: str, steps: int, watch: bool = True, raw_text: str = "") -> None:
         win_seq[0] += 1
         n = win_seq[0]
         win_q.put({"text": win_text, "steps": steps, "n": n})
         if watch and diagram_ctx:
-            threading.Thread(target=_diagram_watch, args=(n, win_text), daemon=True).start()
+            threading.Thread(target=_diagram_watch, args=(n, win_text, raw_text), daemon=True).start()
 
     try:
         window = []          # phrases buffered for the next audio window
+        raw_window: list[str] = []  # parallel RAW phrases (code terms intact) for the planner
         window_chars = 0
         emitted_audio = False
         emitted_text = False  # did the LLM produce ANY speakable sentence?
         text_buf = ""        # partial phrases pending a complete sentence (caption)
+
+        def _take_raw() -> str:
+            raw_text = " ".join(raw_window).strip()
+            raw_window.clear()
+            return raw_text
+
         while True:
             item = sent_q.get()
             if item is None:
                 break  # LLM stream ended (or was stopped)
             if stop_evt is not None and stop_evt.is_set():
                 break
-            text, complete = item
+            raw, text, complete = item
+            if raw:
+                raw_window.append(raw)
             if complete:
                 sent_count += 1
                 if sent_count > MAX_CHAT_SENTENCES:
@@ -857,7 +871,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             for piece in _clause_units(text):
                 if window and window_chars + len(piece) > WINDOW_CHAR_CAP:
                     steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
-                    _ship_window(" ".join(window), steps)
+                    _ship_window(" ".join(window), steps, raw_text=_take_raw())
                     window, window_chars = [], 0
                     emitted_audio = True
                 window.append(piece)
@@ -885,11 +899,11 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                             text_to_speak = cut_text
                         else:
                             window, window_chars = [], 0
-                        _ship_window(text_to_speak, min(num_step, FIRST_WINDOW_STEP))
+                        _ship_window(text_to_speak, min(num_step, FIRST_WINDOW_STEP), raw_text=_take_raw())
                         emitted_audio = True
                 else:
                     if sentence_done or window_chars >= MIN_WINDOW_CHARS * 2:
-                        _ship_window(" ".join(window), num_step)
+                        _ship_window(" ".join(window), num_step, raw_text=_take_raw())
                         window, window_chars = [], 0
                         emitted_audio = True
             if (is_greeting and sent_count >= GREETING_MAX) or sent_count >= MAX_CHAT_SENTENCES:
@@ -905,7 +919,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             emitted_audio = True
         if window and not (stop_evt is not None and stop_evt.is_set()):
             steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
-            _ship_window(" ".join(window), steps)  # final tail window
+            _ship_window(" ".join(window), steps, raw_text=_take_raw())  # final tail window
         win_q.put(None)  # stop the audio thread
         audio_done.wait(timeout=180)
         if llm_error and not emitted_audio:

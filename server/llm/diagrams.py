@@ -89,11 +89,18 @@ def _step_prompt(step_text: str, topic: str) -> list[dict]:
                 "a comparison, a timeline, or an architecture. DO NOT draw for greetings, "
                 "yes/no answers, opinions, single facts, jokes, or meta talk — return no "
                 "tool call for those. When drawing, return a draw_flowchart_or_diagram "
-                "tool call with 3-6 concise nodes (max 6 words each) plus arrows for "
-                "THIS step only. Every rectangle/ellipse/diamond MUST carry non-empty "
+                "tool call with 3-6 nodes plus arrows for THIS step only. Labels may "
+                "explain, not just name — up to ~15 words per node when the meaning "
+                "needs it (e.g. 'h1-h6 tags: headings, h1 biggest'). Size width to "
+                "fit the text (long text = width 300-500). Every rectangle/ellipse/"
+                "diamond MUST carry non-empty "
                 "text naming the concrete thing from the STEP (tag names, file names, "
-                "exact terms — never blank labels). Node ids must be unique — prefix "
-                "every id with the given STEP tag. Layout is dynamic per step: top-to-bottom flow for "
+                "exact terms — never blank labels). Language rule: the BOARD is "
+                "always ENGLISH — short English labels (max 6 words), code/tag/ "
+                "attribute/file names exactly as-is (HTML, h1, href, index.html). "
+                "Never Devanagari on the board; Hindi is voice-only. "
+                "Node ids must be unique — prefix every id with the "
+                "given STEP tag. Layout is dynamic per step: top-to-bottom flow for "
                 "sequences/processes (x ~80..400, y growing), side-by-side for "
                 "comparisons (x spread 80..640). Shapes: rectangle = component/step, "
                 "ellipse = start/end, diamond = decision, arrow = flow."
@@ -183,6 +190,16 @@ def generate_for_step(
                 item["startNodeId"] = nodes[item["startNodeId"]]
             if item.get("endNodeId") in nodes:
                 item["endNodeId"] = nodes[item["endNodeId"]]
+    # Blank-label nodes render as empty boxes — worse than no board. Drop
+    # shapes with no text, then re-drop arrows left dangling by that.
+    out = [it for it in out
+           if it["type"] == "arrow" or str(it.get("text", "")).strip()]
+    keep = {it["id"] for it in out if it["type"] != "arrow"}
+    out = [it for it in out
+           if it["type"] != "arrow"
+           or (it.get("startNodeId") in keep and it.get("endNodeId") in keep)]
+    if not any(it["type"] != "arrow" for it in out):
+        return None
     # Y-offset per window so steps stack downward instead of overlapping.
     try:
         win_n = int(id_prefix.lstrip("w") or 1)
