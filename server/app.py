@@ -15,14 +15,12 @@ Example:
 """
 
 import asyncio
-import functools
 import io
 import json
 import logging
 import os
 import queue
 import re
-import sys
 import threading
 import time
 import uuid
@@ -61,58 +59,17 @@ HERE = Path(__file__).resolve().parent.parent
 
 
 # ---------- Persistent HTTP(S) clients (connection reuse) ----------
-# httpx sync clients are not thread-safe, so we keep ONE client per thread
-# (uvicorn's threadpool + our worker threads). Reusing connections across
-# turns removes the per-call TLS handshake + connect (~50-200 ms) from the
-# reply path. Clients are created lazily and closed at process exit.
-_LLM_CLIENT_TLS = threading.local()
-_VISION_CLIENT_TLS = threading.local()
-
-
-def _llm_http_client() -> httpx.Client:
-    """Thread-local httpx.Client for the LLM endpoint (connection reuse)."""
-    c = getattr(_LLM_CLIENT_TLS, "c", None)
-    if c is None:
-        c = httpx.Client(timeout=LLM_STREAM_TIMEOUT, follow_redirects=True)
-        _LLM_CLIENT_TLS.c = c
-    return c
-
-
-def _vision_http_client() -> httpx.Client:
-    """Thread-local httpx.Client for the vision endpoint (connection reuse)."""
-    c = getattr(_VISION_CLIENT_TLS, "c", None)
-    if c is None:
-        c = httpx.Client(timeout=VISION_TIMEOUT, follow_redirects=True)
-        _VISION_CLIENT_TLS.c = c
-    return c
+# Thread-local HTTP clients managed by ProviderClients (server/http_clients.py).
+# Reusing connections across turns removes the per-call TLS handshake + connect
+# (~50-200 ms) from the reply path.
 
 
 # ---------- Single-GPU guard: TTS generate() vs VLM generate() ----------
-# OmniVoice and Qwen2.5-VL share the same GPU. If a background screen-describe
-# runs while a TTS window generates, both slow down and 16 GB VRAM (T4) can
-# spike. TTS windows are short, so the VLM simply waits its turn.
-GPU_GENERATE_LOCK = threading.Lock()
-# Screen-vision pause gate: while a chat/synth turn is streaming, background
-# VLM/OCR warm-ups hold OFF starting a generate (they would queue behind the
-# reply's TTS windows on GPU_GENERATE_LOCK and add to first-audio latency).
-# _screen_resume_evt wakes the paused worker the instant the reply finishes.
-_screen_busy_count = [0]
-_screen_busy_lock = threading.Lock()
-_screen_resume_evt = threading.Event()
-
-
-def _screen_pause_begin() -> None:
-    """Mark a turn as synthesizing — background screen warm-ups pause."""
-    with _screen_busy_lock:
-        _screen_busy_count[0] += 1
-
-
-def _screen_pause_end() -> None:
-    """Turn finished — resume background screen warm-ups."""
-    with _screen_busy_lock:
-        _screen_busy_count[0] = max(0, _screen_busy_count[0] - 1)
-        if _screen_busy_count[0] == 0:
-            _screen_resume_evt.set()
+# Shared primitives live in server/gpu.py so app.py AND vision/service.py use
+# the SAME lock/counter/event (a second copy would silently break exclusion).
+from server.gpu import gpu_generate_lock as GPU_GENERATE_LOCK
+from server.gpu import screen_pause_begin as _screen_pause_begin
+from server.gpu import screen_pause_end as _screen_pause_end
 
 
 @asynccontextmanager
@@ -183,7 +140,12 @@ DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.0"))      # rate when a r
 STEP_MIN = int(os.environ.get("VOICE_STEP_MIN", "4"))
 STEP_MAX = int(os.environ.get("VOICE_STEP_MAX", "64"))
 GREETING_MAX = int(os.environ.get("VOICE_GREETING_MAX", "2"))  # sentences for small-talk replies
-FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "18"))  # hard char cap on the 1st audio window (small = fast first audio)
+FIRST_WINDOW_CHARS = int(os.environ.get("VOICE_FIRST_WINDOW_CHARS", "40"))  # chars in the 1st audio window (T4: 30-45 covers a full clause so the reply starts mid-flow, not mid-word)
+JITTER_FRAMES = max(0, int(os.environ.get("VOICE_JITTER_FRAMES", "1")))  # client audio frames buffered before playback
+# T4 fluency: language id + per-window edge trims passed to every OmniVoice generate()
+TTS_LANGUAGE = os.environ.get("VOICE_TTS_LANGUAGE", "hi").strip().lower() or "hi"
+TTS_PAD_S = float(os.environ.get("VOICE_TTS_PAD_S", "0.02"))   # edge padding per streamed window (upstream default 0.1s = dead air each frame)
+TTS_FADE_S = float(os.environ.get("VOICE_TTS_FADE_S", "0.02"))  # edge fades per streamed window (same per-window cost)
 
 # MPS (Apple Silicon) / CUDA run best in fp16; CPU falls back to fp32.
 # Override with VOICE_API_DEVICE=cpu|mps|cuda and VOICE_API_DTYPE=fp16|fp32.
@@ -299,18 +261,25 @@ from server.speech.normalization import (
 from server.speech.tts_engine import TTSConfig, TTSEngine
 
 
+from server.vision import service as vision_service
 from server.vision.service import (
     SCREEN_CACHE_TTL,
+    SCREEN_STALE_DESC_S,
+    SCREEN_WAIT_MAX_S,
     VISION_BACKEND,
     VISION_BASE_URL,
     VISION_LOCAL_MODEL,
     VISION_MODEL,
     _load_local_vlm,
     _load_ocr,
+    _ocr_cache,
+    _ocr_lock,
     _screen_backend_choice,
     _screen_cached_desc,
+    _screen_cache,
     _screen_context,
     _screen_layers,
+    _screen_lock,
     _vision_ready,
     _vision_ready_backend,
     _warm_screen_cache,
@@ -381,8 +350,7 @@ def _recent_screen_block() -> str | None:
     from ever claiming blindness mid-share. Frame-bearing turns always take
     precedence (fresh OCR wins over this).
     """
-    global _last_screen_activity
-    if time.monotonic() - _last_screen_activity > SCREEN_RECENT_S:
+    if time.monotonic() - vision_service._last_screen_activity > SCREEN_RECENT_S:
         return None
     layers: dict = {"ocr": "", "desc": ""}
     with _screen_lock:
@@ -460,19 +428,14 @@ WEB_DIR = HERE / "web" / "ui" / "dist"
 
 
 def _llm_api_key() -> str:
-    """LLM API key: GROQ_API_KEY (default provider now) -> LLM_API_KEY ->
-    MISTRAL_API_KEY (legacy fallback), from env or the .env file."""
+    """LLM API key: GROQ_API_KEY -> LLM_API_KEY -> MISTRAL_API_KEY.
+
+    .env is loaded once at startup by _load_dotenv(); read from os.environ only.
+    """
     for name in ("GROQ_API_KEY", "LLM_API_KEY", "MISTRAL_API_KEY"):
         key = os.environ.get(name, "").strip()
         if key:
             return key
-        env_file = HERE / ".env"
-        if env_file.exists():
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                if line.startswith(f"{name}="):
-                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if key:
-                        return key
     return ""
 
 
@@ -497,6 +460,7 @@ def _llm_stream_phrases(
     key: str,
     messages: list[dict],
     temperature: float,
+    http_client: httpx.Client,
     max_tokens: int | None = None,
     phrase_chars: int = FIRST_WINDOW_CHARS,
 ):
@@ -530,7 +494,7 @@ def _llm_stream_phrases(
         yielded = False
         retry_wait = 0.8
         try:
-            with _llm_http_client().stream("POST", MISTRAL_URL, headers=headers, json=payload) as r:
+            with http_client.stream("POST", MISTRAL_URL, headers=headers, json=payload) as r:
                 if r.status_code != 200:
                     body = r.read()[:300]
                     if r.status_code == 429 or r.status_code >= 500:
@@ -696,7 +660,8 @@ def _clause_units(sent: str) -> list[str]:
     return [p for p in final if p]
 
 
-def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt, t0=None):
+def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt, t0=None,
+                 http_client: httpx.Client | None = None):
     """3-thread pipeline: LLM producer -> text/windowing -> audio synth.
 
     Pipeline (all three run concurrently, so nothing serializes):
@@ -718,6 +683,8 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     Events on out_q, in order: ("text", sentence)... then ("audio", wav) per
     window, ending with ("done", None) or ("error", msg).
     """
+    if http_client is None:
+        http_client = state.runtime.provider_clients.llm()
     # Small talk stays short (same rule as /api/chat): stop after 2 sentences
     last_user = messages[-1]["content"] if messages else ""
     is_greeting = bool(GREETING_RE.search(last_user))
@@ -736,7 +703,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
 
     def llm_producer():
         try:
-            for raw, complete in _llm_stream_phrases(key, messages, temperature):
+            for raw, complete in _llm_stream_phrases(key, messages, temperature, http_client):
                 if stop_evt is not None and stop_evt.is_set():
                     return
                 if producer_stop.is_set():
@@ -761,11 +728,9 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 if stop_evt is not None and stop_evt.is_set():
                     continue  # drop windows queued after an interrupt
                 t_gen = time.perf_counter()
-                w = _generate(state.ov_model, state.voice_prompt, win["text"],
-                              win["steps"], _pick_speed(win["text"], speed),
-                              TEMPERATURE)
+                w = TTS_ENGINE.generate(win["text"], win["steps"], _pick_speed(win["text"], speed), TEMPERATURE)
                 gen_s = time.perf_counter() - t_gen
-                w = _insert_pauses(w, SAMPLE_RATE, win["text"])
+                w = TTS_ENGINE.insert_pauses(w, win["text"])
                 dur_s = w.shape[-1] / SAMPLE_RATE
                 rtf = gen_s / dur_s if dur_s > 0 else 0.0
                 timing["windows"] += 1
@@ -924,7 +889,7 @@ async def lifespan(_app: FastAPI):
     # before the OCR engine exists, _screen_layers sees no layer at all, and
     # the tutor wrongly claims it can't see the screen.
     threading.Thread(
-        target=lambda: (_load_ocr(), None)[-1] if not _ocr_disabled else None,
+        target=lambda: (_load_ocr(), None)[-1] if not vision_service._ocr_disabled else None,
         daemon=True,
     ).start()
     # Preload the local VLM as well. Lazily it loads on the FIRST screen share
@@ -952,7 +917,7 @@ def health():
 
 def ready():
     runtime = app.state.runtime
-    runtime.readiness.asr = bool(_asr_ready)
+    runtime.readiness.asr = bool(_asr_ready())
     runtime.readiness.vision = bool(_vision_ready())
     runtime.readiness.provider = bool(_llm_api_key())
     return runtime.readiness.public()
@@ -990,7 +955,7 @@ def api_config():
         "asr_speculative": ASR_SPECULATIVE,
         "spec_chat": ASR_SPECULATIVE,  # the UI reads this key (client-side speculative-turn toggle)
         "speculative_ms": ASR_SPECULATIVE_MS,
-        "asr_ready": _asr_ready,  # True once the warmup finished loading Whisper
+        "asr_ready": _asr_ready(),  # True once the warmup finished loading Whisper
         # chat reply shaping
         "first_step": FIRST_WINDOW_STEP,
         "stream_window": STREAM_WINDOW,
@@ -1018,6 +983,7 @@ def api_config():
         "diagram_enabled": DIAGRAM_ENABLED,
         # browser-side conversation behaviour (read by web/ui/src/App.jsx)
         "chat_step": int(os.environ.get("VOICE_CHAT_STEP", "8")),  # nfe_step the UI sends
+        "jitter_frames": JITTER_FRAMES,
         "max_history": int(os.environ.get("VOICE_MAX_HISTORY", "12")),
         "ws_reconnect_ms": int(os.environ.get("VOICE_WS_RECONNECT_MS", "1500")),
         "rec_restart_ms": int(os.environ.get("VOICE_REC_RESTART_MS", "400")),
@@ -1038,15 +1004,14 @@ def api_config():
 
 
 def tts(req: TTSRequest, request: Request):
-    state = request.app.state
     start = time.perf_counter()
     try:
-        wav = _generate(state.ov_model, state.voice_prompt, req.text, req.nfe_step, req.speed, TEMPERATURE)
-    except Exception as e:  # noqa: BLE001 — surface model errors to the client
-        log.exception("Inference failed")
+        wav = TTS_ENGINE.generate(req.text, req.nfe_step, req.speed, TEMPERATURE)
+    except RuntimeError as e:
+        log.exception("TTS inference failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    wav = _insert_pauses(wav, SAMPLE_RATE, req.text)
+    wav = TTS_ENGINE.insert_pauses(wav, req.text)
     elapsed = time.perf_counter() - start
     log.info("Generated %.1fs of audio in %.2fs", wav.shape[-1] / SAMPLE_RATE, elapsed)
 
@@ -1079,7 +1044,7 @@ def tts(req: TTSRequest, request: Request):
 
 def _wav_bytes(samples: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
-    sf.write(buf, samples, sr, format="WAV")
+    sf.write(buf, samples, sr, format="WAV", subtype="PCM_16")
     return buf.getvalue()
 
 
@@ -1108,13 +1073,15 @@ STREAM_MAX_CHARS = int(os.environ.get("VOICE_STREAM_MAX_CHARS", "75"))
 # Chat audio is synthesized in windows of this many sentences per generate()
 # call so prosody flows across the window (1 = old choppy per-sentence mode).
 STREAM_WINDOW = max(1, int(os.environ.get("VOICE_STREAM_WINDOW", "2")))
-# Max text chars per audio window and per clause piece — keeps every frame to
-# ~4-5s of speech so a reply starts fast and an interrupt tail stays tiny.
-WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "70"))
+# Max text chars per audio window and per clause piece — on the T4 the GPU
+# outruns the audio clock at num_step<=6, so wider windows mean FEWER
+# prosody restarts (more natural flow) with no extra wait between frames.
+WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "110"))
 # Never ship a TTS audio window smaller than this (except the final tail).
 # Stops the LLM's short sentences from becoming tiny 2-3 word audio chunks
 # that keep breaking the flow — windows only go out once they're worth speaking.
-MIN_WINDOW_CHARS = int(os.environ.get("VOICE_MIN_WINDOW_CHARS", "18"))
+# T4: 28 chars ≈ one full clause; smaller values fragment the reply audibly.
+MIN_WINDOW_CHARS = int(os.environ.get("VOICE_MIN_WINDOW_CHARS", "28"))
 _PIECE_MAX = max(40, min(120, WINDOW_CHAR_CAP))  # single unit fed to TTS
 # Hard ceiling on sentences per chat reply (the LLM is told 3-4 but can ramble;
 # this bounds worst-case latency so a turn never turns into a monologue).
@@ -1138,79 +1105,14 @@ TTS_ENGINE = TTSEngine(
         stream_max_chars=STREAM_MAX_CHARS,
         first_window_step=FIRST_WINDOW_STEP,
         pause_seconds=PAUSE_SECONDS,
+        language=TTS_LANGUAGE,
+        pad_duration=TTS_PAD_S,
+        fade_duration=TTS_FADE_S,
     ),
     _fix_pronunciation,
 )
 
 
-def _stream_chunks(text: str, max_bytes: int) -> list[str]:
-    """Split text into small speakable chunks at sentence boundaries (incl. ।),
-    hard-splitting anything longer than max_bytes at word/char level."""
-    clauses = re.split(r"(?<=[।?!.])\s*", text)
-    chunks, cur = [], ""
-    for clause in clauses:
-        clause = clause.strip()
-        if not clause:
-            continue
-        if len((cur + clause).encode("utf-8")) <= max_bytes:
-            cur += clause
-            continue
-        if cur:
-            chunks.append(cur)
-            cur = ""
-        for word in clause.split(" "):
-            word = word.strip()
-            if not word:
-                continue
-            cand = (cur + " " + word).strip() if cur else word
-            if len(cand.encode("utf-8")) <= max_bytes:
-                cur = cand
-                continue
-            if cur:
-                chunks.append(cur)
-                cur = ""
-            buf = ""
-            for ch in word:
-                if len((buf + ch).encode("utf-8")) <= max_bytes:
-                    buf += ch
-                else:
-                    chunks.append(buf)
-                    buf = ch
-            cur = buf
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def _insert_pauses(wav: np.ndarray, sr: int, text: str) -> np.ndarray:
-    """Insert short silences at punctuation marks so speech isn't flat/robotic."""
-    total = len(wav)
-    if total == 0 or not text:
-        return wav
-    n_chars = max(len(text), 1)
-    parts = []
-    start = 0
-    for i, ch in enumerate(text):
-        pause = PAUSE_SECONDS.get(ch)
-        if pause is None:
-            continue
-        est = int(total * (i + 1) / n_chars)
-        if est <= start or est > total:
-            continue
-        seg = wav[start:est]
-        if len(seg) > 0:
-            parts.append(seg)
-        parts.append(np.zeros(int(pause * sr), dtype=wav.dtype))
-        start = est
-    if start < total:
-        parts.append(wav[start:])
-    if not parts:
-        return wav
-    return np.concatenate(parts)
-
-
-def _generate(model, voice_prompt, text, num_step, speed, temperature):
-    return TTS_ENGINE.generate(text, num_step, speed, temperature)
 
 
 def _stream_batches(state, text, num_step, speed, stop_evt, t0=None):
@@ -1219,16 +1121,14 @@ def _stream_batches(state, text, num_step, speed, stop_evt, t0=None):
     The worker thread (see _synth_worker) pulls from this generator as fast as
     the model produces frames, while the websocket sender streams each frame
     to the client — so chunk n+1 is already being generated while chunk n is
-    playing (true prefetch). The only bottleneck is single-device inference
-    speed: on this M4/MPS at num_step=8 one sentence takes ~2.5s to make, so
-    frames arrive every ~2.5s and the browser plays them back-to-back.
+    playing (true prefetch).
 
     Batched generate([...]) was tried for the tail sentences but returns only
     when the whole batch finishes (no per-item speedup on one device), which
     clumps frames and leaves a long silence after frame 1 — so streaming stays
     one sentence per call for a steady cadence.
     """
-    batches = _stream_chunks(text, STREAM_MAX_CHARS)
+    batches = TTS_ENGINE.stream_chunks(text)
     if not batches:
         return
     first = True
@@ -1238,9 +1138,9 @@ def _stream_batches(state, text, num_step, speed, stop_evt, t0=None):
             return
         steps = min(num_step, FIRST_WINDOW_STEP) if first else num_step
         t_gen = time.perf_counter()
-        w = _generate(state.ov_model, state.voice_prompt, gen_text, steps, _pick_speed(gen_text, speed), TEMPERATURE)
+        w = TTS_ENGINE.generate(gen_text, steps, _pick_speed(gen_text, speed), TEMPERATURE)
         gen_s = time.perf_counter() - t_gen
-        w = _insert_pauses(w, SAMPLE_RATE, gen_text)
+        w = TTS_ENGINE.insert_pauses(w, gen_text)
         dur_s = w.shape[-1] / SAMPLE_RATE
         n_win += 1
         total_gen += gen_s
@@ -1277,13 +1177,13 @@ def _synth_worker(state, text, num_step, speed, out_q, stop_evt, t0=None):
         out_q.put(("error", f"{type(e).__name__}: {e}"))
 
 
-def _generate_diagram_for_turn(key, text, history, stop_evt):
+def _generate_diagram_for_turn(key, text, history, stop_evt, http_client: httpx.Client):
     return _generate_diagram(
         key,
         text,
         history,
         stop_evt,
-        client=_llm_http_client(),
+        client=http_client,
         url=MISTRAL_URL,
         model=LLM_MODEL,
         reasoning_effort=LLM_REASONING_EFFORT,
@@ -1298,6 +1198,7 @@ async def _send_diagram_when_ready(
     stop_evt: threading.Event,
     turn_id: str,
     client_turn_id: str,
+    http_client: httpx.Client,
 ) -> None:
     try:
         diagram = await asyncio.to_thread(
@@ -1306,6 +1207,7 @@ async def _send_diagram_when_ready(
             text,
             history,
             stop_evt,
+            http_client,
         )
         if not diagram or stop_evt.is_set():
             return
@@ -1429,8 +1331,7 @@ async def ws_tts(websocket: WebSocket):
                 # screen adds ZERO vision latency — only a fresh screen pays
                 # one Qwen2.5-VL call before the LLM starts writing.
                 if screen:
-                    global _last_screen_activity
-                    _last_screen_activity = time.monotonic()
+                    vision_service._last_screen_activity = time.monotonic()
                     img = str(screen.get("image") or screen.get("b64") or "").strip()
                     if img.startswith("data:") and "," in img:
                         img = img.split(",", 1)[1]
@@ -1531,7 +1432,7 @@ async def ws_tts(websocket: WebSocket):
                         if recent:
                             log.info(
                                 "WS chat: using recent cached screen context (activity %.1fs ago)",
-                                time.monotonic() - _last_screen_activity,
+                                time.monotonic() - vision_service._last_screen_activity,
                             )
                             messages[0] = {
                                 "role": "system",
@@ -1551,9 +1452,10 @@ async def ws_tts(websocket: WebSocket):
                 # reply finishes streaming (covers disconnects/exceptions too)
                 async with state.gen_lock, _screen_paused():
                     out_q: queue.Queue = queue.Queue()
+                    llm_client = state.runtime.provider_clients.llm()
                     threading.Thread(
                         target=_chat_worker,
-                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start),
+                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client),
                         daemon=True,
                     ).start()
                     if should_diagram:
@@ -1566,6 +1468,7 @@ async def ws_tts(websocket: WebSocket):
                                 stop_evt,
                                 turn_id,
                                 client_turn_id,
+                                llm_client,
                             )
                         )
                         diagram_tasks.add(diagram_event)
@@ -2079,7 +1982,6 @@ async def ws_asr(websocket: WebSocket):
         pass
     finally:
         stop_evt.set()
-        cancel_diagram_tasks()
         reader_task.cancel()
 
 
@@ -2097,8 +1999,7 @@ def api_vision(req: VisionRequest):
     RTF 1.58 spikes in the logs). The synchronous path is kept ONLY for
     cache hits and `force` (explicit re-describe) requests.
     """
-    global _last_screen_activity
-    _last_screen_activity = time.monotonic()
+    vision_service._last_screen_activity = time.monotonic()
     img = req.image.strip()
     if img.startswith("data:") and "," in img:
         img = img.split(",", 1)[1]
@@ -2123,7 +2024,8 @@ def api_vision(req: VisionRequest):
             "model": "", "backend": _screen_backend_choice(),
         }
     try:
-        desc, cached, model = _screen_context(img, req.hash, force=True)
+        vision_client = app.state.runtime.provider_clients.vision()
+        desc, cached, model = _screen_context(img, req.hash, force=True, http_client=vision_client)
     except Exception as e:  # noqa: BLE001 — log the WHY, not just the 503
         log.exception("/api/vision failed: %s", e)
         raise HTTPException(status_code=503, detail=str(e)) from e
@@ -2131,13 +2033,15 @@ def api_vision(req: VisionRequest):
 
 
 # ---------- LLM chat (keeps the API key server-side) ----------
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, request: Request):
     key = _llm_api_key()
     if not key:
         raise HTTPException(
             status_code=503,
             detail="LLM API key not configured. Create Voice_Cloning/.env with GROQ_API_KEY=... (or legacy MISTRAL_API_KEY=...)",
         )
+
+    http_client = request.app.state.runtime.provider_clients.llm()
 
     def _call(messages: list[dict]) -> str:
         payload = {
@@ -2149,7 +2053,7 @@ def chat(req: ChatRequest):
         if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
             payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
         try:
-            r = _llm_http_client().post(
+            r = http_client.post(
                 MISTRAL_URL,
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json=payload,

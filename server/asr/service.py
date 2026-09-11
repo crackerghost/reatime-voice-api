@@ -107,7 +107,7 @@ SILERO_HOLD_THRESH = float(os.environ.get("VOICE_SILERO_HOLD", "0.35"))  # p(voi
 SILERO_ON_MS = int(os.environ.get("VOICE_SILERO_ON_MS", "150"))          # speech this long opens the turn
 # Silence this long closes it. 550ms balances conversational speed and natural
 # pauses without splitting utterances.
-SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "550"))
+SILERO_SILENCE_MS = int(os.environ.get("VOICE_SILERO_SILENCE_MS", "500"))
 # Once silence has lasted this long AND the overlapped early decode has already
 # produced a transcript, close the utterance early instead of waiting the full
 # 550ms. This is the sub-second endpointing lever: the early decode (P2) runs
@@ -310,7 +310,7 @@ def _pick_asr_backend() -> str:
 
 _asr_backend = None   # one loaded backend object, reused for every call
 _asr_lock = threading.Lock()  # one Whisper call at a time (single device)
-_asr_ready = False    # True once the ASR backend finished its warmup load
+_asr_ready_event = threading.Event()  # Set once the ASR backend finished its warmup load
 
 
 class _MlxAsr:
@@ -407,10 +407,14 @@ def _get_asr():
                 chosen = _pick_asr_backend()
                 log.info("Loading ASR backend '%s' (model '%s')...", chosen, ASR_MODEL)
                 _asr_backend = _MlxAsr() if chosen == "mlx" else _FasterWhisperAsr()
-                global _asr_ready
-                _asr_ready = True
+                _asr_ready_event.set()
                 log.info("ASR backend '%s' ready (model '%s').", chosen, ASR_MODEL)
     return _asr_backend
+
+
+def _asr_ready() -> bool:
+    """True once the ASR backend finished its warmup load."""
+    return _asr_ready_event.is_set()
 
 
 def _warmup_asr():

@@ -27,6 +27,10 @@ class TTSConfig:
     stream_max_chars: int
     first_window_step: int
     pause_seconds: dict[str, float]
+    # Realtime fluency knobs (env-tunable via TTSConfig build site in app.py):
+    language: str = "hi"           # OmniVoice language id — "hi" gives better Hindi token stats + duration estimate
+    pad_duration: float = 0.02     # per-window edge padding; default 0.1s is dead air on EVERY streamed window
+    fade_duration: float = 0.02    # edge fades; same per-window cost as pad
 
 
 class TTSEngine:
@@ -52,10 +56,23 @@ class TTSEngine:
         return self.model, self.voice_prompt
 
     def warm(self):
+        """Two-stage warm-up so production windows never pay cold-start costs.
+
+        Stage 1 (short): JITs kernels + fills the KV path on a tiny fragment —
+        same as before. Stage 2 (full production window): the diffusion
+        schedule, CUDA graphs / attention paths, and the audio-tokenizer decode
+        are all shape-sensitive; a "नमस्ते"-only warm leaves the FIRST real
+        window ~2x slower. Both run at the production first-window step.
+        """
         try:
-            self.generate("नमस्ते", 2, 1.0)
+            self.generate("नमस्ते", self.config.first_window_step, 1.0)
+            self.generate(
+                "आज हम एक नया विषय सीखेंगे और हर कदम को ध्यान से समझेंगे।",
+                self.config.first_window_step,
+                self.config.default_speed,
+            )
             self.gpu_warm["done"] = True
-            log.info("TTS GPU warm-up complete")
+            log.info("TTS GPU warm-up complete (2 stages)")
         except Exception as exc:
             log.warning("TTS GPU warm-up failed: %s", exc)
 
@@ -65,7 +82,10 @@ class TTSEngine:
         kwargs = {
             "text": self.pronunciation_fix(text),
             "voice_clone_prompt": self.voice_prompt,
+            "language": self.config.language,
             "num_step": num_step,
+            "pad_duration": self.config.pad_duration,
+            "fade_duration": self.config.fade_duration,
         }
         if speed is not None:
             kwargs["speed"] = speed
@@ -91,7 +111,7 @@ class TTSEngine:
 
     def wav_bytes(self, samples):
         buffer = io.BytesIO()
-        sf.write(buffer, samples, self.config.sample_rate, format="WAV")
+        sf.write(buffer, samples, self.config.sample_rate, format="WAV", subtype="PCM_16")
         return buffer.getvalue()
 
     def insert_pauses(self, wav, text):

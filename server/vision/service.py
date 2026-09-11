@@ -1,9 +1,6 @@
 """Screen vision, OCR, caching, and background warm-up services."""
 
 import base64
-import ctypes
-import glob
-import importlib.util
 import io
 import logging
 import os
@@ -15,6 +12,10 @@ from pathlib import Path
 import httpx
 import numpy as np
 import torch
+
+from server.gpu import gpu_generate_lock as GPU_GENERATE_LOCK
+from server.gpu import screen_busy as _screen_busy
+from server.gpu import wait_for_screen_resume as _wait_for_screen_resume
 
 log = logging.getLogger("voice_api")
 HERE = Path(__file__).resolve().parent.parent
@@ -253,7 +254,7 @@ def _screen_describe_local(image_b64: str) -> str:
         return resp
 
 
-def _screen_describe_api(image_b64: str, key: str) -> str:
+def _screen_describe_api(image_b64: str, key: str, http_client: httpx.Client | None = None) -> str:
     """Describe one screenshot with the hosted Qwen2.5-VL (OpenAI-compatible)."""
     payload = {
         "model": VISION_MODEL,
@@ -272,8 +273,9 @@ def _screen_describe_api(image_b64: str, key: str) -> str:
         "max_tokens": 500,
         "temperature": 0.2,
     }
+    client = http_client or httpx.Client(timeout=VISION_TIMEOUT, follow_redirects=True)
     try:
-        r = _vision_http_client().post(
+        r = client.post(
             f"{VISION_BASE_URL}/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=payload,
@@ -309,7 +311,28 @@ _screen_pending: dict = {}  # hash -> threading.Event
 _screen_pending_lock = threading.Lock()
 
 
-def _screen_context(image_b64: str, client_hash: str = "", force: bool = False) -> tuple[str, bool, str]:
+def _evict_stale_pending(pending_dict: dict, lock: threading.Lock, max_age_s: float = 120) -> None:
+    """Evict entries older than max_age_s from a pending dictionary.
+
+    Each entry is a threading.Event with a _created_at timestamp attribute.
+    This prevents unbounded memory growth from stale entries.
+    """
+    now = time.monotonic()
+    with lock:
+        stale_keys = [
+            key for key, evt in pending_dict.items()
+            if getattr(evt, '_created_at', now) < now - max_age_s
+        ]
+        for key in stale_keys:
+            del pending_dict[key]
+
+
+def _screen_context(
+    image_b64: str,
+    client_hash: str = "",
+    force: bool = False,
+    http_client: httpx.Client | None = None,
+) -> tuple[str, bool, str]:
     """Describe one screenshot; cache-first by client hash.
 
     Returns (description, was_cached, model_name_actually_used).
@@ -359,6 +382,7 @@ def _screen_context(image_b64: str, client_hash: str = "", force: bool = False) 
                 # winner failed/timed out — we take over as the new winner
             else:
                 evt = threading.Event()
+                evt._created_at = time.monotonic()  # type: ignore[attr-defined]
                 _screen_pending[client_hash] = evt
                 is_winner = True
     t0 = time.perf_counter()
@@ -371,7 +395,7 @@ def _screen_context(image_b64: str, client_hash: str = "", force: bool = False) 
                     "Vision API key not configured (set VISION_API_KEY or DASHSCOPE_API_KEY in .env, "
                     "or set VISION_BACKEND=local to use the local Qwen2.5-VL-3B)"
                 )
-            desc = _screen_describe_api(image_b64, key)
+            desc = _screen_describe_api(image_b64, key, http_client)
             model_used = VISION_MODEL
         else:
             if not _local_vlm_available():
@@ -396,6 +420,8 @@ def _screen_context(image_b64: str, client_hash: str = "", force: bool = False) 
                 if _screen_pending.get(client_hash) is evt:
                     del _screen_pending[client_hash]
             evt.set()  # wake piggybackers (cache now holds the result)
+        # Evict stale entries (> 2 minutes) to prevent memory leaks
+        _evict_stale_pending(_screen_pending, _screen_pending_lock, max_age_s=120)
 
 
 # Cold-cache softener: if a describe for THIS screen is ALWAYS in flight
@@ -454,11 +480,10 @@ def _vision_drain_worker() -> None:
         # first-audio latency. When sharing is active the client keeps sending
         # fresh frames, so a deferred screen is NEVER stale: skip the deferred
         # one and describe the newest on resume.
-        while _screen_busy_count[0] > 0:
+        while _screen_busy():
             with _vision_job_lock:
                 _latest_vision_job["img"] = None  # drop stale frame, keep latest wins
-            if _screen_resume_evt.wait(timeout=1.0):
-                _screen_resume_evt.clear()
+            _wait_for_screen_resume(timeout=1.0)
         with _vision_job_lock:
             img = _latest_vision_job.get("img")
             chash = _latest_vision_job.get("hash", "")
@@ -600,7 +625,9 @@ def _screen_ocr(image_b64: str, client_hash: str = "", force: bool = False) -> s
         with _ocr_pending_lock:
             existing = _ocr_pending.get(client_hash)
             if existing is None:
-                _ocr_pending[client_hash] = threading.Event()
+                evt = threading.Event()
+                evt._created_at = time.monotonic()  # type: ignore[attr-defined]
+                _ocr_pending[client_hash] = evt
                 registered = True
             else:
                 registered = False
@@ -632,6 +659,8 @@ def _screen_ocr(image_b64: str, client_hash: str = "", force: bool = False) -> s
                 evt = _ocr_pending.pop(client_hash, None)
             if evt is not None:
                 evt.set()
+        # Evict stale entries (> 2 minutes) to prevent memory leaks
+        _evict_stale_pending(_ocr_pending, _ocr_pending_lock, max_age_s=120)
     elapsed = time.perf_counter() - t0
     if elapsed > 1.2:
         global _ocr_slow_detected

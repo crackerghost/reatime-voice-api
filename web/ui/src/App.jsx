@@ -17,7 +17,7 @@ const VISION_URL = `${location.protocol}//${location.host}/api/vision`;
    current behaviour and apply until the fetch resolves. */
 const CFG = {
   chatStep: 8, // nfe_step the UI sends for chat replies
-  jitterFrames: 2, // wait until this many TTS frames are queued (or the reply is done) before starting playback — prevents mid-sentence underruns when TTS RTF > 1
+  jitterFrames: 1, // start after one TTS frame; raise via VOICE_JITTER_FRAMES if slower hardware underruns
   maxHistory: 12,
   wsReconnectMs: 1500,
   recRestartMs: 400,
@@ -44,7 +44,7 @@ const num = (v, d) => (v === undefined || v === null || Number.isNaN(Number(v)) 
 const mergeCfg = (c) => {
   if (!c) return;
   CFG.chatStep = num(c.chat_step, CFG.chatStep);
-  CFG.jitterFrames = num(c.jitter_frames, CFG.jitterFrames);
+  CFG.jitterFrames = Math.max(0, Math.round(num(c.jitter_frames, CFG.jitterFrames)));
   CFG.maxHistory = num(c.max_history, CFG.maxHistory);
   CFG.wsReconnectMs = num(c.ws_reconnect_ms, CFG.wsReconnectMs);
   CFG.recRestartMs = num(c.rec_restart_ms, CFG.recRestartMs);
@@ -1732,6 +1732,12 @@ export default function App() {
                   </article>
                 );
               })}
+              {interim && (
+                <div className="self-end max-w-[88%] rounded-2xl border border-dashed border-teal-200 bg-teal-50/70 px-4 py-3 text-sm leading-6 text-teal-800 shadow-sm">
+                  <div className="mb-1 text-[0.62rem] font-bold tracking-[0.12em] text-teal-600 uppercase">You’re saying…</div>
+                  <p className="whitespace-pre-wrap">{interim}</p>
+                </div>
+              )}
               {typing && <div className="self-start rounded-2xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-400">Tutor is thinking…</div>}
             </div>
             <form onSubmit={sendText} className="flex items-end gap-2 border-t border-slate-500/15 bg-white/55 p-3">

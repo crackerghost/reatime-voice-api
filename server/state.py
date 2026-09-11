@@ -1,6 +1,5 @@
 """Shared process runtime state for the modular Voice API."""
 
-import asyncio
 import threading
 from dataclasses import dataclass, field
 
