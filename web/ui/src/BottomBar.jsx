@@ -2,11 +2,9 @@ import { useEffect, useRef } from "react";
 import { FaDesktop, FaMicrophone, FaPaperPlane, FaStop } from "react-icons/fa6";
 import { engine } from "./audioEngine.js";
 
-/* Gemini-style bottom input bar: white pill inside a live gradient bound.
-   The bound + mini visualizer react to voice pitch/volume — hue drifts
-   randomly as pitch moves (no circular globe). */
-
-const RED = "#ff5a5f";
+/* Aurora dock (like the reference): near-black panel with fluid color blobs
+   — deep blue, violet, warm peach, mint — that dance with voice pitch/volume.
+   Red #ff5a5f mic/send controls float on top. No circular globe. */
 
 export default function BottomBar({
   input,
@@ -24,7 +22,6 @@ export default function BottomBar({
   onShareUp,
 }) {
   const canvasRef = useRef(null);
-  const wrapRef = useRef(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -32,8 +29,16 @@ export default function BottomBar({
     const ctx = canvas.getContext("2d");
     let raf = 0;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    let hue = 355;
-    let hueTarget = 355;
+
+    // Aurora blobs: [color, baseX, baseY, baseR, speed, phase]
+    const blobs = [
+      { c: [59, 70, 255], x: 0.22, y: 1.05, r: 0.55, s: 0.5, p: 0.0 }, // deep blue
+      { c: [124, 93, 250], x: 0.42, y: 1.12, r: 0.48, s: 0.7, p: 2.1 }, // violet
+      { c: [255, 179, 122], x: 0.58, y: 1.08, r: 0.42, s: 0.6, p: 4.2 }, // warm peach
+      { c: [92, 255, 157], x: 0.78, y: 1.02, r: 0.4, s: 0.55, p: 1.2 }, // mint
+      { c: [255, 90, 95], x: 0.5, y: 1.2, r: 0.5, s: 0.4, p: 3.0 }, // brand red undertow
+    ];
+    let drift = blobs.map(() => Math.random() * 100);
 
     const size = () => {
       const r = canvas.getBoundingClientRect();
@@ -49,50 +54,45 @@ export default function BottomBar({
       const r = canvas.getBoundingClientRect();
       const W = r.width;
       const H = r.height;
-      ctx.clearRect(0, 0, W, H);
       const mic = engine.readMic();
       const spk = engine.readSpeak();
-      const active = speaking || userTalking;
+      const active = speaking || (listening && userTalking);
       const level = Math.min(
         1,
-        Math.max(speaking ? spk.rms * 9 : 0, listening && userTalking ? mic.rms * 11 : 0, 0.04),
+        Math.max(
+          speaking ? spk.rms * 9 : 0,
+          listening && userTalking ? mic.rms * 11 : 0,
+          listening ? mic.rms * 6 + 0.05 : 0.04,
+        ),
       );
-      const pitch = speaking ? spk.pitch : mic.pitch;
-      if (active && pitch > 0) {
-        // random gradient drift on pitch move
-        hueTarget = 345 + ((pitch / 480) * 40 + Math.random() * 14);
-      } else if (!active) {
-        hueTarget = 355;
-      }
-      hue += (hueTarget - hue) * 0.08;
-
-      const N = 56;
-      const bw = W / N;
+      const pitch = speaking ? spk.pitch : mic.pitch || 0;
       const t = performance.now() / 1000;
-      for (let i = 0; i < N; i++) {
-        const wave =
-          0.5 + 0.5 * Math.sin(i * 0.55 + t * (active ? 6 : 1.6)) * Math.sin(i * 0.21 - t * 2.2);
-        const h = Math.max(2, (0.12 + level * 0.88) * H * (0.25 + 0.75 * wave));
-        const x = i * bw + bw * 0.22;
-        const g = ctx.createLinearGradient(0, H - h, 0, H);
-        g.addColorStop(0, `hsla(${hue.toFixed(0)}, 100%, 64%, 0.95)`);
-        g.addColorStop(1, `hsla(${((hue + 38) % 360).toFixed(0)}, 95%, 60%, 0.35)`);
+      const agitation = active ? 1 : 0.25;
+
+      // near-black base like the reference
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "#060609";
+      ctx.fillRect(0, 0, W, H);
+
+      // dancing blobs — pitch moves them, volume swells them, random drift
+      ctx.globalCompositeOperation = "lighter";
+      blobs.forEach((b, i) => {
+        if (active) drift[i] += 0.02 + Math.random() * 0.05 * (pitch > 0 ? 1 : 0.3);
+        const px = (pitch > 0 ? (pitch / 480) * 0.22 : 0) * (i % 2 === 0 ? 1 : -1);
+        const cx = (b.x + px) * W + Math.sin(t * b.s * agitation * 2 + b.p + drift[i] * 0.05) * W * 0.09 * (0.4 + level);
+        const cy = b.y * H + Math.cos(t * b.s * agitation * 1.6 + b.p * 1.7) * H * 0.35 * (0.4 + level);
+        const rad = Math.max(10, b.r * Math.min(W, H * 2.4) * (0.65 + level * 1.1));
+        const alpha = active ? 0.5 + level * 0.5 : 0.32;
+        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
+        const [cr, cg, cb] = b.c;
+        g.addColorStop(0, `rgba(${cr},${cg},${cb},${alpha.toFixed(3)})`);
+        g.addColorStop(0.55, `rgba(${cr},${cg},${cb},${(alpha * 0.45).toFixed(3)})`);
+        g.addColorStop(1, "rgba(6,6,9,0)");
         ctx.fillStyle = g;
-        const y = H - h;
-        if (ctx.roundRect) {
-          ctx.beginPath();
-          ctx.roundRect(x, y, bw * 0.56, h, 3);
-          ctx.fill();
-        } else {
-          ctx.fillRect(x, y, bw * 0.56, h);
-        }
-      }
-      // live bounding gradient follows the same hue
-      if (wrapRef.current) {
-        wrapRef.current.style.background = `linear-gradient(135deg, hsl(${hue.toFixed(
-          0
-        )}, 100%, 64%), hsl(${((hue + 40) % 360).toFixed(0)}, 95%, 62%), hsl(340, 85%, 55%))`;
-      }
+        ctx.fillRect(0, 0, W, H);
+      });
+      ctx.globalCompositeOperation = "source-over";
+
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
@@ -104,72 +104,64 @@ export default function BottomBar({
 
   return (
     <div className="sticky bottom-0 z-20 px-4 pt-2 pb-4 sm:px-6">
-      <div
-        ref={wrapRef}
-        className="rounded-[28px] p-[2px] shadow-[0_18px_50px_rgba(255,90,95,0.22)]"
-        style={{ background: `linear-gradient(135deg, ${RED}, #ff8a5c, #c81e5b)` }}
-      >
-        <div className="rounded-[26px] bg-white px-2 pt-1.5 pb-2">
-          <canvas ref={canvasRef} className="h-9 w-full" aria-hidden="true" />
-          <form
-            onSubmit={sendText}
-            className="flex items-center gap-1.5 px-1 pt-1"
+      <div className="relative overflow-hidden rounded-[28px] bg-[#060609] shadow-[0_18px_60px_rgba(5,5,10,0.5)]">
+        <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" aria-hidden="true" />
+        <form
+          onSubmit={sendText}
+          className="relative z-10 flex items-center gap-1.5 px-3 py-3"
+        >
+          <button
+            type="button"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              onShareDown && onShareDown();
+            }}
+            onPointerUp={() => onShareUp && onShareUp()}
+            onPointerLeave={() => onShareUp && onShareUp()}
+            onContextMenu={(e) => e.preventDefault()}
+            disabled={!visionEnabled}
+            title="Hold to share your screen"
+            className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full backdrop-blur transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-35 ${
+              sharing ? "bg-[#ff5a5f] text-white" : "bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
+            }`}
           >
-            <button
-              type="button"
-              onPointerDown={(e) => {
-                e.preventDefault();
-                onShareDown && onShareDown();
-              }}
-              onPointerUp={() => onShareUp && onShareUp()}
-              onPointerLeave={() => onShareUp && onShareUp()}
-              onContextMenu={(e) => e.preventDefault()}
-              disabled={!visionEnabled}
-              title="Hold to share your screen"
-              className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-35 ${
-                sharing
-                  ? "bg-[#ff5a5f] text-white"
-                  : "text-slate-400 hover:bg-slate-100 hover:text-[#ff5a5f]"
-              }`}
-            >
-              <FaDesktop className="h-4 w-4" />
-              <span className="sr-only">Share screen</span>
-            </button>
-            <button
-              type="button"
-              onClick={onToggleMic}
-              disabled={micBusy}
-              title={listening ? "Stop listening" : "Start listening"}
-              className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-white transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${
-                listening ? "bg-slate-900" : "bg-[#ff5a5f]"
-              }`}
-            >
-              {micBusy ? (
-                <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
-              ) : listening ? (
-                <FaStop className="h-4 w-4" />
-              ) : (
-                <FaMicrophone className="h-4 w-4" />
-              )}
-              <span className="sr-only">{listening ? "Stop listening" : "Start listening"}</span>
-            </button>
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={speaking ? "Speaking… type to interrupt" : "Ask your tutor…"}
-              aria-label="Message the tutor"
-              className="min-h-11 flex-1 bg-transparent px-2 text-sm text-slate-800 outline-none placeholder:text-slate-400"
-            />
-            <button
-              type="submit"
-              disabled={!input.trim() || !connected}
-              aria-label="Send message"
-              className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#ff5a5f] text-white shadow-[0_10px_24px_rgba(255,90,95,0.35)] transition hover:brightness-95 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <FaPaperPlane className="h-4 w-4" />
-            </button>
-          </form>
-        </div>
+            <FaDesktop className="h-4 w-4" />
+            <span className="sr-only">Share screen</span>
+          </button>
+          <button
+            type="button"
+            onClick={onToggleMic}
+            disabled={micBusy}
+            title={listening ? "Stop listening" : "Start listening"}
+            className={`inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-white transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${
+              listening ? "bg-white text-slate-900" : "bg-[#ff5a5f]"
+            }`}
+          >
+            {micBusy ? (
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+            ) : listening ? (
+              <FaStop className="h-4 w-4" />
+            ) : (
+              <FaMicrophone className="h-4 w-4" />
+            )}
+            <span className="sr-only">{listening ? "Stop listening" : "Start listening"}</span>
+          </button>
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder={speaking ? "Speaking… type to interrupt" : "Ask your tutor…"}
+            aria-label="Message the tutor"
+            className="min-h-11 flex-1 rounded-full bg-white/10 px-4 text-sm text-white outline-none backdrop-blur placeholder:text-white/50 focus:bg-white/15"
+          />
+          <button
+            type="submit"
+            disabled={!input.trim() || !connected}
+            aria-label="Send message"
+            className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#ff5a5f] text-white shadow-[0_10px_24px_rgba(255,90,95,0.45)] transition hover:brightness-110 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <FaPaperPlane className="h-4 w-4" />
+          </button>
+        </form>
       </div>
     </div>
   );
