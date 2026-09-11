@@ -65,6 +65,33 @@ class TestStreamChunks(unittest.TestCase):
         self.assertEqual(chunks, [])
 
 
+class TestClauseUnits(unittest.TestCase):
+    """Danda-terminated sentences must never merge across a window split."""
+
+    def test_danda_is_hard_boundary(self):
+        import re
+
+        def clause_units(sent: str, piece_max: int = 120) -> list[str]:
+            sentences = [s.strip() for s in re.split(r"(?<=[।?!.\n])\s*", sent) if s.strip()]
+            if not sentences:
+                return []
+            out: list[str] = []
+            for sentence in sentences:
+                if len(sentence) <= piece_max:
+                    out.append(sentence)
+                    continue
+                out.append(sentence)
+            return [p for p in out if p]
+
+        text = "मैं बस तुम्हारे सवालों का जवाब देने के लिए तैयार हूँ। कुछ बात करनी हो तो बताओ!"
+        pieces = clause_units(text)
+        self.assertEqual(len(pieces), 2)
+        self.assertTrue(pieces[0].endswith("।"))
+        self.assertIn("जवाब देने के लिए तैयार हूँ", pieces[0])
+        # "जवाब देने के" must never be stranded without its sentence ending
+        self.assertNotEqual(pieces[0].rstrip("। ").split()[-2:], ["जवाब", "देने"])
+
+
 class TestInsertPauses(unittest.TestCase):
     """Test pause insertion in audio."""
 

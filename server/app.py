@@ -617,28 +617,38 @@ def _speech_sentence(sent: str, complete: bool = True) -> str:
 def _clause_units(sent: str) -> list[str]:
     """Split text into TTS-window-sized pieces (hard cap, word boundaries).
 
+    Sentence enders (। ? ! . newline) are HARD boundaries — a piece never
+    spans across one, so a danda-terminated sentence is always spoken as one
+    intonation arc and never glued to the next sentence's opening words.
+    Within one sentence, cuts land at clause punctuation first, then at
+    spaces; short sentences pass through untouched.
+
     Every returned piece is <= _PIECE_MAX chars, so no single audio window can
     grow into a long uninterruptible frame (the #1 thing that kills the
     realtime feel — one giant run-on sentence used to stall TTS for 10s+).
-    Cuts land at clause punctuation first, then at spaces; short sentences
-    pass through untouched.
     """
-    if len(sent) <= _PIECE_MAX:
-        return [sent]
+    # Cut at sentence enders FIRST — each sentence is spoken separately.
+    sentences = [s.strip() for s in re.split(r"(?<=[।?!.\n])\s*", sent) if s.strip()]
+    if not sentences:
+        return []
     out: list[str] = []
-    # first cut at clause punctuation so seams sit at natural pauses
-    seps = [m.start() for m in re.finditer(r"[,;—–]", sent)]
-    if seps:
-        last = 0
-        for p in seps:
-            if p - last > _PIECE_MAX:
-                out.append(sent[last : p + 1].strip())
-                last = p + 1
-        tail = sent[last:].strip()
-        if tail:
-            out.append(tail)
-    else:
-        out.append(sent)
+    for sentence in sentences:
+        if len(sentence) <= _PIECE_MAX:
+            out.append(sentence)
+            continue
+        # first cut at clause punctuation so seams sit at natural pauses
+        seps = [m.start() for m in re.finditer(r"[,;—–]", sentence)]
+        if seps:
+            last = 0
+            for p in seps:
+                if p - last > _PIECE_MAX:
+                    out.append(sentence[last : p + 1].strip())
+                    last = p + 1
+            tail = sentence[last:].strip()
+            if tail:
+                out.append(tail)
+        else:
+            out.append(sentence)
     # then hard-split anything still too long at word boundaries
     final: list[str] = []
     for u in out:
@@ -796,6 +806,14 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             # Complete and partial phrases both feed the audio windows; windows
             # ship on CHARACTER thresholds, so the first window starts as soon as
             # enough text has streamed instead of waiting for a full sentence.
+            #
+            # COMPLETE sentences flush their window immediately: _clause_units
+            # never merges across a । ? ! . boundary, and a buffered window is
+            # always spoken before the next sentence starts. So "जवाब देने के
+            # लिए तैयार हूँ। कुछ बात…" speaks sentence 1 whole, then sentence 2
+            # — a split can never strand "जवाब देने के" in window #1 while
+            # "लिए तैयार हूँ" lands in window #2.
+            sentence_done = complete and not text_buf
             for piece in _clause_units(text):
                 if window and window_chars + len(piece) > WINDOW_CHAR_CAP:
                     steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
@@ -807,7 +825,11 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 if not emitted_audio:
                     if window_chars >= FIRST_WINDOW_CHARS:
                         text_to_speak = " ".join(window)
-                        if len(text_to_speak) > FIRST_WINDOW_CHARS:
+                        if sentence_done or len(text_to_speak) <= FIRST_WINDOW_CHARS:
+                            # Whole sentence(s) buffered — ship them intact,
+                            # never slice a word off the end for the char cap.
+                            window, window_chars = [], 0
+                        elif len(text_to_speak) > FIRST_WINDOW_CHARS:
                             words = text_to_speak.split()
                             cut_text = ""
                             for w in words:
@@ -826,7 +848,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                         win_q.put({"text": text_to_speak, "steps": min(num_step, FIRST_WINDOW_STEP)})
                         emitted_audio = True
                 else:
-                    if window_chars >= MIN_WINDOW_CHARS * 2:
+                    if sentence_done or window_chars >= MIN_WINDOW_CHARS * 2:
                         win_q.put({"text": " ".join(window), "steps": num_step})
                         window, window_chars = [], 0
                         emitted_audio = True
