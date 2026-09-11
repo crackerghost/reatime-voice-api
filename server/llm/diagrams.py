@@ -84,12 +84,14 @@ def _step_prompt(step_text: str, topic: str) -> list[dict]:
             "role": "system",
             "content": (
                 "You are a visual teaching assistant drawing ONE step of an explanation "
-                "on a shared whiteboard. Return a draw_flowchart_or_diagram tool call with "
-                "3-6 concise nodes (max 6 words each) plus arrows for THIS step only. "
-                "Node ids must be unique — prefix every id with the given STEP tag. "
-                "Coordinates: top-to-bottom flow, x in 80..640, y in 80..900. "
-                "If this step has nothing drawable (greeting, opinion, meta talk), "
-                "return no tool call."
+                "on a shared whiteboard. DRAW only when the step has a visual structure: "
+                "a process/flow, a system with 3+ parts, frontend/backend/data flow, "
+                "a comparison, a timeline, or an architecture. DO NOT draw for greetings, "
+                "yes/no answers, opinions, single facts, jokes, or meta talk — return no "
+                "tool call for those. When drawing, return a draw_flowchart_or_diagram "
+                "tool call with 3-6 concise nodes (max 6 words each) plus arrows for "
+                "THIS step only. Node ids must be unique — prefix every id with the "
+                "given STEP tag. Coordinates: top-to-bottom flow, x in 80..640, y in 80..900."
             ),
         },
         {"role": "user", "content": f"TOPIC: {topic[:200]}\nSTEP: {step_text[:600]}"},
