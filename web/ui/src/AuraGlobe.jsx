@@ -74,17 +74,17 @@ export default function AuraGlobe({ listening, speaking, userTalking }) {
 
       const main = ctx2d.createRadialGradient(cx, cy, baseR * 0.2, cx, cy, baseR * 2.1);
       if (speaking) {
-        main.addColorStop(0, "rgba(167,139,250,0.9)");
-        main.addColorStop(0.45, "rgba(129,140,248,0.55)");
-        main.addColorStop(1, "rgba(34,211,238,0)");
+        main.addColorStop(0, "rgba(45,212,191,0.9)");
+        main.addColorStop(0.45, "rgba(13,148,136,0.55)");
+        main.addColorStop(1, "rgba(18,48,74,0)");
       } else if (listening) {
-        main.addColorStop(0, "rgba(103,232,249,0.85)");
-        main.addColorStop(0.5, "rgba(96,165,250,0.5)");
-        main.addColorStop(1, "rgba(167,139,250,0)");
+        main.addColorStop(0, "rgba(94,234,212,0.85)");
+        main.addColorStop(0.5, "rgba(45,212,191,0.5)");
+        main.addColorStop(1, "rgba(14,116,144,0)");
       } else {
-        main.addColorStop(0, "rgba(148,163,184,0.35)");
-        main.addColorStop(0.6, "rgba(148,163,184,0.12)");
-        main.addColorStop(1, "rgba(148,163,184,0)");
+        main.addColorStop(0, "rgba(71,103,117,0.35)");
+        main.addColorStop(0.6, "rgba(71,103,117,0.12)");
+        main.addColorStop(1, "rgba(71,103,117,0)");
       }
 
       ctx2d.save();
@@ -109,14 +109,14 @@ export default function AuraGlobe({ listening, speaking, userTalking }) {
 
       // outer wisp
       ctx2d.shadowBlur = 90;
-      ctx2d.shadowColor = speaking ? "rgba(129,140,248,0.8)" : "rgba(96,165,250,0.5)";
+      ctx2d.shadowColor = speaking ? "rgba(13,148,136,0.8)" : "rgba(45,212,191,0.5)";
       ctx2d.fillStyle = main;
       path(baseR * 1.35, 0.16 * (0.6 + st.amp), baseR * 0.4);
       ctx2d.fill();
 
       // middle band
       path(baseR * 0.95, 0.1, baseR * 0.15);
-      ctx2d.fillStyle = speaking ? "rgba(199,210,254,0.5)" : "rgba(224,242,254,0.45)";
+      ctx2d.fillStyle = speaking ? "rgba(204,251,241,0.5)" : "rgba(207,250,254,0.45)";
       ctx2d.fill();
 
       // bright core
@@ -141,7 +141,7 @@ export default function AuraGlobe({ listening, speaking, userTalking }) {
         const py = Math.sin(s.a * 1.3) * orbR * 0.7;
         ctx2d.beginPath();
         ctx2d.arc(px, py, 1.2 + st.amp * 2.4, 0, Math.PI * 2);
-        ctx2d.fillStyle = speaking ? "rgba(196,181,253,0.8)" : "rgba(125,211,252,0.7)";
+        ctx2d.fillStyle = speaking ? "rgba(153,246,228,0.8)" : "rgba(94,234,212,0.7)";
         ctx2d.fill();
       }
       ctx2d.restore();

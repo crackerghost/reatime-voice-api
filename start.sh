@@ -21,11 +21,11 @@ if [ ! -x "$PYTHON" ]; then
   echo "🛠️  First run — creating omnivoice-env and installing OmniVoice..."
   if command -v uv >/dev/null 2>&1; then
     uv venv --python 3.11 omnivoice-env
-    uv pip install --python "$PYTHON" omnivoice torchaudio fastapi "uvicorn[standard]" httpx soundfile python-multipart
+    uv pip install --python "$PYTHON" -r requirements.txt
   else
     python3 -m venv omnivoice-env
     "$PYTHON" -m pip install --upgrade pip
-    "$PYTHON" -m pip install omnivoice torchaudio fastapi "uvicorn[standard]" httpx soundfile python-multipart
+    "$PYTHON" -m pip install -r requirements.txt
   fi
 fi
 

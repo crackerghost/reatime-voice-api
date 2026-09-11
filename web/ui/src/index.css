@@ -1,26 +1,61 @@
 @import "tailwindcss";
 
-html,
-body,
-#root {
-  height: 100%;
+@theme {
+  --animate-ring-breathe: ring-breathe 7s ease-in-out infinite;
+  --animate-ring-spin: ring-spin 38s linear infinite;
+  --animate-mic-pulse: mic-pulse 2s ease-in-out infinite;
+  --animate-diagram-reveal: diagram-reveal 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+
+  @keyframes ring-breathe {
+    0%, 100% { transform: scale(0.985); opacity: 0.75; }
+    50% { transform: scale(1.015); opacity: 1; }
+  }
+
+  @keyframes ring-spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @keyframes mic-pulse {
+    0%, 100% { box-shadow: 0 16px 34px rgba(194, 65, 90, 0.25); }
+    50% { box-shadow: 0 16px 42px rgba(194, 65, 90, 0.42); }
+  }
+
+  @keyframes diagram-reveal {
+    from { opacity: 0; transform: translateX(28px) scale(0.985); }
+    to { opacity: 1; transform: translateX(0) scale(1); }
+  }
 }
 
-body {
-  margin: 0;
-  font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Noto Sans Devanagari", sans-serif;
-  -webkit-font-smoothing: antialiased;
-}
+@layer base {
+  :root {
+    color-scheme: light;
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Noto Sans Devanagari", sans-serif;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+  }
 
-/* slim scrollbars for the chat panel */
-*::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-*::-webkit-scrollbar-thumb {
-  background: rgba(99, 102, 241, 0.25);
-  border-radius: 9999px;
-}
-*::-webkit-scrollbar-track {
-  background: transparent;
+  html,
+  body,
+  #root {
+    min-height: 100%;
+    margin: 0;
+  }
+
+  body {
+    min-width: 320px;
+    background: #f4f8f8;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  [role="button"]:focus-visible {
+    outline: 3px solid rgba(13, 148, 136, 0.38);
+    outline-offset: 5px;
+  }
 }

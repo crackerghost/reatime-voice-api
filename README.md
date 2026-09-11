@@ -20,15 +20,13 @@ chat turns by speaking in that voice.
 
 ```
 Voice_Cloning/
-├── voice_api.py          # FastAPI server: TTS WS, chat, streaming ASR, static UI
-├── main.py               # single-shot CLI benchmark (prints RTF)
-├── clean_voice.py        # denoise/normalize my_voice.wav
-├── trim_voice.py         # trim reference to ~5 s of speech
-├── start.sh              # macOS helper: create venv + run server + open UI
+├── voice_api.py          # thin deployment entrypoint
+├── server/               # FastAPI routes, runtime, TTS, ASR, vision, LLM
+├── web/ui/               # React frontend and Excalidraw whiteboard
+├── my_voice.wav          # local reference voice clip
+├── start.sh              # create the environment, run the server, open UI
 ├── requirements.txt
-├── .env.example          # every tunable, documented (copy to .env)
-├── web/ui/               # React frontend (build with npm)
-└── kaggle/               # Kaggle / cloud-GPU helpers (no .env needed)
+└── .env.example          # documented runtime configuration
 ```
 
 ---
@@ -67,7 +65,7 @@ cd web/ui && npm install && npm run build && cd ../..
 
 # 3) Config — copy and edit (reference voice path/text, LLM key, tuning)
 cp .env.example .env
-#   - MISTRAL_API_KEY=...        (required for chat; or export the env var)
+#   - GROQ_API_KEY=...           (required for chat; or export the env var)
 #   - VOICE_REF_AUDIO=my_voice.wav
 #   - VOICE_REF_TEXT=<EXACT transcript of the clip>
 ```
@@ -77,21 +75,20 @@ cp .env.example .env
 
 ### Reference voice
 
-- `my_voice.wav` must be a **3–10 s clean mono clip** (ideally with the exact
-  transcript in `VOICE_REF_TEXT`). Run `clean_voice.py` (denoise) and/or
-  `trim_voice.py` (auto-trim to ~5 s) to prepare it.
+- `my_voice.wav` must be a **3–10 s clean mono clip** with the exact transcript configured in `VOICE_REF_TEXT`.
 - It is git-ignored (`*.wav`) — drop your own after cloning.
 
 ### Run
 
 ```bash
-# CLI benchmark — prints inference time, audio length and RTF
-./omnivoice-env/bin/python main.py "अरे वाह! आपने तो बहुत अच्छा सवाल पूछा।"
-
-# Full server (UI at http://127.0.0.1:8000) — macOS helper:
+# Full server (UI at http://127.0.0.1:8000) — helper:
 ./start.sh
 # …or manually:
 ./omnivoice-env/bin/python voice_api.py
+
+# Liveness/readiness checks:
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/ready
 ```
 
 **First run downloads models:** OmniVoice weights and (on first mic use) the

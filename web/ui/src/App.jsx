@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTrash, FaVolumeHigh, FaWandMagicSparkles } from "react-icons/fa6";
 import AuraGlobe from "./AuraGlobe.jsx";
+const DiagramWhiteboard = lazy(() => import("./DiagramWhiteboard.jsx"));
 import { engine } from "./audioEngine.js";
+import { chatMessage, pingMessage, stopMessage } from "./services/ttsProtocol.js";
 
 const GREETING = "नमस्ते! मैं आपका हिंदी ट्यूटर हूँ। माइक दबाकर बोलिए, लिखकर पूछिए — और स्क्रीन दिखाने के लिए X दबाकर रखें, बोलते रहिए, छोड़ते ही मैं स्क्रीन देखकर जवाब दूँगा। जब मैं बोलूँ तो बीच में कुछ भी बोलिए, मैं तुरंत रुक जाऊँगा।";
 const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/tts`;
@@ -93,6 +95,7 @@ export default function App() {
   const [typing, setTyping] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
   const [sharing, setSharing] = useState(false); // push-to-see capture active (button held)
+  const [diagram, setDiagram] = useState(null);
 
   // ---- mutable runtime state (safe across renders) ----
   const wsRef = useRef(null);
@@ -108,6 +111,8 @@ export default function App() {
   const activeRef = useRef(false); // a reply is being streamed from the server
   const framesRef = useRef(0);
   const turnStartRef = useRef(0); // browser-side: when the current turn was submitted (first-audio stopwatch)
+  const activeTurnIdRef = useRef(0);
+  const diagramTurnRef = useRef(null);
   const openAssistantId = useRef(null);
   const assistantTextRef = useRef("");
   const asrWsRef = useRef(null); // /ws/asr connection (streaming faster-whisper)
@@ -283,7 +288,7 @@ export default function App() {
     }
     pendingRef.current.length = 0;
     if (wsRef.current && wsRef.current.readyState === 1) {
-      wsRef.current.send(JSON.stringify({ type: "stop" }));
+      wsRef.current.send(stopMessage());
     }
     speakingRef.current = false;
     setSpeaking(false);
@@ -635,6 +640,9 @@ export default function App() {
       const text = (rawText || "").trim();
       if (!text) return;
       hardStop();
+      activeTurnIdRef.current += 1;
+      diagramTurnRef.current = null;
+      setDiagram(null);
       setMessages((m) => [...m, { id: nextId(), role: "user", text, ts: Date.now() }]);
       pushHistory("user", text);
 
@@ -662,7 +670,12 @@ export default function App() {
       openAssistantId.current = null;
       assistantTextRef.current = "";
       setTyping(true);
-      const payload = { type: "chat", text, history: historyRef.current, nfe_step: CFG.chatStep };
+      const payload = {
+        text,
+        history: historyRef.current,
+        nfeStep: CFG.chatStep,
+        clientTurnId: activeTurnIdRef.current,
+      };
       // Push-to-see: the held button already captured + warmed the frame.
       // Attach it (with wait_ms) so the server waits briefly for the in-flight
       // describe instead of answering blind. Legacy continuous-share path
@@ -688,7 +701,10 @@ export default function App() {
           console.warn("[screen] sharing is ON but grabScreen() returned null — video not ready");
         }
       }
-      ws.send(JSON.stringify(payload));
+      ws.send(chatMessage({
+        ...payload,
+        screen: payload.screen,
+      }));
     },
     [hardStop]
   );
@@ -767,7 +783,7 @@ export default function App() {
         // heartbeat: detect a dead connection in ~15s instead of uvicorn's 40s
         ttsHb = setInterval(() => {
           try {
-            ws.send(JSON.stringify({ type: "ping" }));
+            ws.send(pingMessage());
           } catch { /* closed — onclose handles it */ }
           if (Date.now() - ttsLastPong > 15000) {
             try { ws.close(); } catch { /* noop */ } // force reconnect
@@ -823,6 +839,12 @@ export default function App() {
               ` | audio ${m.audio_s}s / gen ${m.gen_s}s (RTF ${m.rtf})` +
               ` | "${m.text}"`,
             );
+          } else if (m.type === "diagram") {
+            if (dropRef.current || !m.turn_id || m.client_turn_id !== String(activeTurnIdRef.current) || !m.diagram?.elements?.length) return;
+            diagramTurnRef.current = m.turn_id;
+            setDiagram(m.diagram);
+          } else if (m.type === "diagram_error") {
+            if (!dropRef.current) console.info("[diagram] visual explanation unavailable", m.message || "");
           } else if (m.type === "text") {
             if (dropRef.current) return; // stale sentence of an aborted reply
             setTyping(false);
@@ -1596,243 +1618,157 @@ export default function App() {
     };
   }, []);
 
+  const sendText = useCallback((event) => {
+    event.preventDefault();
+    const text = input.trim();
+    if (!text) return;
+    submitChat(text);
+    setInput("");
+  }, [input, submitChat]);
+
   /* ---------- UI ---------- */
   return (
-    <div className="relative min-h-screen overflow-hidden bg-slate-50 text-slate-800">
-      {/* soft professional background glows */}
-      <div className="pointer-events-none absolute -top-48 left-1/2 h-120 w-120 -translate-x-1/2 rounded-full bg-indigo-200/40 blur-3xl" />
-      <div className="pointer-events-none absolute -bottom-24 -right-24 h-80 w-80 rounded-full bg-cyan-100/60 blur-3xl" />
-      <div className="pointer-events-none absolute -bottom-24 -left-24 h-80 w-80 rounded-full bg-fuchsia-100/50 blur-3xl" />
+    <div className="relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_50%_42%,rgba(153,246,228,0.34),transparent_29rem),linear-gradient(135deg,#fbfdfd_0%,#edf5f5_100%)] text-slate-900 [isolation:isolate] max-[640px]:bg-[radial-gradient(circle_at_50%_40%,rgba(153,246,228,0.28),transparent_19rem),#f4f8f8]">
+      <div className="pointer-events-none absolute inset-0 -z-20 opacity-[0.34] [background-image:linear-gradient(rgba(15,118,110,0.055)_1px,transparent_1px),linear-gradient(90deg,rgba(15,118,110,0.055)_1px,transparent_1px)] [background-size:56px_56px] [mask-image:linear-gradient(to_bottom,black,transparent_82%)] max-[640px]:[background-size:38px_38px]" />
+      <div className="pointer-events-none absolute -left-48 top-[12%] -z-10 h-[27rem] w-[27rem] rounded-full bg-teal-100/35 blur-[1px] opacity-40" />
+      <div className="pointer-events-none absolute -right-44 bottom-[4%] -z-10 h-[25rem] w-[25rem] rounded-full bg-sky-100/35 blur-[1px] opacity-40" />
 
-      <div className="relative mx-auto flex min-h-screen w-full max-w-2xl flex-col px-4 pb-4">
-        {/* header */}
-        <header className="flex items-center justify-between py-4">
+      <div className="relative mx-auto flex min-h-screen w-full max-w-[1440px] flex-col px-6 pb-8 sm:px-10">
+        <header className="flex items-center justify-between py-7">
           <div className="flex items-center gap-3">
-            <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 via-violet-500 to-fuchsia-500 text-white shadow-lg shadow-indigo-200">
-              {listening ? <FaMicrophone className="h-4 w-4" /> : <FaWandMagicSparkles className="h-4 w-4" />}
+            <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[linear-gradient(145deg,#12304a,#0d9488)] text-white shadow-[0_10px_26px_rgba(15,118,110,0.22)]">
+              <FaWandMagicSparkles className="h-4 w-4" />
             </span>
             <div>
-              <h1 className="text-lg font-semibold leading-tight tracking-tight">वॉयस ट्यूटर</h1>
-              <p className="text-xs leading-tight text-slate-400">रियल-टाइम वॉयस कन्वर्सेशन • हिंदी में</p>
+              <h1 className="text-sm font-semibold tracking-[0.16em] text-slate-800 uppercase">Voice tutor</h1>
+              <p className="mt-1 text-xs text-slate-500">Hindi conversation engine</p>
             </div>
           </div>
-          <span
-            className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium ${
-              connected ? "bg-emerald-50 text-emerald-600" : "bg-rose-50 text-rose-500"
-            }`}
-          >
-            <span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-emerald-500" : "bg-rose-500"}`} />
-            {connected ? (listening ? (asrReady ? "सुन रहा हूँ" : "वॉर्म-अप…") : "तैयार") : "जुड़ रहा हूँ…"}
-          </span>
+          <div className="flex items-center gap-2 text-xs font-medium text-slate-500">
+            <span className={`h-2 w-2 rounded-full ${connected ? "bg-teal-700 shadow-[0_0_0_4px_rgba(15,118,110,0.12)]" : "bg-amber-600 shadow-[0_0_0_4px_rgba(183,121,31,0.12)]"}`} />
+            {connected ? (listening ? (asrReady ? "Listening" : "Warming up") : "Ready") : "Connecting"}
+          </div>
         </header>
 
-        {/* aura globe + live caption */}
-        <main className="flex flex-1 flex-col items-center pt-2">
-          <div className="relative h-[46vh] min-h-[420px] w-full max-w-2xl">
+        <main className={`grid flex-1 items-center pb-6 ${diagram ? "grid-cols-1 gap-9 min-[981px]:grid-cols-[minmax(420px,0.9fr)_minmax(440px,1.1fr)] min-[981px]:gap-[clamp(1.5rem,4vw,4.5rem)] min-[981px]:items-stretch" : "grid-cols-1"}`}>
+          <section className={`flex min-w-0 flex-col items-center justify-center ${diagram ? "min-[981px]:min-h-[min(72vh,760px)]" : ""}`} aria-label="Voice tutor">
+          <div className="relative grid aspect-square w-[min(78vw,620px)] place-items-center max-[640px]:w-[min(92vw,520px)]">
+            <div className="pointer-events-none absolute inset-0 rounded-full border border-teal-700/20 shadow-[inset_0_0_55px_rgba(15,118,110,0.08),0_0_80px_rgba(15,118,110,0.1)] [animation:ring-breathe_7s_ease-in-out_infinite] motion-reduce:animate-none" />
+            <div className="pointer-events-none absolute inset-[9%] rounded-full border border-dashed border-[#12304a]/15 [animation:ring-spin_38s_linear_infinite] motion-reduce:animate-none" />
+            <div className="absolute inset-[12%] rounded-full bg-white/30 shadow-[0_30px_100px_rgba(15,118,110,0.16)] backdrop-blur-[2px]" />
             <AuraGlobe listening={listening} speaking={speaking} userTalking={userTalking} />
-
-            <div className="pointer-events-none absolute inset-x-0 bottom-4 flex flex-col items-center gap-2">
-              {typing && (
-                <span className="rounded-full bg-white/85 px-4 py-1.5 text-xs text-slate-500 shadow-sm ring-1 ring-slate-200/80 backdrop-blur">
-                  सोच रहा हूँ…
-                </span>
-              )}
-              {(speaking || activeRef.current) && !typing && (
-                <span className="flex animate-pulse items-center gap-1.5 rounded-full bg-indigo-50 px-4 py-1.5 text-xs font-medium text-indigo-600 shadow-sm ring-1 ring-indigo-100">
-                  <FaVolumeHigh className="h-3 w-3" />
-                  बोल रहा हूँ — बीच में बोलिए, रुक जाऊँगा
-                </span>
-              )}
-              {listening && !speaking && (
-                <span className="rounded-full bg-white/85 px-4 py-1.5 text-xs text-slate-500 shadow-sm ring-1 ring-slate-200/80 backdrop-blur">
-                  {userTalking ? "सुन रहा हूँ…" : "बोलिए…"}
-                </span>
-              )}
-              {interim && (
-                <span className="max-w-lg truncate rounded-full bg-cyan-50/90 px-4 py-1.5 text-xs italic text-cyan-600 shadow-sm ring-1 ring-cyan-100/80">
-                  “{interim}”
-                </span>
-              )}
-              {asrRejected && (
-                <button
-                  onClick={() => {
-                    clearTimeout(asrRejTimerRef.current);
-                    setAsrRejected("");
-                  }}
-                  className="rounded-full bg-amber-50/95 px-4 py-1.5 text-xs font-medium text-amber-700 shadow-sm ring-1 ring-amber-200/80 transition hover:bg-amber-100"
-                  title="यह बात आपकी आवाज़ नहीं लगी इसलिए नज़रअंदाज़ की गई — दबाकर हटाएँ"
-                >
-                  {asrRejected === "speaker"
-                    ? "आपकी आवाज़ नहीं लगी — नज़रअंदाज़ कर दिया ✓"
-                    : "बहुत छोटी आवाज़ — नज़रअंदाज़ कर दिया ✓"}
-                </button>
-              )}
+            <div className="pointer-events-none absolute inset-0 flex items-end justify-center pb-[9%]">
+              <span className="rounded-full border border-slate-500/20 bg-white/75 px-3.5 py-2 text-[0.7rem] font-semibold tracking-[0.08em] text-slate-500 uppercase shadow-[0_8px_25px_rgba(25,67,82,0.08)] backdrop-blur-[10px]">
+                {typing ? "Thinking" : speaking || activeRef.current ? "Speaking" : listening ? (userTalking ? "Listening" : "Speak naturally") : "Tap the microphone to begin"}
+              </span>
             </div>
           </div>
 
-          {/* chat */}
-          <section className="mt-2 w-full max-w-2xl">
-            <div className="flex h-72 flex-col overflow-hidden rounded-3xl bg-white/90 shadow-lg shadow-slate-200/70 ring-1 ring-slate-200/80 backdrop-blur">
-              <div ref={chatEl} className="flex-1 space-y-2.5 overflow-y-auto px-4 py-4">
-                {messages.map((m) =>
-                  m.role === "assistant" ? (
-                    <div key={m.id} className="flex justify-start">
-                      <div className="flex max-w-[85%] flex-col">
-                        <div className="whitespace-pre-wrap rounded-2xl rounded-bl-sm bg-slate-100 px-3.5 py-2 text-sm leading-relaxed text-slate-700">
-                          {m.text}
-                        </div>
-                        {m.elapsed != null && (
-                          <div className="mt-1 flex items-center gap-2 px-1 text-[10px] text-slate-400">
-                            <span className="flex items-center gap-1">
-                              <FaClock className="h-2.5 w-2.5" />
-                              {fmtElapsed(m.elapsed)}
-                            </span>
-                            <span>{fmtClock(m.ts)}</span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ) : m.role === "user" ? (
-                    <div key={m.id} className="flex justify-end">
-                      <div className="flex max-w-[85%] flex-col items-end">
-                        <div className="whitespace-pre-wrap rounded-2xl rounded-br-sm bg-gradient-to-br from-indigo-500 to-violet-500 px-3.5 py-2 text-sm leading-relaxed text-white shadow-sm">
-                          {m.text}
-                        </div>
-                        <div className="mt-1 px-1 text-[10px] text-slate-400">{fmtClock(m.ts)}</div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div key={m.id} className="flex justify-center">
-                      <div className="rounded-xl bg-rose-50 px-3 py-1.5 text-xs text-rose-600 ring-1 ring-rose-100">
-                        {m.text}
-                      </div>
-                    </div>
-                  )
-                )}
-                {typing && (
-                  <div className="flex justify-start">
-                    <div className="flex items-center gap-1 rounded-2xl rounded-bl-sm bg-slate-100 px-4 py-3">
-                      {[0, 1, 2].map((i) => (
-                        <span
-                          key={i}
-                          className="h-1.5 w-1.5 animate-bounce rounded-full bg-slate-400"
-                          style={{ animationDelay: `${i * 0.15}s` }}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
+          <div className="mt-8 flex items-center gap-4">
+            <button
+              onPointerDown={(e) => {
+                e.preventDefault();
+                if (!CFG.pushMode) {
+                  if (sharingRef.current) stopScreenCapture();
+                  else startScreenShare();
+                  return;
+                }
+                apiRef.current.startPush && apiRef.current.startPush();
+              }}
+              onPointerUp={() => {
+                if (CFG.pushMode && apiRef.current.pushActiveRef?.current) apiRef.current.releasePush();
+              }}
+              onPointerLeave={() => {
+                if (CFG.pushMode && apiRef.current.pushActiveRef?.current) apiRef.current.releasePush();
+              }}
+              onContextMenu={(e) => e.preventDefault()}
+              title={CFG.pushMode ? "Hold to share your screen" : sharing ? "Stop screen sharing" : "Share your screen"}
+              disabled={!CFG.visionEnabled}
+              className={`inline-flex h-13 w-13 items-center justify-center rounded-full border border-slate-500/20 bg-white/80 text-slate-500 shadow-[0_10px_24px_rgba(25,67,82,0.13)] transition duration-180 hover:-translate-y-0.5 hover:bg-white hover:text-teal-700 hover:shadow-[0_14px_28px_rgba(25,67,82,0.17)] active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${sharing ? "border-transparent bg-[linear-gradient(145deg,#0f766e,#0d9488)] text-white shadow-[0_10px_28px_rgba(15,118,110,0.25)]" : ""}`}
+            >
+              <FaDesktop className="h-4 w-4" />
+              <span className="sr-only">Share screen</span>
+            </button>
+            <button
+              onClick={() => apiRef.current.toggleMic && apiRef.current.toggleMic()}
+              title={listening ? "Stop listening" : "Start listening"}
+              disabled={micBusy}
+              className={`inline-flex h-18 w-18 items-center justify-center rounded-full border-0 bg-[linear-gradient(145deg,#12304a,#0d9488)] text-white shadow-[0_16px_34px_rgba(18,48,74,0.28)] transition duration-180 hover:-translate-y-0.5 hover:bg-[linear-gradient(145deg,#0d2438,#0f766e)] hover:shadow-[0_19px_38px_rgba(18,48,74,0.34)] active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${listening ? "bg-[linear-gradient(145deg,#c2415a,#9f3048)] shadow-[0_16px_34px_rgba(194,65,90,0.25)] [animation:mic-pulse_2s_ease-in-out_infinite] motion-reduce:animate-none" : ""}`}
+            >
+              {micBusy ? (
+                <span className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+              ) : listening ? (
+                <FaStop className="h-5 w-5" />
+              ) : (
+                <FaMicrophone className="h-5 w-5" />
+              )}
+              <span className="sr-only">{listening ? "Stop listening" : "Start listening"}</span>
+            </button>
+            <div className="inline-flex h-13 w-13 cursor-default items-center justify-center rounded-full border border-dashed border-slate-500/20 bg-white/50 text-slate-500 shadow-none" aria-hidden="true">
+              <span className="text-[10px] font-semibold tracking-[0.18em]">X</span>
+            </div>
+          </div>
+          <p className="mt-5 text-center text-xs tracking-wide text-slate-400">Hold X or the display button to share context</p>
 
-              {/* composer */}
-              <div className="flex items-center gap-2 border-t border-slate-100 p-3">
-                <button
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    if (!CFG.pushMode) {
-                      // legacy continuous mode: press toggles the share loop
-                      if (sharingRef.current) stopScreenCapture();
-                      else startScreenShare();
-                      return;
-                    }
-                    apiRef.current.startPush && apiRef.current.startPush();
-                  }}
-                  onPointerUp={() => {
-                    if (CFG.pushMode && apiRef.current.pushActiveRef?.current) {
-                      apiRef.current.releasePush();
-                    }
-                  }}
-                  onPointerLeave={() => {
-                    // pointer slid off while held — still release (prevents a stuck hold)
-                    if (CFG.pushMode && apiRef.current.pushActiveRef?.current) {
-                      apiRef.current.releasePush();
-                    }
-                  }}
-                  onContextMenu={(e) => e.preventDefault()}
-                  title={CFG.pushMode
-                    ? "X दबाकर रखें (या यह बटन) — स्क्रीन देखूँगा; छोड़ते ही जवाब (max 5 सेकंड)"
-                    : sharing ? "स्क्रीन शेयर बंद करें" : "स्क्रीन शेयर करें — मैं देखकर समझाऊँगा"}
-                  disabled={!CFG.visionEnabled}
-                  className={`flex h-11 w-11 items-center justify-center rounded-full shadow-md transition disabled:opacity-40 ${
-                    sharing
-                      ? "animate-pulse bg-emerald-500 text-white shadow-emerald-200"
-                      : "bg-white text-slate-600 ring-1 ring-slate-200 hover:ring-emerald-300"
-                  }`}
-                >
-                  <FaDesktop className="h-4 w-4" />
-                </button>
-                <input
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      submitChat(input);
-                      setInput("");
-                    }
-                  }}
-                  placeholder="लिखकर पूछिए…"
-                  className="h-11 flex-1 rounded-full border border-slate-200 bg-slate-50 px-4 text-sm outline-none transition placeholder:text-slate-400 focus:border-indigo-300 focus:bg-white focus:ring-2 focus:ring-indigo-100"
-                />
-                <button
-                  onClick={() => {
-                    apiRef.current.toggleMic && apiRef.current.toggleMic();
-                  }}
-                  title={listening ? "माइक बंद करें" : "बोलने के लिए माइक चालू करें"}
-                  disabled={micBusy}
-                  className={`flex h-11 w-11 items-center justify-center rounded-full text-lg shadow-md transition disabled:opacity-50 ${
-                    listening
-                      ? "animate-pulse bg-rose-500 text-white shadow-rose-200"
-                      : "bg-white text-slate-600 ring-1 ring-slate-200 hover:ring-indigo-300"
-                  }`}
-                >
-                  {micBusy ? (
-                    <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
-                  ) : listening ? (
-                    <FaStop className="h-4 w-4" />
-                  ) : (
-                    <FaMicrophone className="h-4 w-4" />
-                  )}
-                </button>
-                <button
-                  onClick={() => {
-                    submitChat(input);
-                    setInput("");
-                  }}
-                  title="भेजें"
-                  className="flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white shadow-lg shadow-indigo-200 transition hover:brightness-110 active:scale-95"
-                >
-                  <FaPaperPlane className="h-4 w-4 -translate-x-px" />
-                </button>
+          <section className="mt-8 flex w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-slate-500/20 bg-white/70 shadow-[0_18px_55px_rgba(25,67,82,0.1)] backdrop-blur-xl" aria-label="Chat transcript">
+            <div className="flex items-center justify-between border-b border-slate-500/15 px-5 py-4">
+              <div>
+                <p className="text-[0.64rem] font-bold tracking-[0.14em] text-teal-700 uppercase">Live conversation</p>
+                <h2 className="mt-1 text-base font-semibold text-[#12304a]">Chat transcript</h2>
               </div>
+              <span className="rounded-full bg-teal-50 px-2.5 py-1 text-[0.65rem] font-semibold text-teal-700">{messages.length} messages</span>
             </div>
-            <div className="mt-2 flex items-center justify-between px-2 pb-1">
-              <p className="flex items-center gap-1.5 text-[11px] text-slate-400">
-                {sharing ? (
-                  <>
-                    <FaDesktop className="h-3 w-3 animate-pulse text-emerald-500" />
-                    X दबा हुआ है — बोलिए, छोड़ते ही जवाब आएगा (max 5 सेकंड)
-                  </>
-                ) : (
-                  <>
-                    <FaDesktop className="h-3 w-3 text-slate-400" />
-                    स्क्रीन दिखाने के लिए X दबाकर रखें — या माइक चालू करके बोलिए
-                  </>
-                )}
-              </p>
-              <button
-                onClick={() => {
-                  historyRef.current = [];
-                  setMessages([{ id: nextId(), role: "assistant", text: GREETING, ts: Date.now() }]);
-                  hardStop();
+            <div ref={chatEl} className="flex max-h-72 min-h-28 flex-col gap-3 overflow-y-auto px-4 py-4 sm:px-5" aria-live="polite">
+              {messages.map((message) => {
+                const isUser = message.role === "user";
+                const isError = message.role === "error";
+                return (
+                  <article key={message.id} className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${isError ? "self-start border border-rose-200 bg-rose-50 text-rose-700" : isUser ? "self-end bg-[#12304a] text-white" : "self-start border border-teal-100 bg-teal-50/80 text-slate-700"}`}>
+                    <div className={`mb-1 text-[0.62rem] font-bold tracking-[0.12em] uppercase ${isUser ? "text-teal-100" : isError ? "text-rose-500" : "text-teal-700"}`}>
+                      {isError ? "Notice" : isUser ? "You" : "Tutor"}
+                    </div>
+                    <p className="whitespace-pre-wrap">{message.text}</p>
+                    {message.elapsed != null && <span className="mt-2 block text-[0.65rem] opacity-60">{fmtElapsed(message.elapsed)}</span>}
+                  </article>
+                );
+              })}
+              {typing && <div className="self-start rounded-2xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-400">Tutor is thinking…</div>}
+            </div>
+            <form onSubmit={sendText} className="flex items-end gap-2 border-t border-slate-500/15 bg-white/55 p-3">
+              <textarea
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    sendText(event);
+                  }
                 }}
-                className="flex items-center gap-1 text-[11px] font-medium text-slate-400 transition hover:text-rose-400"
-              >
-                <FaTrash className="h-2.5 w-2.5" />
-                साफ़ करें
+                rows={1}
+                placeholder="Ask your tutor…"
+                aria-label="Message the tutor"
+                className="min-h-11 flex-1 resize-none rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition placeholder:text-slate-400 focus:border-teal-500 focus:ring-4 focus:ring-teal-100"
+              />
+              <button type="submit" disabled={!input.trim() || !connected} className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[#12304a] text-white shadow-md transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-40" aria-label="Send message">
+                <FaPaperPlane className="h-4 w-4" />
               </button>
-            </div>
+            </form>
           </section>
+          </section>
+          {diagram ? (
+            <aside className="min-w-0 min-h-0 overflow-hidden rounded-3xl border border-slate-500/20 bg-white/75 shadow-[0_24px_70px_rgba(25,67,82,0.14),inset_0_1px_0_rgba(255,255,255,0.9)] [animation:diagram-reveal_420ms_cubic-bezier(0.16,1,0.3,1)_both] motion-reduce:animate-none min-[981px]:min-h-[min(72vh,760px)] max-[980px]:rounded-2xl">
+              <div className="flex min-h-[4.75rem] items-center justify-between border-b border-slate-500/15 bg-[linear-gradient(180deg,rgba(248,252,252,0.96),rgba(255,255,255,0.78))] px-[1.35rem] py-[0.9rem] max-[640px]:px-4">
+                <div>
+                  <span className="block text-[0.64rem] font-bold tracking-[0.14em] text-teal-700 uppercase">Visual explanation</span>
+                  <h2 className="mt-1 text-[1.05rem] font-semibold tracking-[-0.02em] text-[#12304a]">Let’s map it out</h2>
+                </div>
+                <span className="h-2 w-2 rounded-full bg-teal-500 shadow-[0_0_0_5px_rgba(13,148,136,0.12)]" aria-hidden="true" />
+              </div>
+              <Suspense fallback={<div className="grid h-[min(68vh,620px)] min-h-[320px] place-items-center text-[0.82rem] tracking-wide text-slate-500">Preparing the whiteboard…</div>}>
+                <DiagramWhiteboard diagram={diagram} />
+              </Suspense>
+            </aside>
+          ) : null}
         </main>
       </div>
     </div>

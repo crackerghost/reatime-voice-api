@@ -8,6 +8,7 @@ let micAnalyser = null;
 let micStream = null;
 let micSrc = null;
 let tap = null;
+let speakConnected = false;
 
 function ensureNodes() {
   if (!speakAnalyser) speakAnalyser = ctx.createAnalyser();
@@ -58,7 +59,10 @@ export const engine = {
   connectSpeak(source) {
     if (!speakAnalyser) return;
     source.connect(speakAnalyser);
-    speakAnalyser.connect(ctx.destination);
+    if (!speakConnected) {
+      speakAnalyser.connect(ctx.destination);
+      speakConnected = true;
+    }
   },
   readSpeak() {
     return read(speakAnalyser);
@@ -129,7 +133,7 @@ export const engine = {
     }
 
     // If the real file never loaded, try the inline Blob as a final attempt.
-    if (last && i === tries - 1) {
+    if (last) {
       try {
         const blobUrl = URL.createObjectURL(
           new Blob([src], { type: "application/javascript" }),
