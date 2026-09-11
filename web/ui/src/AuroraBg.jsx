@@ -6,11 +6,11 @@ import { engine } from "./audioEngine.js";
    pitch/volume. Top edge fades into the page via CSS mask. */
 
 const BLOBS = [
-  { c: [48, 64, 220], x: 0.14, y: 0.62, r: 1.1, s: 0.12, p: 0.0 }, // deep blue
-  { c: [110, 80, 235], x: 0.34, y: 0.78, r: 1.05, s: 0.15, p: 2.1 }, // violet
-  { c: [255, 165, 110], x: 0.56, y: 0.74, r: 0.95, s: 0.13, p: 4.2 }, // warm peach
-  { c: [90, 230, 150], x: 0.8, y: 0.6, r: 0.92, s: 0.13, p: 1.2 }, // mint
-  { c: [235, 120, 160], x: 0.45, y: 0.9, r: 1.0, s: 0.1, p: 3.0 }, // rose undertow
+  { c: [48, 64, 220], x: 0.14, y: 0.62, r: 1.1, s: 0.03, p: 0.0 }, // deep blue
+  { c: [110, 80, 235], x: 0.34, y: 0.78, r: 1.05, s: 0.035, p: 2.1 }, // violet
+  { c: [255, 165, 110], x: 0.56, y: 0.74, r: 0.95, s: 0.03, p: 4.2 }, // warm peach
+  { c: [90, 230, 150], x: 0.8, y: 0.6, r: 0.92, s: 0.03, p: 1.2 }, // mint
+  { c: [235, 120, 160], x: 0.45, y: 0.9, r: 1.0, s: 0.025, p: 3.0 }, // rose undertow
 ];
 
 export default function AuroraBg({ listening, speaking, userTalking }) {
@@ -55,7 +55,7 @@ export default function AuroraBg({ listening, speaking, userTalking }) {
       );
       const pitch = speaking ? spk.pitch : mic.pitch || 0;
       const t = performance.now() / 1000;
-      const agitation = active ? 0.5 : 0.12;
+      const agitation = active ? 0.22 : 0.06;
 
       ctx.globalCompositeOperation = "source-over";
       ctx.clearRect(0, 0, W, H);
@@ -64,7 +64,7 @@ export default function AuroraBg({ listening, speaking, userTalking }) {
       // slow drift only. Voice gently breathes the whole field.
       ctx.globalCompositeOperation = "lighter";
       BLOBS.forEach((b, i) => {
-        if (active) drift[i] += 0.004 + Math.random() * 0.008 * (pitch > 0 ? 1 : 0.3);
+        if (active) drift[i] += 0.001 + Math.random() * 0.002 * (pitch > 0 ? 1 : 0.3);
         const px = (pitch > 0 ? (pitch / 480) * 0.12 : 0) * (i % 2 === 0 ? 1 : -1);
         const cx =
           (b.x + px) * W +
