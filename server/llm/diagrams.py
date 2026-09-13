@@ -6,6 +6,11 @@ import threading
 
 DIAGRAM_MAX_ELEMENTS = 40
 DIAGRAM_MAX_TEXT = 180
+# Overload guard for default-allow gating: at most this many concurrent
+# planner calls per process. Long turns spawn one thread per audio window;
+# beyond this the step is skipped (best-effort — voice is unaffected).
+_MAX_PARALLEL_PLANNERS = 6
+_PLANNER_SEMAPHORE = threading.Semaphore(_MAX_PARALLEL_PLANNERS)
 # Board text is English-only. Devanagari is voice-only.
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]+")
 DIAGRAM_INTENT_RE = re.compile(
@@ -95,11 +100,14 @@ def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
             "role": "system",
             "content": (
                 "You are a visual teaching assistant drawing ONE step of an explanation "
-                "on a shared whiteboard. DRAW only when the step has a visual structure: "
-                "a process/flow, a system with 3+ parts, frontend/backend/data flow, "
-                "a comparison, a timeline, or an architecture. DO NOT draw for greetings, "
-                "yes/no answers, opinions, single facts, jokes, or meta talk — return no "
-                "tool call for those. When drawing, return a draw_flowchart_or_diagram "
+                "on a shared whiteboard. DEFAULT TO DRAWING: any explanation with "
+                "parts, steps, sequence, cause-effect, comparison, timeline, "
+                "hierarchy, a system, a definition with 2+ components, or how "
+                "something works deserves a board — processes, frontend/backend/"
+                "data flow, architectures included. When in doubt, DRAW; a visual "
+                "almost always helps grounding. Return no tool call ONLY for pure "
+                "greetings, bare yes/no answers with no explanation, unstructured "
+                "opinions, jokes, or meta talk. When drawing, return a draw_flowchart_or_diagram "
                 "tool call with 3-6 nodes plus arrows for THIS step only. Labels may "
                 "explain, not just name — up to ~15 words per node when the meaning "
                 "needs it (e.g. 'h1-h6 tags: headings, h1 biggest'). Size width to "
@@ -124,16 +132,16 @@ def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
     ]
 
 
-# Cheap pre-gate: skip the LLM call entirely for windows with no visual
-# structure (greetings, opinions, single facts). Saves ~half the planner calls
-# and their 1-5 s each. The LLM judge inside _step_prompt stays the final
-# authority — this only filters obvious no-draw windows.
-_VISUAL_GATE_RE = re.compile(
-    r"(\d+|[vs]s\.| vs |->|→|पहला|दूसरा|तीसरा|चरण|स्टेप|कदम|process|steps?|"
-    r"flow|compare|comparison|तुलना|difference|अंतर|timeline|क्रम|architecture|"
-    r"system|frontend|backend|database|डेटाबेस|error|एरर|code|कोड|function|"
-    r"फंक्शन|html|css|api|tag|टैग|file|फाइल|h1|h2|div|button|बटन|form|"
-    r"vs\b|w1|w2|first|second|third|then|फिर|because|क्योंकि|means|मतलब)",
+# Production policy: DEFAULT-ALLOW. Any explaining counts as drawable until
+# proven otherwise — the LLM judge is far better at "does this need a
+# visual?" than any keyword list. This regex blocks ONLY windows that are
+# certainly not explanations (greetings, praise, acks, goodbyes).
+_NONVISUAL_RE = re.compile(
+    r"^(नमस्ते|नमस्कार|हेलो|हाय|हैलो|hello|hi|hey|thanks|थैंक्स?|शुक्रिया|"
+    r"धन्यवाद|ओके|ok(ay)?|अच्छा|हाँ|हां|yes|no|नहीं|bye|बाय|अलविदा|"
+    r"good\s+(morning|afternoon|evening|night)|शुभ\s+(प्रभात|रात्रि)|"
+    r"बिल्कुल सही|बहुत बढ़िया|शाबाश|congrats|welcome|वेलकम)"
+    r"[!।.\s?]*$",
     re.IGNORECASE,
 )
 
@@ -188,17 +196,18 @@ def set_course_context(glossary: dict | None = None, keywords=None) -> None:
 
 
 def is_visual_step(step_text: str) -> bool:
-    """Cheap heuristic: does this window merit a planner LLM call?"""
+    """Default-allow: every substantive window earns a planner call.
+
+    Only obvious non-explanations are filtered; the LLM judge makes the
+    final draw/no-draw call per step. Course keywords now act as a recall
+    BOOST (log boost below) rather than a requirement.
+    """
     text = (step_text or "").strip()
     if len(text) < 24:
         return False
-    if _VISUAL_GATE_RE.search(text):
-        return True
-    # Course domain hit: any keyword (len 3+, avoids ना/पर noise).
-    if _COURSE_KEYWORDS:
-        low = text.lower()
-        return any(len(k) > 2 and k in low for k in _COURSE_KEYWORDS)
-    return False
+    if _NONVISUAL_RE.search(text):
+        return False
+    return True
 
 
 def generate_for_step(
@@ -224,111 +233,122 @@ def generate_for_step(
     needs zero thinking; gpt-oss thinking is the biggest chunk of the old
     2-5 s per-window cost). reasoning_effort is accepted for backward
     compat but ignored. max_tokens is env-tunable (DIAGRAM_MAX_TOKENS).
+
+    Overload guard: at most _MAX_PARALLEL_PLANNERS concurrent Groq calls;
+    beyond that the step is skipped (best-effort — voice is unaffected).
+    With default-allow gating every window calls the planner, so one long
+    turn must not open unbounded parallel requests.
     """
     if stop_evt.is_set() or not (step_text or "").strip():
         return None
     if not is_visual_step(step_text):
         return None
-    payload = {
-        "model": model,
-        "messages": _step_prompt(step_text, topic, id_prefix),
-        "tools": [DIAGRAM_TOOL],
-        "tool_choice": "auto",
-        "temperature": 0,
-        "max_tokens": max_tokens,
-    }
-    # Deliberately no reasoning_effort: see docstring.
-    response = None
+    if not _PLANNER_SEMAPHORE.acquire(blocking=False):
+        return None
     try:
-        response = client.post(
-            url,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        response.raise_for_status()
-    except Exception as e:
-        # Log the body once — Groq 400s carry the real reason (bad tool
-        # payload, token budget, model capability). Voice is unaffected.
+        payload = {
+            "model": model,
+            "messages": _step_prompt(step_text, topic, id_prefix),
+            "tools": [DIAGRAM_TOOL],
+            "tool_choice": "auto",
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        }
+        # Deliberately no reasoning_effort: see docstring.
+        response = None
         try:
-            body = response.text[:300] if response is not None else ""
-        except Exception:
-            body = ""
-        import logging as _logging
-        _logging.getLogger("voice_api").warning("Diagram planner skipped (%s) %s", e, body)
-        return None
-    message = (response.json().get("choices") or [{}])[0].get("message") or {}
-    arguments = None
-    for call in message.get("tool_calls") or []:
-        function = call.get("function") or {}
-        if function.get("name") == "draw_flowchart_or_diagram":
-            arguments = function.get("arguments")
-            break
-    if not arguments:
-        return None
-    try:
-        diagram = normalize(json.loads(arguments))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    if not diagram or stop_evt.is_set():
-        return None
-    # Namespace ids per window so deltas merge without collisions.
-    nodes = {}
-    out = []
-    for item in diagram["elements"]:
-        old_id = item["id"]
-        new_id = f"{id_prefix}-{old_id}"[:80]
-        nodes[old_id] = new_id
-        item["id"] = new_id
-        out.append(item)
-    for item in out:
-        if item["type"] == "arrow":
-            if item.get("startNodeId") in nodes:
-                item["startNodeId"] = nodes[item["startNodeId"]]
-            if item.get("endNodeId") in nodes:
-                item["endNodeId"] = nodes[item["endNodeId"]]
-    # Blank-label nodes render as empty boxes — worse than no board. Drop
-    # shapes with no text, then re-drop arrows left dangling by that.
-    out = [it for it in out
-           if it["type"] == "arrow" or str(it.get("text", "")).strip()]
-    keep = {it["id"] for it in out if it["type"] != "arrow"}
-    out = [it for it in out
-           if it["type"] != "arrow"
-           or (it.get("startNodeId") in keep and it.get("endNodeId") in keep)]
-    if not any(it["type"] != "arrow" for it in out):
-        return None
-    # Deterministic layout: model coordinates are NOT trusted (prod boards
-    # showed boxes piled on top of each other). Each window gets its own
-    # band; shapes stack top-to-bottom inside it, sized to their label, so
-    # batches can never overlap and paced reveal always draws downward.
-    # Wrap every 4 windows into a new column to bound viewport growth.
-    try:
-        win_n = int(id_prefix.lstrip("w") or 1)
-    except ValueError:
-        win_n = 1
-    row = (win_n - 1) % 4
-    col = (win_n - 1) // 4
-    base_x = 80 + col * 560
-    base_y = 80 + row * 950
-    shapes = [it for it in out if it["type"] != "arrow"]
-    try:
-        shapes.sort(key=lambda it: (float(it.get("y", 80)), float(it.get("x", 80))))
-    except (TypeError, ValueError):
-        pass
-    cy = float(base_y)
-    for item in shapes:
-        label = str(item.get("text", ""))
-        item["width"] = max(180, min(460, 140 + 8 * len(label)))
-        item["height"] = 96 if item["type"] == "diamond" else 84
-        item["x"] = max(-2000, min(2000, float(base_x)))
-        item["y"] = max(-2000, min(2000, cy))
-        cy += float(item["height"]) + 66
-    boxes = {
-        it["id"]: (it["x"], it["y"], it["width"], it["height"]) for it in shapes
-    }
-    for item in out:
-        if item["type"] == "arrow":
-            _arrow_geometry(item, boxes)
-    return {"elements": out}
+            response = client.post(
+                url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            response.raise_for_status()
+        except Exception as e:
+            # Log the body once — Groq 400s carry the real reason (bad tool
+            # payload, token budget, model capability). Voice is unaffected.
+            try:
+                body = response.text[:300] if response is not None else ""
+            except Exception:
+                body = ""
+            import logging as _logging
+            _logging.getLogger("voice_api").warning("Diagram planner skipped (%s) %s", e, body)
+            return None
+        message = (response.json().get("choices") or [{}])[0].get("message") or {}
+        arguments = None
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if function.get("name") == "draw_flowchart_or_diagram":
+                arguments = function.get("arguments")
+                break
+        if not arguments:
+            return None
+        try:
+            diagram = normalize(json.loads(arguments))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not diagram or stop_evt.is_set():
+            return None
+        # Namespace ids per window so deltas merge without collisions.
+        nodes = {}
+        out = []
+        for item in diagram["elements"]:
+            old_id = item["id"]
+            new_id = f"{id_prefix}-{old_id}"[:80]
+            nodes[old_id] = new_id
+            item["id"] = new_id
+            out.append(item)
+        for item in out:
+            if item["type"] == "arrow":
+                if item.get("startNodeId") in nodes:
+                    item["startNodeId"] = nodes[item["startNodeId"]]
+                if item.get("endNodeId") in nodes:
+                    item["endNodeId"] = nodes[item["endNodeId"]]
+        # Blank-label nodes render as empty boxes — worse than no board. Drop
+        # shapes with no text, then re-drop arrows left dangling by that.
+        out = [it for it in out
+               if it["type"] == "arrow" or str(it.get("text", "")).strip()]
+        keep = {it["id"] for it in out if it["type"] != "arrow"}
+        out = [it for it in out
+               if it["type"] != "arrow"
+               or (it.get("startNodeId") in keep and it.get("endNodeId") in keep)]
+        if not any(it["type"] != "arrow" for it in out):
+            return None
+        # Deterministic layout: model coordinates are NOT trusted (prod boards
+        # showed boxes piled on top of each other). Each window gets its own
+        # band; shapes stack top-to-bottom inside it, sized to their label, so
+        # batches can never overlap and paced reveal always draws downward.
+        # Wrap every 4 windows into a new column to bound viewport growth.
+        try:
+            win_n = int(id_prefix.lstrip("w") or 1)
+        except ValueError:
+            win_n = 1
+        row = (win_n - 1) % 4
+        col = (win_n - 1) // 4
+        base_x = 80 + col * 560
+        base_y = 80 + row * 950
+        shapes = [it for it in out if it["type"] != "arrow"]
+        try:
+            shapes.sort(key=lambda it: (float(it.get("y", 80)), float(it.get("x", 80))))
+        except (TypeError, ValueError):
+            pass
+        cy = float(base_y)
+        for item in shapes:
+            label = str(item.get("text", ""))
+            item["width"] = max(180, min(460, 140 + 8 * len(label)))
+            item["height"] = 96 if item["type"] == "diamond" else 84
+            item["x"] = max(-2000, min(2000, float(base_x)))
+            item["y"] = max(-2000, min(2000, cy))
+            cy += float(item["height"]) + 66
+        boxes = {
+            it["id"]: (it["x"], it["y"], it["width"], it["height"]) for it in shapes
+        }
+        for item in out:
+            if item["type"] == "arrow":
+                _arrow_geometry(item, boxes)
+        return {"elements": out}
+    finally:
+        _PLANNER_SEMAPHORE.release()
+
 
 
 def _prompt(text: str, history: list[dict]) -> list[dict]:

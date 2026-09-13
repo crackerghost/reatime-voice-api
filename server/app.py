@@ -45,7 +45,7 @@ from server.schemas import make_schemas
 from server.runtime import VoiceRuntime
 from server.settings import Settings
 
-from server.llm.diagrams import generate as _generate_diagram, generate_for_step as _generate_step, should_generate as _should_generate_diagram
+from server.llm.diagrams import generate_for_step as _generate_step, should_generate as _should_generate_diagram
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("voice_api")
@@ -1071,7 +1071,7 @@ def api_config():
         # browser-side conversation behaviour (read by web/ui/src/App.jsx)
         "chat_step": int(os.environ.get("VOICE_CHAT_STEP", "8")),  # nfe_step the UI sends
         "jitter_frames": JITTER_FRAMES,
-        "max_history": int(os.environ.get("VOICE_MAX_HISTORY", "12")),
+        "max_history": int(os.environ.get("VOICE_MAX_HISTORY", "8")),
         "ws_reconnect_ms": int(os.environ.get("VOICE_WS_RECONNECT_MS", "1500")),
         "rec_restart_ms": int(os.environ.get("VOICE_REC_RESTART_MS", "400")),
         "vad_tick_ms": int(os.environ.get("VOICE_VAD_TICK_MS", "50")),
@@ -1179,7 +1179,7 @@ MAX_CHAT_SENTENCES = int(os.environ.get("VOICE_MAX_SENTENCES", "6"))
 FIRST_WINDOW_STEP = max(2, min(32, int(os.environ.get("VOICE_FIRST_STEP", "2"))))  # floor 2 = snappiest first window
 # Conversation history kept per turn (older messages dropped). Kept small so
 # the LLM prefill stays tiny - the #1 lever for first-audio latency.
-MAX_HISTORY = int(os.environ.get("VOICE_MAX_HISTORY", "12"))
+MAX_HISTORY = int(os.environ.get("VOICE_MAX_HISTORY", "8"))
 
 TTS_ENGINE = TTSEngine(
     TTSConfig(
@@ -1264,50 +1264,6 @@ def _synth_worker(state, text, num_step, speed, out_q, stop_evt, t0=None):
         out_q.put(("error", f"{type(e).__name__}: {e}"))
 
 
-def _generate_diagram_for_turn(key, text, history, stop_evt, http_client: httpx.Client):
-    return _generate_diagram(
-        key,
-        text,
-        history,
-        stop_evt,
-        client=http_client,
-        url=MISTRAL_URL,
-        model=DIAGRAM_MODEL,
-        reasoning_effort=LLM_REASONING_EFFORT,
-    )
-
-
-async def _send_diagram_when_ready(
-    websocket: WebSocket,
-    key: str,
-    text: str,
-    history: list[dict],
-    stop_evt: threading.Event,
-    turn_id: str,
-    client_turn_id: str,
-    http_client: httpx.Client,
-) -> None:
-    try:
-        diagram = await asyncio.to_thread(
-            _generate_diagram_for_turn,
-            key,
-            text,
-            history,
-            stop_evt,
-            http_client,
-        )
-        if not diagram or stop_evt.is_set():
-            return
-        await websocket.send_text(json.dumps({
-            "type": "diagram",
-            "turn_id": turn_id,
-            "client_turn_id": client_turn_id,
-            "diagram": diagram,
-        }))
-    except Exception as exc:
-        log.warning("Diagram generation skipped: %s", exc)
-
-
 async def ws_tts(websocket: WebSocket):
     await websocket.accept()
     state = websocket.app.state
@@ -1315,12 +1271,10 @@ async def ws_tts(websocket: WebSocket):
     ctrl: asyncio.Queue = asyncio.Queue()
     busy = [False]  # a generation/chat is currently streaming to this client
     turn_started = [0.0]  # monotonic time the latest turn started (stop-grace guard)
-    diagram_tasks: set[asyncio.Task] = set()
-
-    def cancel_diagram_tasks() -> None:
-        for task in diagram_tasks:
-            task.cancel()
-        diagram_tasks.clear()
+    # NOTE: an older whole-turn diagram judge used to run here as an asyncio
+    # task (diagram_tasks). It was superseded by the per-window watcher
+    # sidecars inside _chat_worker and never fires anymore — removed rather
+    # than left as dead plumbing. Board deltas arrive via out_q ("diagram").
 
     async def reader():
         try:
@@ -1344,13 +1298,11 @@ async def ws_tts(websocket: WebSocket):
                     if busy[0] and time.monotonic() - turn_started[0] < STOP_GRACE_S:
                         continue
                     stop_evt.set()  # explicit user interrupt
-                    cancel_diagram_tasks()
                     continue
                 if busy[0] and (mtype == "chat" or data.get("text")):
                     # barge-in: a new request while one is streaming cuts the
                     # current reply short (it will run next, in order)
                     stop_evt.set()
-                    cancel_diagram_tasks()
                 await ctrl.put(raw)
         except Exception:
             await ctrl.put(None)
@@ -1528,7 +1480,6 @@ async def ws_tts(websocket: WebSocket):
 
                 turn_started[0] = time.monotonic()
                 stop_evt.clear()
-                cancel_diagram_tasks()
                 start = time.perf_counter()
                 turn_id = uuid.uuid4().hex
                 client_turn_id = str(data.get("client_turn_id", ""))[:80]

@@ -21,7 +21,7 @@ const VISION_URL = `${location.protocol}//${location.host}/api/vision`;
 const CFG = {
   chatStep: 8, // nfe_step the UI sends for chat replies
   jitterFrames: 1, // start after one TTS frame; raise via VOICE_JITTER_FRAMES if slower hardware underruns
-  maxHistory: 12,
+  maxHistory: 8,
   wsReconnectMs: 1500,
   recRestartMs: 400,
   vadTickMs: 50,
