@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FaBars, FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTableColumns, FaTrash, FaVolumeHigh, FaWandMagicSparkles, FaXmark } from "react-icons/fa6";
 import Sidebar from "./Sidebar.jsx";
 import BottomBar from "./BottomBar.jsx";
-import DiagramWhiteboard from "./DiagramWhiteboard.jsx";
+import TutorBoard from "./TutorBoard.jsx";
 import ResizeHandle from "./ResizeHandle.jsx";
 import VoiceGradient from "./VoiceGradient.jsx";
 import { engine } from "./audioEngine.js";
@@ -137,7 +137,9 @@ export default function App() {
   const revealTimerRef = useRef(0);
   const REVEAL_MS = 650; // one shape per beat: smooth hand-drawn feel in sync with speech
 
-  /* Merge one staged board batch into state (id-keyed, capped). */
+  /* Merge one staged board batch into state (id-keyed, capped).
+     The cap is generous (500): the board is a persistent lesson timeline
+     that is NEVER erased between turns — only clearChat wipes it. */
   const mergeDiagramBatch = useCallback((incoming) => {
     setDiagram((prev) => {
       const seen = new Set();
@@ -147,15 +149,73 @@ export default function App() {
         seen.add(el.id);
         merged.push(el);
       }
-      return { elements: merged.slice(-40) };
+      return { elements: merged.slice(-500) };
     });
   }, []);
+
+  // Lesson timeline: flat board elements grouped into steps by window tag
+  // (w{N}-... ids). Drives back/forward navigation in TutorBoard.
+  const stepOf = (el) => {
+    const m = /^w(\d+)-/i.exec(String(el?.id || ""));
+    return m ? `w${Number(m[1])}` : "w0";
+  };
+  const steps = useMemo(() => {
+    const map = new Map();
+    for (const el of diagram?.elements || []) {
+      const key = stepOf(el);
+      if (!map.has(key)) map.set(key, { key, elements: [] });
+      map.get(key).elements.push(el);
+    }
+    return [...map.values()].sort((a, b) =>
+      Number(a.key.slice(1)) - Number(b.key.slice(1)));
+  }, [diagram]);
+  const [stepIndex, setStepIndex] = useState(0);
+  const [followLive, setFollowLive] = useState(true);
+  useEffect(() => {
+    if (followLive && steps.length) setStepIndex(steps.length - 1);
+  }, [steps.length, followLive]);
+
+  // Trigger-gated elements: drawn the instant their trigger word is spoken.
+  // Matched against the live caption (same pipeline as speech = exact clock);
+  // 8s deadline backstop so a missed trigger never strands content.
+  const waitingRef = useRef([]); // [{el, stagedAt}]
+  const normCaption = (s) => (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ");
+  // Plain per-render closure (refs + stable setters only — no staleness),
+  // callable from stable callbacks and the WS handler without dep churn.
+  const matchWaiting = () => {
+    if (!waitingRef.current.length) return;
+    const cap = normCaption(assistantTextRef.current);
+    const now = Date.now();
+    const ready = [];
+    waitingRef.current = waitingRef.current.filter((w) => {
+      const t = (w.el?.trigger || "").toLowerCase().trim();
+      if (!t || (cap && cap.includes(t)) || now - w.stagedAt > 8000) {
+        ready.push(w.el);
+        return false;
+      }
+      return true;
+    });
+    if (ready.length) {
+      revealQueueRef.current.push(...ready);
+      if (!revealTimerRef.current) revealNext();
+    }
+  };
 
   /* Paced reveal: draw ONE shape per beat so the board grows smoothly with
      the speech instead of popping a whole batch instantly. Each shape gets
      viewport focus as it appears. Overflow (queue > 12) dumps instantly to
      avoid falling minutes behind on long turns. */
   const revealNext = useCallback(() => {
+    // Sweep expired trigger-waits first (deadline backstop).
+    if (waitingRef.current.length) {
+      const now = Date.now();
+      const due = [];
+      waitingRef.current = waitingRef.current.filter((w) => {
+        if (now - w.stagedAt > 8000) { due.push(w.el); return false; }
+        return true;
+      });
+      if (due.length) revealQueueRef.current.push(...due);
+    }
     const el = revealQueueRef.current.shift();
     if (!el) {
       revealTimerRef.current = 0;
@@ -178,17 +238,23 @@ export default function App() {
   }, [mergeDiagramBatch]);
 
   /* Flush staged deltas whose audio window has started playing.
-     Elements queue in window order for paced reveal — position matches
-     the spoken step, one shape at a time. */
+     Trigger-bearing elements wait for their spoken word (matchWaiting);
+     the rest join the paced reveal queue in window order. */
   const flushDiagramsUpTo = useCallback((n) => {
     const staged = stagedDiagramsRef.current;
     if (!staged.size) return;
     const keys = [...staged.keys()].filter((k) => k <= n).sort((a, b) => a - b);
+    const now = Date.now();
     for (const k of keys) {
       const batch = staged.get(k);
       staged.delete(k);
-      if (batch?.length) revealQueueRef.current.push(...batch);
+      if (!batch?.length) continue;
+      for (const el of batch) {
+        if (el?.trigger) waitingRef.current.push({ el, stagedAt: now });
+        else revealQueueRef.current.push(el);
+      }
     }
+    matchWaiting();
     if (revealQueueRef.current.length && !revealTimerRef.current) revealNext();
   }, [revealNext]);
 
@@ -216,6 +282,7 @@ export default function App() {
     audioWindowRef.current = [];
     currentWindowRef.current = 0;
     revealQueueRef.current = [];
+    waitingRef.current = [];
     setDiagramFocus(null);
     if (diagramTimerRef.current) {
       clearTimeout(diagramTimerRef.current);
@@ -415,6 +482,7 @@ export default function App() {
     windowOrderRef.current = [];
     stagedDiagramsRef.current.clear();
     revealQueueRef.current = [];
+    waitingRef.current = [];
     if (revealTimerRef.current) {
       clearTimeout(revealTimerRef.current);
       revealTimerRef.current = 0;
@@ -775,7 +843,9 @@ export default function App() {
       clearDiagramQueue();
       activeTurnIdRef.current += 1;
       diagramTurnRef.current = null;
-      setDiagram(null);
+      // Board is NEVER erased between turns: new steps append to the lesson
+      // timeline. Only clearChat wipes it. Resume live-follow for the reply.
+      setFollowLive(true);
       setMessages((m) => [...m, { id: nextId(), role: "user", text, ts: Date.now() }]);
       pushHistory("user", text);
 
@@ -1016,6 +1086,9 @@ export default function App() {
               );
             });
             assistantTextRef.current += m.text;
+            // Trigger-watch: a board element whose spoken word just arrived
+            // in the caption draws NOW (caption == speech clock).
+            try { matchWaiting(); } catch { /* board must never break voice */ }
           } else if (m.type === "error") {
             if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
             assistantTextRef.current = "";
@@ -1801,6 +1874,8 @@ export default function App() {
     openAssistantId.current = null;
     assistantTextRef.current = "";
     setDiagram(null);
+    setStepIndex(0); // fresh lesson timeline
+    setFollowLive(true);
     setMessages([{ id: nextId(), role: "assistant", text: GREETING }]);
   }, [hardStop]);
 
@@ -1833,7 +1908,8 @@ export default function App() {
     rightDragStartRef.current = rightW;
   }, [rightW]);
   const resizeRight = useCallback((dx) => {
-    setRightW(clampW(rightDragStartRef.current + dx, 340, 900));
+    // Handle sits on the panel's LEFT edge: dragging left (dx<0) must WIDEN.
+    setRightW(clampW(rightDragStartRef.current - dx, 340, 900));
   }, []);
 
   /* ---------- UI: three draggable panels ---------- */
@@ -2015,15 +2091,15 @@ export default function App() {
         <aside
           className="relative z-10 flex h-full flex-col overflow-hidden bg-white max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:z-40 max-lg:w-[min(92vw,520px)] max-lg:shadow-2xl lg:shrink-0 lg:border-l lg:border-slate-200/80 lg:w-[var(--canvas-w)]"
           style={{ "--canvas-w": `${rightW}px` }}
-          aria-label="Visual explanation canvas"
+          aria-label="Lesson board"
         >
           <div className="flex items-center justify-between border-b border-slate-200/70 px-5 py-3">
             <div>
               <span className="block text-[0.64rem] font-bold tracking-[0.14em] text-[#ff5a5f] uppercase">
-                Visual explanation{diagram?.elements?.length ? ` · ${diagram.elements.length} shapes` : ""}
+                Lesson board{steps.length ? ` · ${steps.length} step${steps.length > 1 ? "s" : ""}` : ""}
               </span>
               <h2 className="mt-0.5 text-[1rem] font-semibold tracking-[-0.02em] text-slate-900">
-                Let’s map it out
+                Learn step by step
               </h2>
             </div>
             <div className="flex items-center gap-2">
@@ -2038,7 +2114,20 @@ export default function App() {
             </div>
           </div>
           <div className="min-h-0 flex-1">
-            <DiagramWhiteboard diagram={diagram} focus={diagramFocus} />
+            <TutorBoard
+              steps={steps}
+              focus={diagramFocus}
+              stepIndex={stepIndex}
+              followLive={followLive}
+              onStep={(i) => {
+                setStepIndex(i);
+                setFollowLive(false);
+              }}
+              onJumpLive={() => {
+                setFollowLive(true);
+                setStepIndex(Math.max(0, steps.length - 1));
+              }}
+            />
           </div>
         </aside>
       )}

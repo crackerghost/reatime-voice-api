@@ -44,6 +44,10 @@ DIAGRAM_TOOL = {
                             "startNodeId": {"type": "string"},
                             "endNodeId": {"type": "string"},
                             "arrowLabel": {"type": "string"},
+                            "trigger": {
+                                "type": "string",
+                                "description": "1-3 exact English words from the STEP that name this element (e.g. 'computer', 'query selector'). The board draws it the moment the tutor speaks them.",
+                            },
                         },
                         # x/y required only for SHAPES. Arrows are defined by
                         # startNodeId/endNodeId (server computes their geometry),
@@ -120,7 +124,11 @@ def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
                 "Never Devanagari on the board; Hindi is voice-only. "
                 "Node ids: ASCII ONLY (a-z, 0-9, hyphen), prefixed with the given "
                 "TAG (e.g. TAG-n1, TAG-n2). Never Devanagari or invented words in "
-                "ids. Shapes give x/y/width/height; ARROWS give ONLY id, type, "
+                "ids. Every element ALSO gets a trigger: the 1-3 exact English "
+                "words from the STEP that name it (label 'Computer' -> trigger "
+                "'computer'; 'query selector' -> 'query selector'). The board "
+                "draws each element the instant the tutor speaks its trigger, "
+                "so triggers must be words the STEP actually says. Shapes give x/y/width/height; ARROWS give ONLY id, type, "
                 "startNodeId, endNodeId — never x/y on arrows. Layout is dynamic "
                 "per step: top-to-bottom flow for sequences/processes "
                 "(x ~80..400, y growing), side-by-side for comparisons "
@@ -424,6 +432,9 @@ def normalize(raw: object) -> dict | None:
                 normalized[key] = default
         if item_type in {"rectangle", "ellipse", "diamond", "text"}:
             normalized["text"] = _board_text(item.get("text", ""))[:DIAGRAM_MAX_TEXT]
+            trigger = re.sub(r"[^A-Za-z0-9 ]+", "", str(item.get("trigger", ""))).strip()[:60]
+            if trigger:
+                normalized["trigger"] = trigger
         if item_type == "arrow":
             normalized["startNodeId"] = str(item.get("startNodeId", "")).strip()[:80]
             normalized["endNodeId"] = str(item.get("endNodeId", "")).strip()[:80]

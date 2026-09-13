@@ -262,6 +262,10 @@ from server.llm.prompts import (
 )
 
 
+from server.chat.phrases import (
+    clause_units as _clause_units,
+    speech_sentence as _speech_sentence,
+)
 from server.speech.normalization import (
     _devanagari_only,
     _fix_pronunciation,
@@ -579,112 +583,6 @@ def _llm_stream_phrases(
             retry_wait = min(retry_wait * 2, 8.0)
 
 
-_HINDI_NUMS = {
-    0: "शून्य", 1: "एक", 2: "दो", 3: "तीन", 4: "चार", 5: "पांच", 6: "छह", 7: "सात", 8: "आठ", 9: "नौ",
-    10: "दस", 11: "ग्यारह", 12: "बारह", 13: "तेरह", 14: "चौदह", 15: "पंद्रह", 16: "सोलह", 17: "सत्रह",
-    18: "अठारह", 19: "उन्नीस", 20: "बीस", 21: "इक्कीस", 22: "बाईस", 23: "तेईस", 24: "चौबीस", 25: "पच्चीस",
-    26: "छब्बीस", 27: "सत्ताईस", 28: "अट्ठाइस", 29: "उनतीस", 30: "तीस", 31: "इकत्तीस", 32: "बत्तीस",
-    33: "तैंतीस", 34: "चौंतीस", 35: "पैंतीस", 36: "छत्तीस", 37: "सैंतीस", 38: "अड़तीस", 39: "उनतालीस",
-    40: "चालीस", 50: "पचास", 60: "साठ", 70: "सत्तर", 80: "अस्सी", 90: "नब्बे", 100: "सौ",
-}
-
-
-def _convert_numbers_to_hindi(text: str) -> str:
-    """Convert numeric digits to spoken Hindi words so OmniVoice never fails on ASCII numbers."""
-    def _repl(m: re.Match) -> str:
-        s = m.group(0)
-        try:
-            val = int(s)
-            if val in _HINDI_NUMS:
-                return _HINDI_NUMS[val]
-            if val < 100:
-                tens = (val // 10) * 10
-                ones = val % 10
-                return f"{_HINDI_NUMS.get(tens, '')} {_HINDI_NUMS.get(ones, '')}".strip()
-            # Multi-digit numbers (like 404, 2024): pronounce digit-by-digit
-            return " ".join(_HINDI_NUMS.get(int(d), d) for d in s)
-        except Exception:
-            return s
-
-    # Skip digits glued to Latin letters (h1, html5) — _devanagari_only
-    # speaks those as एच वन, एचटीएमएल फाइव. Standalone numbers convert here.
-    return re.sub(r"(?<![A-Za-z])\d+", _repl, text)
-
-
-def _speech_sentence(sent: str, complete: bool = True) -> str:
-    """Make one streamed phrase speakable (strip markup, convert numbers, Devanagari accent).
-
-    complete=False leaves off the terminal danda/full-stop so a phrase that was
-    flushed early (mid-sentence) doesn't get an artificial full stop.
-    """
-    sent = _preserve_code_tokens(sent)
-    sent = _speechify(sent)
-    sent = _naturalize(sent)
-    sent = _convert_numbers_to_hindi(sent)
-    sent = _devanagari_only(sent)
-    if not sent:
-        return ""
-    if complete and sent[-1] not in "।?!.":
-        sent += "।" if any("\u0900" <= ch <= "\u097F" for ch in sent) else "."
-    return sent
-
-
-def _clause_units(sent: str) -> list[str]:
-    """Split text into TTS-window-sized pieces (hard cap, word boundaries).
-
-    Sentence enders (। ? ! . newline) are HARD boundaries — a piece never
-    spans across one, so a danda-terminated sentence is always spoken as one
-    intonation arc and never glued to the next sentence's opening words.
-    Within one sentence, cuts land at clause punctuation first, then at
-    spaces; short sentences pass through untouched.
-
-    Every returned piece is <= _PIECE_MAX chars, so no single audio window can
-    grow into a long uninterruptible frame (the #1 thing that kills the
-    realtime feel — one giant run-on sentence used to stall TTS for 10s+).
-    """
-    # Cut at sentence enders FIRST — each sentence is spoken separately.
-    sentences = [s.strip() for s in re.split(r"(?<=[।?!.\n])\s*", sent) if s.strip()]
-    if not sentences:
-        return []
-    out: list[str] = []
-    for sentence in sentences:
-        if len(sentence) <= _PIECE_MAX:
-            out.append(sentence)
-            continue
-        # first cut at clause punctuation so seams sit at natural pauses
-        seps = [m.start() for m in re.finditer(r"[,;—–]", sentence)]
-        if seps:
-            last = 0
-            for p in seps:
-                if p - last > _PIECE_MAX:
-                    out.append(sentence[last : p + 1].strip())
-                    last = p + 1
-            tail = sentence[last:].strip()
-            if tail:
-                out.append(tail)
-        else:
-            out.append(sentence)
-    # then hard-split anything still too long at word boundaries
-    final: list[str] = []
-    for u in out:
-        if len(u) <= _PIECE_MAX:
-            final.append(u)
-            continue
-        words = u.split(" ")
-        cur = ""
-        for w in words:
-            cand = ((cur + " " + w) if cur else w).strip()
-            if len(cand) <= _PIECE_MAX:
-                cur = cand
-                continue
-            if cur:
-                final.append(cur)
-                cur = w
-        if cur:
-            final.append(cur)
-    return [p for p in final if p]
-
-
 def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt, t0=None,
                  http_client: httpx.Client | None = None, diagram_ctx: dict | None = None):
     """3-thread pipeline: LLM producer -> text/windowing -> audio synth.
@@ -877,7 +775,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             # — a split can never strand "जवाब देने के" in window #1 while
             # "लिए तैयार हूँ" lands in window #2.
             sentence_done = complete and not text_buf
-            for piece in _clause_units(text):
+            for piece in _clause_units(text, _PIECE_MAX):
                 if window and window_chars + len(piece) > WINDOW_CHAR_CAP:
                     steps = min(num_step, FIRST_WINDOW_STEP) if not emitted_audio else num_step
                     _ship_window(" ".join(window), steps, raw_text=_take_raw())
