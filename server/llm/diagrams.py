@@ -117,6 +117,28 @@ def _step_prompt(step_text: str, topic: str) -> list[dict]:
     ]
 
 
+# Cheap pre-gate: skip the LLM call entirely for windows with no visual
+# structure (greetings, opinions, single facts). Saves ~half the planner calls
+# and their 1-5 s each. The LLM judge inside _step_prompt stays the final
+# authority — this only filters obvious no-draw windows.
+_VISUAL_GATE_RE = re.compile(
+    r"(\d+|[vs]s\.| vs |->|→|पहला|दूसरा|तीसरा|चरण|स्टेप|कदम|process|steps?|"
+    r"flow|compare|comparison|तुलना|difference|अंतर|timeline|क्रम|architecture|"
+    r"system|frontend|backend|database|डेटाबेस|error|एरर|code|कोड|function|"
+    r"फंक्शन|html|css|api|tag|टैग|file|फाइल|h1|h2|div|button|बटन|form|"
+    r"vs\b|w1|w2|first|second|third|then|फिर|because|क्योंकि|means|मतलब)",
+    re.IGNORECASE,
+)
+
+
+def is_visual_step(step_text: str) -> bool:
+    """Cheap heuristic: does this window merit a planner LLM call?"""
+    text = (step_text or "").strip()
+    if len(text) < 24:
+        return False
+    return bool(_VISUAL_GATE_RE.search(text))
+
+
 def generate_for_step(
     key: str,
     step_text: str,
@@ -126,7 +148,8 @@ def generate_for_step(
     client,
     url: str,
     model: str,
-    reasoning_effort: str,
+    reasoning_effort: str = "",
+    max_tokens: int = 450,
     id_prefix: str = "w",
 ) -> dict | None:
     """Watcher planner: one small board delta for ONE spoken window.
@@ -134,21 +157,25 @@ def generate_for_step(
     Best-effort by design — None means 'nothing drawable this step', never an
     error. Voice never waits for this; the caller tags the result with window_n
     and the client merges it on arrival.
+
+    Latency design: NO reasoning param is ever sent here (a 3-6 node board
+    needs zero thinking; gpt-oss thinking is the biggest chunk of the old
+    2-5 s per-window cost). reasoning_effort is accepted for backward
+    compat but ignored. max_tokens is env-tunable (DIAGRAM_MAX_TOKENS).
     """
     if stop_evt.is_set() or not (step_text or "").strip():
+        return None
+    if not is_visual_step(step_text):
         return None
     payload = {
         "model": model,
         "messages": _step_prompt(step_text, topic),
         "tools": [DIAGRAM_TOOL],
         "tool_choice": "auto",
-        "temperature": 0.2,
-        # gpt-oss spends tokens thinking before answering — 450 starves the
-        # tool arguments and Groq answers 400. 800 matches the whole-turn judge.
-        "max_tokens": 800,
+        "temperature": 0,
+        "max_tokens": max_tokens,
     }
-    if reasoning_effort and "gpt-oss" in model:
-        payload["reasoning_effort"] = reasoning_effort
+    # Deliberately no reasoning_effort: see docstring.
     response = None
     try:
         response = client.post(
@@ -208,14 +235,22 @@ def generate_for_step(
     if not any(it["type"] != "arrow" for it in out):
         return None
     # Y-offset per window so steps stack downward instead of overlapping.
+    # Capped + wrapped: unbounded growth (win 8 -> +1540y) pushes new nodes
+    # far below the fitted viewport while old nodes get evicted by the
+    # client's 40-element cap — the board then shows "Scroll back to content"
+    # with apparently nothing on screen. Wrap every 4 windows into a new column.
     try:
         win_n = int(id_prefix.lstrip("w") or 1)
     except ValueError:
         win_n = 1
-    y_off = max(0, (win_n - 1)) * 220
+    row = (win_n - 1) % 4
+    col = (win_n - 1) // 4
+    y_off = row * 220
+    x_off = col * 280
     for item in out:
         try:
             item["y"] = max(-2000, min(2000, float(item.get("y", 80)) + y_off))
+            item["x"] = max(-2000, min(2000, float(item.get("x", 80)) + x_off))
         except (TypeError, ValueError):
             pass
     return {"elements": out}

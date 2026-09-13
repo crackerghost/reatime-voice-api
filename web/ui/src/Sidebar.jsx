@@ -1,5 +1,3 @@
-import { useEffect, useRef } from "react";
-import gsap from "gsap";
 import {
   FaClock,
   FaComments,
@@ -13,6 +11,7 @@ import {
 export default function Sidebar({
   open,
   onClose,
+  width,
   connected,
   listening,
   asrReady,
@@ -24,28 +23,6 @@ export default function Sidebar({
   sharing,
   visionEnabled,
 }) {
-  const ref = useRef(null);
-
-  const firstRender = useRef(true);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    if (firstRender.current) {
-      // First paint: render in final position, no animation hiding content.
-      firstRender.current = false;
-      gsap.set(el, open ? { x: 0, autoAlpha: 1 } : { x: -320, autoAlpha: 0 });
-      return;
-    }
-    gsap.to(el, {
-      x: open ? 0 : -320,
-      autoAlpha: open ? 1 : 0,
-      duration: 0.45,
-      ease: "power3.out",
-      overwrite: true,
-    });
-  }, [open ]);
-
   const status = connected
     ? listening
       ? asrReady
@@ -56,8 +33,8 @@ export default function Sidebar({
 
   return (
     <aside
-      ref={ref}
-      className={`z-30 flex h-full w-72 shrink-0 flex-col border-r border-slate-200/80 bg-white max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:shadow-2xl ${open ? "" : "pointer-events-none"}`}
+      className="z-30 flex h-full shrink-0 flex-col border-r border-slate-200/80 bg-white max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:w-72 max-md:shadow-2xl md:w-[var(--sidebar-w)]"
+      style={{ "--sidebar-w": `${width}px` }}
       aria-label="Tutor sidebar"
       aria-hidden={!open}
     >

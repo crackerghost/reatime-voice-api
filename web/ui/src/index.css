@@ -59,3 +59,36 @@
     outline-offset: 5px;
   }
 }
+
+/* Gemini-style voice gradient: bottom 50% background, pitch-driven from JS. */
+@keyframes gemini-pulse {
+  0%, 100% { opacity: 0.45; transform: scale(0.9); }
+  50% { opacity: 0.8; transform: scale(1.1); }
+}
+
+.voice-gradient-layer {
+  filter: blur(42px);
+  pointer-events: none;
+  will-change: transform, opacity, filter;
+}
+
+.gemini-gradient {
+  position: absolute;
+  inset: -12%;
+  background:
+    radial-gradient(ellipse at 20% 70%, #4285f4 0%, transparent 55%),
+    radial-gradient(ellipse at 45% 60%, #9b72cb 0%, transparent 55%),
+    radial-gradient(ellipse at 70% 65%, #d96570 0%, transparent 55%),
+    radial-gradient(ellipse at 90% 70%, #fbbc04 0%, transparent 50%);
+  transform-origin: center;
+  will-change: transform;
+}
+
+.gemini-gradient::after {
+  content: "";
+  position: absolute;
+  inset: -20px;
+  background: radial-gradient(ellipse at center, rgba(90, 130, 255, 0.7), transparent 65%);
+  filter: blur(50px);
+  animation: gemini-pulse 2.5s ease-in-out infinite;
+}

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FaBars, FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTrash, FaVolumeHigh, FaWandMagicSparkles, FaXmark } from "react-icons/fa6";
+import { FaBars, FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTableColumns, FaTrash, FaVolumeHigh, FaWandMagicSparkles, FaXmark } from "react-icons/fa6";
 import Sidebar from "./Sidebar.jsx";
 import BottomBar from "./BottomBar.jsx";
-import AuroraBg from "./AuroraBg.jsx";
 import DiagramWhiteboard from "./DiagramWhiteboard.jsx";
+import ResizeHandle from "./ResizeHandle.jsx";
+import VoiceGradient from "./VoiceGradient.jsx";
 import { engine } from "./audioEngine.js";
 import { chatMessage, pingMessage, stopMessage } from "./services/ttsProtocol.js";
 
@@ -97,8 +98,13 @@ export default function App() {
   const [typing, setTyping] = useState(false);
   const [micBusy, setMicBusy] = useState(false);
   const [sharing, setSharing] = useState(false); // push-to-see capture active (button held)
-  const [diagram, setDiagram] = useState({ elements: [] });
+  const [diagram, setDiagram] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [canvasOpen, setCanvasOpen] = useState(() => typeof window !== "undefined" && window.innerWidth >= 1024);
+  const [leftW, setLeftW] = useState(288);
+  const [rightW, setRightW] = useState(520);
+  const leftDragStartRef = useRef(0);
+  const rightDragStartRef = useRef(0);
 
   // ---- mutable runtime state (safe across renders) ----
   const wsRef = useRef(null);
@@ -118,6 +124,15 @@ export default function App() {
   const diagramTurnRef = useRef(null);
   const diagramQueueRef = useRef([]); // staged board deltas for smooth step-by-step draw
   const diagramTimerRef = useRef(0);
+  // Audio-synced board: server numbers every TTS window (m.type==="window" n),
+  // audio blobs arrive in the same WS order, and diagram deltas carry window_n.
+  // We stage deltas keyed by window and flush them only when that window's
+  // audio STARTS playing — so the viewport always shows the step being spoken.
+  const windowOrderRef = useRef([]); // window numbers in arrival order (pairs with audio blobs)
+  const audioWindowRef = useRef([]); // window n aligned 1:1 with pendingRef blobs
+  const stagedDiagramsRef = useRef(new Map()); // window_n -> elements[]
+  const currentWindowRef = useRef(0); // audio window currently playing
+  const [diagramFocus, setDiagramFocus] = useState(null); // {ids:[...], tick:n} -> whiteboard scrolls here
 
   /* Merge one staged board batch into state (id-keyed, capped). */
   const mergeDiagramBatch = useCallback((incoming) => {
@@ -133,8 +148,26 @@ export default function App() {
     });
   }, []);
 
+  /* Flush staged deltas whose audio window has started playing.
+     Batches merge in window order; the whiteboard focuses the newest batch
+     so the viewport follows the spoken step instead of the whole board. */
+  const flushDiagramsUpTo = useCallback((n) => {
+    const staged = stagedDiagramsRef.current;
+    if (!staged.size) return;
+    const keys = [...staged.keys()].filter((k) => k <= n).sort((a, b) => a - b);
+    for (const k of keys) {
+      const batch = staged.get(k);
+      staged.delete(k);
+      if (batch?.length) {
+        mergeDiagramBatch(batch);
+        setDiagramFocus({ ids: batch.map((el) => el?.id).filter(Boolean), tick: Date.now() + k });
+      }
+    }
+  }, [mergeDiagramBatch]);
+
   /* Staggered drain: one board batch per beat so steps draw one-by-one
-     instead of dumping all divs at once. */
+     instead of dumping all divs at once. (Legacy whole-board path only —
+     window deltas now go through stagedDiagramsRef for audio sync.) */
   const drainDiagramQueue = useCallback(() => {
     const batch = diagramQueueRef.current.shift();
     if (!batch) {
@@ -151,6 +184,11 @@ export default function App() {
 
   const clearDiagramQueue = useCallback(() => {
     diagramQueueRef.current = [];
+    stagedDiagramsRef.current.clear();
+    windowOrderRef.current = [];
+    audioWindowRef.current = [];
+    currentWindowRef.current = 0;
+    setDiagramFocus(null);
     if (diagramTimerRef.current) {
       clearTimeout(diagramTimerRef.current);
       diagramTimerRef.current = 0;
@@ -284,6 +322,11 @@ export default function App() {
         return;
       }
       const blob = pendingRef.current.shift();
+      const winN = audioWindowRef.current.length ? audioWindowRef.current.shift() : currentWindowRef.current + 1;
+      currentWindowRef.current = winN || 0;
+      // Audio-synced board: this window's diagram delta (if already arrived)
+      // appears exactly when its speech starts — position matches explanation.
+      try { flushDiagramsUpTo(currentWindowRef.current); } catch { /* board must never break voice */ }
       // decode the NEXT queued frame in parallel with playing this one, so
       // the handoff is gapless instead of "play -> stop -> decode -> play"
       const pre = (pendingRef.current.length > 0)
@@ -320,7 +363,8 @@ export default function App() {
     if (activeRef.current) drainRestartRef.current = true;
     speakingRef.current = false;
     setSpeaking(false);
-  }, [playBuf]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playBuf, flushDiagramsUpTo]);
 
   /* ---- hard stop: instant audio cut + server cancel (barge-in) ---- */
   const hardStop = useCallback(() => {
@@ -334,6 +378,9 @@ export default function App() {
       currentSourceRef.current = null;
     }
     pendingRef.current.length = 0;
+    audioWindowRef.current = [];
+    windowOrderRef.current = [];
+    stagedDiagramsRef.current.clear();
     if (wsRef.current && wsRef.current.readyState === 1) {
       wsRef.current.send(stopMessage());
     }
@@ -887,6 +934,8 @@ export default function App() {
               ` | audio ${m.audio_s}s / gen ${m.gen_s}s (RTF ${m.rtf})` +
               ` | "${m.text}"`,
             );
+            // Pair window numbers with the audio blobs that follow in WS order.
+            if (m.n != null) windowOrderRef.current.push(Number(m.n));
           } else if (m.type === "diagram") {
             if (dropRef.current) return;
             if (m.client_turn_id && m.client_turn_id !== String(activeTurnIdRef.current)) return;
@@ -896,9 +945,17 @@ export default function App() {
             if (m.turn_id) diagramTurnRef.current = m.turn_id;
             console.info(`[diagram] ${m.mode === "append" ? `delta window #${m.window_n ?? "?"}` : "board"}: +${incoming.length} element(s)`);
             if (m.mode === "append" && m.window_n != null) {
-              // Stage window deltas — one batch per beat draws step-by-step.
-              diagramQueueRef.current.push(incoming);
-              if (!diagramTimerRef.current) drainDiagramQueue();
+              // Audio-synced staging: draw only when window_n's speech plays.
+              const wn = Number(m.window_n);
+              const prev = stagedDiagramsRef.current.get(wn) || [];
+              const seenIds = new Set(prev.map((el) => el?.id));
+              for (const el of incoming) {
+                if (el?.id && !seenIds.has(el.id)) { seenIds.add(el.id); prev.push(el); }
+              }
+              stagedDiagramsRef.current.set(wn, prev);
+              // Late planner (diagram arrived after its audio already played)
+              // still draws immediately instead of stranding the step forever.
+              try { flushDiagramsUpTo(currentWindowRef.current); } catch { /* noop */ }
             } else {
               mergeDiagramBatch(incoming);
             }
@@ -956,6 +1013,9 @@ export default function App() {
               );
             }
             if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
+            // Reply stream done: draw any planner deltas that arrived after
+            // their audio already finished (slow planner tail) — nothing strands.
+            try { flushDiagramsUpTo(Number.MAX_SAFE_INTEGER); } catch { /* noop */ }
 
             assistantTextRef.current = "";
             openAssistantId.current = null;
@@ -983,6 +1043,16 @@ export default function App() {
             );
           }
           pendingRef.current.push(new Blob([ev.data], { type: "audio/wav" }));
+          // Pair this blob with its TTS window number (WS order is preserved:
+          // window(n) arrives just before audio(n)). Falls back to sequential.
+          if (windowOrderRef.current.length) {
+            audioWindowRef.current.push(windowOrderRef.current.shift());
+          } else {
+            const last = audioWindowRef.current.length
+              ? audioWindowRef.current[audioWindowRef.current.length - 1]
+              : currentWindowRef.current;
+            audioWindowRef.current.push((Number(last) || 0) + 1);
+          }
           // Jitter buffer: don't start playing on the first frame alone. The
           // first window is a tiny ~1s fragment; starting immediately means
           // playback runs dry before window #2 is generated (RTF > 1 on
@@ -1692,7 +1762,7 @@ export default function App() {
     historyRef.current = [];
     openAssistantId.current = null;
     assistantTextRef.current = "";
-    setDiagram({ elements: [] });
+    setDiagram(null);
     setMessages([{ id: nextId(), role: "assistant", text: GREETING }]);
   }, [hardStop]);
 
@@ -1713,24 +1783,48 @@ export default function App() {
     if (CFG.pushMode && apiRef.current.pushActiveRef?.current) apiRef.current.releasePush();
   }, []);
 
-  /* ---------- UI: single screen + sidebar + Gemini bottom bar ---------- */
+  /* ---------- draggable panel resize ---------- */
+  const clampW = (value, min, max) => Math.min(max, Math.max(min, value));
+  const startLeftResize = useCallback(() => {
+    leftDragStartRef.current = leftW;
+  }, [leftW]);
+  const resizeLeft = useCallback((dx) => {
+    setLeftW(clampW(leftDragStartRef.current + dx, 200, 560));
+  }, []);
+  const startRightResize = useCallback(() => {
+    rightDragStartRef.current = rightW;
+  }, [rightW]);
+  const resizeRight = useCallback((dx) => {
+    setRightW(clampW(rightDragStartRef.current + dx, 340, 900));
+  }, []);
+
+  /* ---------- UI: three draggable panels ---------- */
   return (
     <div className="relative flex h-screen overflow-hidden bg-white text-slate-900">
-      <AuroraBg listening={listening} speaking={speaking} userTalking={userTalking} />
-      <Sidebar
-        open={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
-        connected={connected}
-        listening={listening}
-        asrReady={asrReady}
-        messageCount={messages.length}
-        hasDiagram={!!(diagram?.elements?.length)}
-        onClear={clearChat}
-        onToggleMic={handleToggleMic}
-        onShareScreen={shareDown}
-        sharing={sharing}
-        visionEnabled={CFG.visionEnabled}
-      />
+      {sidebarOpen && (
+        <Sidebar
+          open={sidebarOpen}
+          onClose={() => setSidebarOpen(false)}
+          width={leftW}
+          connected={connected}
+          listening={listening}
+          asrReady={asrReady}
+          messageCount={messages.length}
+          hasDiagram={!!(diagram?.elements?.length)}
+          onClear={clearChat}
+          onToggleMic={handleToggleMic}
+          onShareScreen={shareDown}
+          sharing={sharing}
+          visionEnabled={CFG.visionEnabled}
+        />
+      )}
+      {sidebarOpen && (
+        <ResizeHandle
+          onDragStart={startLeftResize}
+          onDrag={resizeLeft}
+          className="max-md:hidden"
+        />
+      )}
       {sidebarOpen && (
         <div
           className="fixed inset-0 z-20 bg-slate-900/20 min-md:hidden"
@@ -1740,7 +1834,8 @@ export default function App() {
       )}
 
       <div className="relative z-10 flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center gap-3 border-b border-slate-200/70 bg-white/70 px-4 py-3 backdrop-blur sm:px-6">
+        <VoiceGradient listening={listening} speaking={speaking} userTalking={userTalking} />
+        <header className="relative z-10 flex items-center gap-3 border-b border-slate-200/70 bg-white/70 px-4 py-3 backdrop-blur sm:px-6">
           <button
             onClick={() => setSidebarOpen((v) => !v)}
             className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 hover:text-[#ff5a5f]"
@@ -1786,19 +1881,25 @@ export default function App() {
                       ? "Ready"
                       : "Connecting…"}
             </span>
+            <button
+              onClick={() => setCanvasOpen((v) => !v)}
+              className={`inline-flex h-9 w-9 items-center justify-center rounded-full transition ${
+                canvasOpen
+                  ? "bg-[#ff5a5f]/10 text-[#ff5a5f]"
+                  : "bg-slate-100 text-slate-500 hover:bg-slate-200"
+              }`}
+              aria-label={canvasOpen ? "Hide canvas" : "Show canvas"}
+              title={canvasOpen ? "Hide canvas" : "Show canvas"}
+            >
+              <FaTableColumns className="h-4 w-4" />
+            </button>
           </div>
         </header>
 
-        <main
-          className={`flex min-h-0 flex-1 gap-4 overflow-hidden px-4 pt-4 sm:px-6 ${
-            diagram ? "lg:flex-row" : "flex-col"
-          }`}
-        >
+        <main className="relative z-10 flex min-h-0 flex-1 overflow-hidden">
           <section
             ref={chatEl}
-            className={`flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pb-2 ${
-              diagram ? "lg:max-w-[46%]" : "mx-auto w-full max-w-3xl"
-            }`}
+            className="mx-auto flex min-h-0 w-full max-w-3xl flex-col gap-3 overflow-y-auto px-4 pt-4 pb-2 sm:px-6"
             aria-live="polite"
             aria-label="Chat transcript"
           >
@@ -1846,34 +1947,6 @@ export default function App() {
               </div>
             )}
           </section>
-
-          {diagram ? (
-            <aside className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_24px_70px_rgba(255,90,95,0.12)] [animation:diagram-reveal_420ms_cubic-bezier(0.16,1,0.3,1)_both] motion-reduce:animate-none">
-              <div className="flex items-center justify-between border-b border-slate-200/70 px-5 py-3">
-                <div>
-                  <span className="block text-[0.64rem] font-bold tracking-[0.14em] text-[#ff5a5f] uppercase">
-                    Visual explanation · {diagram?.elements?.length || 0} shapes
-                  </span>
-                  <h2 className="mt-0.5 text-[1rem] font-semibold tracking-[-0.02em] text-slate-900">
-                    Let’s map it out
-                  </h2>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="h-2 w-2 rounded-full bg-[#ff5a5f]" aria-hidden="true" />
-                  <button
-                    onClick={() => setDiagram(null)}
-                    className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
-                    aria-label="Close whiteboard"
-                  >
-                    <FaXmark className="h-4 w-4" />
-                  </button>
-                </div>
-              </div>
-              <div className="min-h-0 flex-1">
-                <DiagramWhiteboard diagram={diagram} />
-              </div>
-            </aside>
-          ) : null}
         </main>
 
         <BottomBar
@@ -1892,6 +1965,45 @@ export default function App() {
           onShareUp={shareUp}
         />
       </div>
+
+      {canvasOpen && (
+        <ResizeHandle
+          onDragStart={startRightResize}
+          onDrag={resizeRight}
+          className="max-lg:hidden"
+        />
+      )}
+      {canvasOpen && (
+        <aside
+          className="relative z-10 flex h-full flex-col overflow-hidden bg-white max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:z-40 max-lg:w-[min(92vw,520px)] max-lg:shadow-2xl lg:shrink-0 lg:border-l lg:border-slate-200/80 lg:w-[var(--canvas-w)]"
+          style={{ "--canvas-w": `${rightW}px` }}
+          aria-label="Visual explanation canvas"
+        >
+          <div className="flex items-center justify-between border-b border-slate-200/70 px-5 py-3">
+            <div>
+              <span className="block text-[0.64rem] font-bold tracking-[0.14em] text-[#ff5a5f] uppercase">
+                Visual explanation{diagram?.elements?.length ? ` · ${diagram.elements.length} shapes` : ""}
+              </span>
+              <h2 className="mt-0.5 text-[1rem] font-semibold tracking-[-0.02em] text-slate-900">
+                Let’s map it out
+              </h2>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="h-2 w-2 rounded-full bg-[#ff5a5f]" aria-hidden="true" />
+              <button
+                onClick={() => setCanvasOpen(false)}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+                aria-label="Close whiteboard"
+              >
+                <FaXmark className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          <div className="min-h-0 flex-1">
+            <DiagramWhiteboard diagram={diagram} focus={diagramFocus} />
+          </div>
+        </aside>
+      )}
     </div>
   );
 }

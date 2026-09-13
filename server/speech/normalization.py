@@ -135,6 +135,54 @@ HINGLISH_TO_DEVANAGARI = {
     "ul": "यू एल", "ol": "ओ एल", "li": "एल आई",
     "doctype": "डॉकटाइप", "meta": "मेटा", "footer": "फुटर",
     "header": "हेडर", "section": "सेक्शन", "article": "आर्टिकल",
+    # ---- JS / programming keywords (were spelled एल ई टी, सी ओ एन एस टी...) ----
+    "let": "लेट", "const": "कॉन्स्ट", "var": "वार",
+    "function": "फंक्शन", "functions": "फंक्शन्स",
+    "condition": "कंडीशन", "conditions": "कंडीशन्स",
+    "conditional": "कंडीशनल",
+    "if": "इफ", "else": "एल्स", "elseif": "एल्स इफ",
+    "loop": "लूप", "loops": "लूप्स",
+    "for": "फॉर", "while": "व्हाइल", "do": "डू",
+    "foreach": "फॉर ईच", "map": "मैप", "filter": "फ़िल्टर",
+    "return": "रिटर्न", "break": "ब्रेक", "continue": "कंटिन्यू",
+    "new": "न्यू", "class": "क्लास", "classes": "क्लासेस",
+    "object": "ऑब्जेक्ट", "objects": "ऑब्जेक्ट्स",
+    "array": "अरे", "arrays": "अरेज़",
+    "string": "स्ट्रिंग", "strings": "स्ट्रिंग्स",
+    "number": "नंबर", "numbers": "नंबर्स",
+    "boolean": "बूलियन", "null": "नल", "undefined": "अनडिफाइंड",
+    "true": "ट्रू", "false": "फॉल्स",
+    "variable": "वेरिएबल", "variables": "वेरिएबल्स",
+    "declare": "डिक्लेयर", "assign": "असाइन",
+    "parameter": "पैरामीटर", "parameters": "पैरामीटर्स",
+    "argument": "आर्गुमेंट", "arguments": "आर्गुमेंट्स",
+    "callback": "कॉलबैक", "promise": "प्रॉमिस",
+    "async": "एसिंक", "await": "अवेट",
+    "import": "इम्पोर्ट", "export": "एक्सपोर्ट",
+    "fetch": "फेच", "response": "रिस्पॉन्स",
+    "request": "रिक्वेस्ट", "event": "इवेंट", "events": "इवेंट्स",
+    "listener": "लिसनर", "handler": "हैंडलर",
+    "animation": "एनिमेशन", "animations": "एनिमेशन्स",
+    "dynamic": "डायनामिक", "static": "स्टैटिक",
+    "syntax": "सिंटैक्स", "logic": "लॉजिक",
+    "iterate": "इटरेट", "iteration": "इटरेशन",
+    "manipulation": "मैनिपुलेशन", "manipulate": "मैनिपुलेट",
+    "select": "सेलेक्ट", "selector": "सेलेक्टर",
+    "query": "क्वेरी", "submit": "सबमिट",
+    "input": "इनपुट", "output": "आउटपुट",
+    "create": "क्रिएट", "change": "चेंज", "update": "अपडेट",
+    # ---- DOM API (split camelCase first, so these hit as words) ----
+    "dom": "डॉम", "document": "डॉक्यूमेंट", "window": "विंडो",
+    "get": "गेट", "set": "सेट", "by": "बाय", "id": "आईडी",
+    "getelementbyid": "गेट एलिमेंट बाय आईडी",
+    "queryselector": "क्वेरी सेलेक्टर",
+    "queryselectorall": "क्वेरी सेलेक्टर ऑल",
+    "addeventlistener": "ऐड इवेंट लिसनर",
+    "removeeventlistener": "रिमूव इवेंट लिसनर",
+    "innerhtml": "इनर एचटीएमएल", "innertext": "इनर टेक्स्ट",
+    "textcontent": "टेक्स्ट कंटेंट", "classname": "क्लास नेम",
+    "createelement": "क्रिएट एलिमेंट",
+    "appendchild": "अपेंड चाइल्ड",
     # ---- connectors / helpers (missed = letter-spell, so keep explicit) ----
     "need": "नीड", "needs": "नीड्स", "and": "एंड", "or": "ऑर",
     "but": "बट", "because": "बिकॉज़", "with": "विद",
@@ -256,16 +304,67 @@ _DIGIT_HINDI = {
 }
 
 
+def _split_identifier(token: str) -> list[str]:
+    """Split code identifiers so dict lookup hits words, not spell-outs.
+
+    document.getElementById -> [document, get, Element, By, Id]
+    querySelector -> [query, Selector] ; addEventListener -> [add, Event, Listener]
+    Dots/underscores/hyphens split first, then camelCase / acronym boundaries.
+    """
+    parts: list[str] = []
+    for dot_part in re.split(r"[._\-/]+", token):
+        if not dot_part:
+            continue
+        # camelCase + acronym boundaries: HTMLDiv -> HTML Div, getId -> get Id
+        spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", dot_part)
+        spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", spaced)
+        parts.extend(spaced.split())
+    return parts or [token]
+
+
 def _devanagari_only(text: str) -> str:
     """Rewrite leftover Latin words as Devanagari so speech keeps the Hindi accent.
 
     Captures trailing digits with the word (h1 -> एच वन, not एचएक): full-token
-    dict hit first, else letter NAMES + spoken digits.
+    dict hit first, then camelCase-split word hits (getElementById -> गेट
+    एलिमेंट बाय आईडी), else letter NAMES + spoken digits.
     """
     def repl(m):
-        low = m.group(0).lower()
+        token = m.group(0)
+        low = token.lower()
         if low in HINGLISH_TO_DEVANAGARI:
             return HINGLISH_TO_DEVANAGARI[low]
+        # camelCase / dotted API names: try joint + per-word dict hits before
+        # falling back to letter spelling (the एल ई टी / डी ओ सी यू एम ई एन टी bug).
+        subwords = _split_identifier(token)
+        if len(subwords) > 1:
+            joint = "".join(subwords).lower()
+            if joint in HINGLISH_TO_DEVANAGARI:
+                return HINGLISH_TO_DEVANAGARI[joint]
+            spoken: list[str] = []
+            all_known = True
+            for sub in subwords:
+                hit = HINGLISH_TO_DEVANAGARI.get(sub.lower())
+                if hit:
+                    spoken.append(hit)
+                else:
+                    all_known = False
+                    break
+            if all_known:
+                return " ".join(spoken)
+            # mixed: speak known words, spell only the unknown part
+            out_mixed: list[str] = []
+            for sub in subwords:
+                hit = HINGLISH_TO_DEVANAGARI.get(sub.lower())
+                if hit:
+                    out_mixed.append(hit)
+                else:
+                    letters = [
+                        _DIGIT_HINDI.get(ch.lower(), LATIN_TO_DEVANAGARI.get(ch.lower(), ""))
+                        for ch in sub
+                    ]
+                    out_mixed.append(" ".join(o for o in letters if o))
+            return " ".join(o for o in out_mixed if o)
         out = []
         for ch in low:
             if ch.isdigit():
@@ -274,5 +373,11 @@ def _devanagari_only(text: str) -> str:
                 out.append(LATIN_TO_DEVANAGARI.get(ch, ""))
         return " ".join(o for o in out if o)
 
-    return re.sub(r"[A-Za-z]+\d*", repl, text) if HAS_LATIN.search(text) else text
+    # Match dotted/chained APIs as ONE token so dots don't survive into speech
+    # (document.getElementById -> डॉक्यूमेंट गेट एलिमेंट बाय आईडी, not डॉक्यूमेंट.गेट).
+    out = re.sub(r"[A-Za-z]+(?:[._\-/][A-Za-z0-9]+)*\d*", repl, text) if HAS_LATIN.search(text) else text
+    # Any leftover separator dots/slashes between Devanagari words become spaces —
+    # a "." would otherwise be read as a sentence end (mid-word cutoff).
+    out = re.sub(r"(?<=[\u0900-\u097F])[._/\-]+(?=[\u0900-\u097F])", " ", out)
+    return out
 

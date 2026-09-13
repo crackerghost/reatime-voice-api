@@ -243,6 +243,14 @@ VISION_TIMEOUT = float(os.environ.get("VOICE_VISION_TIMEOUT", "90.0"))
 # sentence is spoken, so a retry can never interrupt a playing reply.
 LLM_RETRIES = int(os.environ.get("LLM_RETRIES", "2"))
 DIAGRAM_ENABLED = os.environ.get("DIAGRAM_EVENTS", "1") == "1"
+# Diagram planner knobs (env-tunable, no code edits needed):
+# - DIAGRAM_MODEL: blank/ unset = reuse the chat model (default). Groq's
+#   developer tier serves no faster tool-capable model than gpt-oss-20b, so
+#   the delay win comes from zero reasoning + small token budget + gating,
+#   not from switching models. Set this later if Groq ships a faster one.
+# - DIAGRAM_MAX_TOKENS: per-window tool-call budget (450 fits 3-6 nodes).
+DIAGRAM_MODEL = os.environ.get("DIAGRAM_MODEL", "").strip() or LLM_MODEL
+DIAGRAM_MAX_TOKENS = int(os.environ.get("DIAGRAM_MAX_TOKENS", "450"))
 
 from server.llm.prompts import (
     LLM_SYSTEM_PROMPT,
@@ -800,7 +808,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             d = _generate_step(
                 diagram_ctx["key"], raw_text or win_text, diagram_ctx.get("topic", ""),
                 stop_evt, client=http_client, url=MISTRAL_URL,
-                model=LLM_MODEL, reasoning_effort=LLM_REASONING_EFFORT,
+                model=DIAGRAM_MODEL, max_tokens=DIAGRAM_MAX_TOKENS,
                 id_prefix=f"w{n}",
             )
             if not d or (stop_evt is not None and stop_evt.is_set()):
@@ -1057,6 +1065,8 @@ def api_config():
         "llm_temperature": LLM_TEMPERATURE,
         "llm_max_tokens": LLM_MAX_TOKENS,
         "diagram_enabled": DIAGRAM_ENABLED,
+        "diagram_model": DIAGRAM_MODEL,
+        "diagram_max_tokens": DIAGRAM_MAX_TOKENS,
         # browser-side conversation behaviour (read by web/ui/src/App.jsx)
         "chat_step": int(os.environ.get("VOICE_CHAT_STEP", "8")),  # nfe_step the UI sends
         "jitter_frames": JITTER_FRAMES,
@@ -1261,7 +1271,7 @@ def _generate_diagram_for_turn(key, text, history, stop_evt, http_client: httpx.
         stop_evt,
         client=http_client,
         url=MISTRAL_URL,
-        model=LLM_MODEL,
+        model=DIAGRAM_MODEL,
         reasoning_effort=LLM_REASONING_EFFORT,
     )
 
