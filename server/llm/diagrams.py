@@ -79,8 +79,9 @@ def _board_text(value: object) -> str:
 def should_generate(text: str, history: list[dict] | None, enabled: bool) -> bool:
     """Auto-decide: every teaching turn gets an LLM judge call.
 
-    No keyword gate — the judge prompt itself decides whether a diagram
-    materially improves THIS explanation (tool call) or not (no call).
+    DIAGRAM_GATE=auto (default, paid tier): default-allow, judge decides.
+    DIAGRAM_GATE=explicit (dev tier, 8k TPM): only explicit draw-intent
+    ("draw/diagram/दिखाओ...") triggers the planner, saving ~10 Groq calls/turn.
     Voice never waits: the judge runs parallel to TTS, diagram pops when ready.
     Only pure greetings / tiny acks are skipped to save the extra LLM call.
     """
@@ -94,6 +95,9 @@ def should_generate(text: str, history: list[dict] | None, enabled: bool) -> boo
     # Explicit ask always wins (no LLM judgement needed to trigger).
     if DIAGRAM_INTENT_RE.search(clean_text):
         return True
+    import os as _os
+    if _os.environ.get("DIAGRAM_GATE", "auto").strip().lower() == "explicit":
+        return False
     # Everything else: let the judge decide (explain html, क्या है, कैसे...).
     return True
 
@@ -435,6 +439,17 @@ def normalize(raw: object) -> dict | None:
             trigger = re.sub(r"[^A-Za-z0-9 ]+", "", str(item.get("trigger", ""))).strip()[:60]
             if trigger:
                 normalized["trigger"] = trigger
+                # Bilingual sync: the client matches triggers against the SPOKEN
+                # caption, which is Devanagari-only ("क्वेरी सेलेक्टर"), while
+                # the LLM returns English ("query selector"). Precompute the
+                # spoken form so App.jsx can match without transliterating.
+                try:
+                    from server.speech.normalization import _devanagari_only as _to_hi
+                    hi = _to_hi(trigger).strip()[:60]
+                    if hi and hi.lower() != trigger.lower():
+                        normalized["trigger_hi"] = hi
+                except Exception:
+                    pass
         if item_type == "arrow":
             normalized["startNodeId"] = str(item.get("startNodeId", "")).strip()[:80]
             normalized["endNodeId"] = str(item.get("endNodeId", "")).strip()[:80]

@@ -809,7 +809,13 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                         _ship_window(text_to_speak, min(num_step, FIRST_WINDOW_STEP), raw_text=_take_raw())
                         emitted_audio = True
                 else:
-                    if sentence_done or window_chars >= MIN_WINDOW_CHARS * 2:
+                    # Buffer short sentences: ship only once the window holds a
+                    # full clause (>= MIN chars). Tiny tails like "आदि।" merge
+                    # into the next window instead of a solo prosody restart.
+                    # Final tail still ships at end-of-stream below.
+                    if window_chars >= MIN_WINDOW_CHARS and (
+                        sentence_done or window_chars >= MIN_WINDOW_CHARS * 2
+                    ):
                         _ship_window(" ".join(window), num_step, raw_text=_take_raw())
                         window, window_chars = [], 0
                         emitted_audio = True
@@ -1043,14 +1049,15 @@ def _pause_for(key: str, dflt: float) -> float:
 
 
 PAUSE_SECONDS = {
-    # Comma is the breath mark: 0.15s rushed clauses together ("robotic").
-    # 0.3s lets each clause land before the next starts.
-    ",": _pause_for("COMMA", 0.3),
-    ";": _pause_for("SEMI", 0.25),
-    ".": _pause_for("FULL", 0.3),
-    "?": _pause_for("QUESTION", 0.35),
-    "!": _pause_for("EXCLAM", 0.4),
-    "।": _pause_for("DANDA", 0.35),
+    # Comma is the breath mark: <0.2s rushes clauses together ("robotic").
+    # Trailing pauses are appended after generate (see insert_pauses), so
+    # these values are heard exactly at the breath, not spliced mid-word.
+    ",": _pause_for("COMMA", 0.35),
+    ";": _pause_for("SEMI", 0.3),
+    ".": _pause_for("FULL", 0.4),
+    "?": _pause_for("QUESTION", 0.4),
+    "!": _pause_for("EXCLAM", 0.45),
+    "।": _pause_for("DANDA", 0.45),
 }
 PAUSE_SCALE = float(os.environ.get("VOICE_PAUSE_SCALE", "1.0"))
 PAUSE_SECONDS = {k: round(v * PAUSE_SCALE, 3) for k, v in PAUSE_SECONDS.items()}
@@ -1059,17 +1066,17 @@ PAUSE_SECONDS = {k: round(v * PAUSE_SCALE, 3) for k, v in PAUSE_SECONDS.items()}
 STREAM_MAX_CHARS = int(os.environ.get("VOICE_STREAM_MAX_CHARS", "75"))
 # Chat audio is synthesized in windows of this many sentences per generate()
 # call so prosody flows across the window (1 = old choppy per-sentence mode).
-STREAM_WINDOW = max(1, int(os.environ.get("VOICE_STREAM_WINDOW", "2")))
+STREAM_WINDOW = max(1, int(os.environ.get("VOICE_STREAM_WINDOW", "3")))
 # Max text chars per audio window and per clause piece — on the T4 the GPU
-# outruns the audio clock at num_step<=6, so wider windows mean FEWER
+# outruns the audio clock at num_step<=8, so wider windows mean FEWER
 # prosody restarts (more natural flow) with no extra wait between frames.
-WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "110"))
+WINDOW_CHAR_CAP = int(os.environ.get("VOICE_WINDOW_CHARS", "150"))
 # Never ship a TTS audio window smaller than this (except the final tail).
 # Stops the LLM's short sentences from becoming tiny 2-3 word audio chunks
 # that keep breaking the flow — windows only go out once they're worth speaking.
-# T4: 28 chars ≈ one full clause; smaller values fragment the reply audibly.
-MIN_WINDOW_CHARS = int(os.environ.get("VOICE_MIN_WINDOW_CHARS", "28"))
-_PIECE_MAX = max(40, min(120, WINDOW_CHAR_CAP))  # single unit fed to TTS
+# 55 chars ≈ one full Hindi clause; smaller values fragment audibly ("आदि।" alone).
+MIN_WINDOW_CHARS = int(os.environ.get("VOICE_MIN_WINDOW_CHARS", "55"))
+_PIECE_MAX = max(60, min(150, WINDOW_CHAR_CAP))  # single unit fed to TTS
 # Hard ceiling on sentences per chat reply (the LLM is told 3-4 but can ramble;
 # this bounds worst-case latency so a turn never turns into a monologue).
 MAX_CHAT_SENTENCES = int(os.environ.get("VOICE_MAX_SENTENCES", "6"))

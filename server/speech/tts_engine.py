@@ -115,27 +115,30 @@ class TTSEngine:
         return buffer.getvalue()
 
     def insert_pauses(self, wav, text):
+        """Append a natural trailing pause; never splice mid-audio.
+
+        Old proportional splicing estimated pause positions as
+        total * index/n_chars, which lands inside words (clicks, robotic
+        chops) because chars are not uniform duration. The TTS model already
+        renders interior commas with its own prosody when fed full clauses,
+        so we only add: trailing breath for ending punctuation + small
+        inter-window gap so back-to-back windows don't start instantly.
+        """
         total = len(wav)
         if total == 0 or not text:
             return wav
-        n_chars = max(len(text), 1)
-        parts = []
-        start = 0
-        for index, char in enumerate(text):
-            pause = self.config.pause_seconds.get(char)
-            if pause is None:
-                continue
-            estimate = int(total * (index + 1) / n_chars)
-            if estimate <= start or estimate > total:
-                continue
-            segment = wav[start:estimate]
-            if len(segment) > 0:
-                parts.append(segment)
-            parts.append(np.zeros(int(pause * self.config.sample_rate), dtype=wav.dtype))
-            start = estimate
-        if start < total:
-            parts.append(wav[start:])
-        return np.concatenate(parts) if parts else wav
+        t = text.strip()
+        gap = 0.08  # inter-window gap so next window never starts instantly
+        if t:
+            pause = self.config.pause_seconds.get(t[-1])
+            if pause is not None:
+                gap = max(pause, gap)
+        n = int(gap * self.config.sample_rate)
+        if n <= 0:
+            return wav
+        return np.concatenate(
+            [wav, np.zeros(n, dtype=wav.dtype)]
+        ) if total else wav
 
     def stream_chunks(self, text):
         clauses = re.split(r"(?<=[।?!.])\s*", text)

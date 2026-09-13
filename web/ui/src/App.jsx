@@ -3,6 +3,15 @@ import { FaBars, FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTable
 import Sidebar from "./Sidebar.jsx";
 import BottomBar from "./BottomBar.jsx";
 import TutorBoard from "./TutorBoard.jsx";
+import MenuBar from "./os/MenuBar.jsx";
+import Dock from "./os/Dock.jsx";
+import Widgets from "./os/Widgets.jsx";
+import ProgressWidget from "./os/ProgressWidget.jsx";
+import CodeApp from "./os/CodeApp.jsx";
+import BrowserApp from "./os/BrowserApp.jsx";
+import NotesApp from "./os/NotesApp.jsx";
+import TutorPopup from "./os/TutorPopup.jsx";
+import AppWindow from "./os/AppWindow.jsx";
 import ResizeHandle from "./ResizeHandle.jsx";
 import VoiceGradient from "./VoiceGradient.jsx";
 import { engine } from "./audioEngine.js";
@@ -103,9 +112,118 @@ export default function App() {
   const [canvasOpen, setCanvasOpen] = useState(() => typeof window !== "undefined" && window.innerWidth >= 1024);
   const [leftW, setLeftW] = useState(288);
   const [rightW, setRightW] = useState(520);
+  // ---- SaathiOS: desktop state (pure UI, voice logic untouched) ----
+  // ---- Bug OS window manager: several apps open at once, last = front ----
+  const [openApps, setOpenApps] = useState(["tutor"]);
+  const [minApps, setMinApps] = useState({});
+  const [maxed, setMaxed] = useState({});
+  // Per-app window geometry (drag/resize memory). null = centered default.
+  const [winGeom, setWinGeom] = useState({});
+  // Exit animations: a closing/minimizing window plays its shrink-out
+  // first (180ms), then actually leaves. Reopening mid-exit cancels it.
+  // Declared before visibleApps — render reads it on every pass.
+  const [leaving, setLeaving] = useState({});
+  const leaveTimers = useRef({});
+  useEffect(
+    () => () => {
+      Object.values(leaveTimers.current).forEach(clearTimeout);
+    },
+    [],
+  );
+  const cancelLeave = (id) => {
+    if (leaveTimers.current[id]) {
+      clearTimeout(leaveTimers.current[id]);
+      delete leaveTimers.current[id];
+    }
+    setLeaving((p) => {
+      if (!p[id]) return p;
+      const n = { ...p };
+      delete n[id];
+      return n;
+    });
+  };
+  const visibleApps = openApps.filter((id) => !minApps[id] && !leaving[id]);
+  const activeApp = visibleApps.length ? visibleApps[visibleApps.length - 1] : null;
+  const maximized = !!(activeApp && maxed[activeApp]);
+  const geomFor = (id) => winGeom[id] || null;
+  const setGeomFor = (id) => (g) => setWinGeom((p) => ({ ...p, [id]: g }));
+  const [dockVisible, setDockVisible] = useState(false);
+  // Fullscreen chrome: hidden until the pointer hits the top edge (or Esc).
+  const [topChrome, setTopChrome] = useState(false);
+  const [browserUrl, setBrowserUrl] = useState("https://www.google.com/webhp?igu=1");
+  const [notes, setNotes] = useState(() => {
+    try {
+      const next = JSON.parse(localStorage.getItem("bugos-notes") || "null");
+      if (Array.isArray(next)) return next;
+      const legacy = JSON.parse(localStorage.getItem("saathi-notes") || "[]");
+      return Array.isArray(legacy) ? legacy : [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeNoteId, setActiveNoteId] = useState(null);
+  const [popupPinned, setPopupPinned] = useState(false);
+  // Learning activity per local day, powers the desktop progress graph.
+  const [dayStats, setDayStats] = useState(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem("bugos-stats") || "{}");
+      return v && typeof v === "object" ? v : {};
+    } catch {
+      return {};
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("bugos-stats", JSON.stringify(dayStats));
+    } catch { /* private mode — stats stay in memory */ }
+  }, [dayStats]);
+  const recordQuestion = () => {
+    const d = new Date();
+    const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+    setDayStats((prev) => ({ ...prev, [key]: { q: (prev[key]?.q || 0) + 1 } }));
+  };
+  const [clock, setClock] = useState("");
+  const [dateStr, setDateStr] = useState("");
+  // Reopening a leaving window cancels its exit (see cancelLeave above).
+  const focusApp = (id) => {
+    cancelLeave(id);
+    setSpreadTop(false);
+    setOpenApps((prev) => (prev.includes(id) ? [...prev.filter((x) => x !== id), id] : [...prev, id]));
+    setMinApps((p) => (p[id] ? { ...p, [id]: false } : p));
+  };
+  useEffect(() => {
+    const tick = () => {
+      const now = new Date();
+      setClock(now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+      setDateStr(now.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }));
+    };
+    tick();
+    const t = setInterval(tick, 15000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    try {
+      localStorage.setItem("bugos-notes", JSON.stringify(notes));
+    } catch { /* private mode — notes stay in memory */ }
+  }, [notes]);
   const leftDragStartRef = useRef(0);
   const rightDragStartRef = useRef(0);
 
+  // Desktop spread: clicking empty wallpaper fans all windows to the top
+  // (Apple-like), clicking again restores. Focusing any window also restores.
+  const [spreadTop, setSpreadTop] = useState(false);
+  const fanStyle = (i) => {
+    if (!spreadTop) return {};
+    const c = (visibleApps.length - 1) / 2;
+    return {
+      transform: `translate(${(i - c) * 110}px, -40%) scale(0.52)`,
+      transformOrigin: "top center",
+    };
+  };
+  const onDesktopClick = (e) => {
+    if (e.target.closest && e.target.closest(".os-window")) return;
+    setSpreadTop((v) => !v);
+  };
   // ---- mutable runtime state (safe across renders) ----
   const wsRef = useRef(null);
   const chatEl = useRef(null);
@@ -176,20 +294,25 @@ export default function App() {
   }, [steps.length, followLive]);
 
   // Trigger-gated elements: drawn the instant their trigger word is spoken.
-  // Matched against the live caption (same pipeline as speech = exact clock);
-  // 8s deadline backstop so a missed trigger never strands content.
+  // Bilingual: server sends trigger (English, matches code/raw) + trigger_hi
+  // (Devanagari spoken form, matches the live Hindi caption). Either hit
+  // draws now; 8s deadline backstop so a missed trigger never strands content.
   const waitingRef = useRef([]); // [{el, stagedAt}]
   const normCaption = (s) => (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ");
   // Plain per-render closure (refs + stable setters only — no staleness),
   // callable from stable callbacks and the WS handler without dep churn.
   const matchWaiting = () => {
     if (!waitingRef.current.length) return;
-    const cap = normCaption(assistantTextRef.current);
+    const rawCap = assistantTextRef.current || "";
+    const cap = normCaption(rawCap);
     const now = Date.now();
     const ready = [];
     waitingRef.current = waitingRef.current.filter((w) => {
       const t = (w.el?.trigger || "").toLowerCase().trim();
-      if (!t || (cap && cap.includes(t)) || now - w.stagedAt > 8000) {
+      const th = (w.el?.trigger_hi || "").trim();
+      const hitEn = t && cap && cap.includes(t);
+      const hitHi = th && rawCap && rawCap.includes(th);
+      if (!t && !th || hitEn || hitHi || now - w.stagedAt > 8000) {
         ready.push(w.el);
         return false;
       }
@@ -250,7 +373,7 @@ export default function App() {
       staged.delete(k);
       if (!batch?.length) continue;
       for (const el of batch) {
-        if (el?.trigger) waitingRef.current.push({ el, stagedAt: now });
+        if (el?.trigger || el?.trigger_hi) waitingRef.current.push({ el, stagedAt: now });
         else revealQueueRef.current.push(el);
       }
     }
@@ -873,6 +996,7 @@ export default function App() {
       openAssistantId.current = null;
       assistantTextRef.current = "";
       setTyping(true);
+      recordQuestion();
       const payload = {
         text,
         history: historyRef.current,
@@ -907,9 +1031,22 @@ export default function App() {
       ws.send(chatMessage({
         ...payload,
         screen: payload.screen,
+        // Tutor agent context: which OS app is frontmost + what the learner
+        // is looking at. Server ignores it today; the agent uses it to pull
+        // browser/whiteboard/notes content into the answer when wired.
+        os: {
+          app: activeApp,
+          browserUrl,
+          note: (() => {
+            const n = notes.find((x) => x.id === (activeNoteId || notes[0]?.id));
+            return n ? { title: n.title, snippet: String(n.body || "").slice(0, 600) } : null;
+          })(),
+          whiteboardSteps: steps.length,
+          code: codeCtxRef.current,
+        },
       }));
     },
-    [hardStop]
+    [hardStop, activeApp, browserUrl, notes, activeNoteId, steps.length]
   );
 
   /* Push-to-see turn: text + the frame captured during the hold. */
@@ -1050,7 +1187,20 @@ export default function App() {
             // Whole-board (legacy) or window delta (watcher sidecar).
             const incoming = m.diagram?.elements?.length ? m.diagram.elements : (m.elements?.length ? m.elements : null);
             if (!incoming) return;
+            // Tutor called canvas: first visual of a turn opens Whiteboard and
+            // brings it front so the tutor draws where the learner looks.
+            // Functional setStates only — safe inside this long-lived handler.
+            const isNewVisualTurn = m.turn_id && diagramTurnRef.current !== m.turn_id;
             if (m.turn_id) diagramTurnRef.current = m.turn_id;
+            if (isNewVisualTurn) {
+              setOpenApps((prev) =>
+                prev.includes("whiteboard")
+                  ? [...prev.filter((x) => x !== "whiteboard"), "whiteboard"]
+                  : [...prev, "whiteboard"],
+              );
+              setMinApps((p) => (p.whiteboard ? { ...p, whiteboard: false } : p));
+              setFollowLive(true);
+            }
             console.info(`[diagram] ${m.mode === "append" ? `delta window #${m.window_n ?? "?"}` : "board"}: +${incoming.length} element(s)`);
             if (m.mode === "append" && m.window_n != null) {
               // Audio-synced staging: draw only when window_n's speech plays.
@@ -1912,225 +2062,437 @@ export default function App() {
     setRightW(clampW(rightDragStartRef.current - dx, 340, 900));
   }, []);
 
-  /* ---------- UI: three draggable panels ---------- */
+  /* ---------- SaathiOS: glass desktop, one focused app + auto-hide dock ----------
+     Tutor keeps the full voice+chat pipeline; Whiteboard/Browser/Notes share
+     context into every turn via message.os (see submitChat). */
+  const dockTimerRef = useRef(0);
+  const pokeDock = () => {
+    setDockVisible(true);
+    if (dockTimerRef.current) clearTimeout(dockTimerRef.current);
+    dockTimerRef.current = setTimeout(() => setDockVisible(false), 2200);
+  };
+  const openApp = (id) => {
+    focusApp(id);
+    if (id === "whiteboard") {
+      setFollowLive(true);
+      setStepIndex(Math.max(0, steps.length - 1));
+    }
+    pokeDock();
+  };
+  // Dock toggle: restore if minimized, minimize if front, focus otherwise.
+  const codeCtxRef = useRef(null);
+  const toggleDock = (id) => {
+    if (leaving[id]) return;
+    if (minApps[id]) focusApp(id);
+    else if (!openApps.includes(id)) focusApp(id);
+    else if (activeApp === id) minimizeApp(id);
+    else focusApp(id);
+    pokeDock();
+  };
+  const scheduleLeave = (id, action) => {
+    if (leaving[id]) return;
+    cancelLeave(id);
+    setLeaving((p) => ({ ...p, [id]: action }));
+    leaveTimers.current[id] = setTimeout(() => {
+      delete leaveTimers.current[id];
+      if (action === "close") {
+        setOpenApps((prev) => prev.filter((x) => x !== id));
+        setMinApps((p) => {
+          if (!p[id]) return p;
+          const n = { ...p };
+          delete n[id];
+          return n;
+        });
+        setMaxed((p) => {
+          if (!p[id]) return p;
+          const n = { ...p };
+          delete n[id];
+          return n;
+        });
+        setWinGeom((p) => {
+          if (!p[id]) return p;
+          const n = { ...p };
+          delete n[id];
+          return n;
+        });
+      } else {
+        setMinApps((p) => ({ ...p, [id]: true }));
+      }
+      setLeaving((p) => {
+        const n = { ...p };
+        delete n[id];
+        return n;
+      });
+    }, 180);
+  };
+  const closeApp = (id) => scheduleLeave(id, "close");
+  const minimizeApp = (id) => scheduleLeave(id, "min");
+  const zoomApp = (id) => {
+    setSpreadTop(false);
+    setMinApps((p) => (p[id] ? { ...p, [id]: false } : p));
+    setMaxed((p) => ({ ...p, [id]: !p[id] }));
+  };
+  // Esc leaves fullscreen.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape" && activeApp && maxed[activeApp]) zoomApp(activeApp);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+  const menuAction = (action) => {
+    if (action === "new-note") {
+      addNote();
+      openApp("notes");
+    } else if (action === "clear-chat") {
+      clearChat();
+    } else if (action === "close-window") {
+      if (activeApp) closeApp(activeApp);
+    } else if (action === "minimize") {
+      if (activeApp) minimizeApp(activeApp);
+    } else if (action === "maximize") {
+      if (activeApp) zoomApp(activeApp);
+    } else if (action.startsWith("open-")) {
+      openApp(action.slice(5));
+    }
+  };
+  const addNote = () => {
+    const n = { id: `n${Date.now()}`, title: "Untitled", body: "" };
+    setNotes((prev) => [n, ...prev]);
+    setActiveNoteId(n.id);
+  };
+  const updateNote = (id, patch) =>
+    setNotes((prev) => prev.map((n) => (n.id === id ? { ...n, ...patch } : n)));
+  const deleteNote = (id) =>
+    setNotes((prev) => {
+      const next = prev.filter((n) => n.id !== id);
+      if (activeNoteId === id) setActiveNoteId(next[0]?.id || null);
+      return next;
+    });
+  const tutorActive = speaking || listening || typing || !!interim;
+  const popupOpen = popupPinned || (activeApp !== "tutor" && tutorActive);
+  // Reveal the auto-hide dock briefly on boot so it's discoverable.
+  useEffect(() => {
+    pokeDock();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------- UI: Bug OS desktop ---------- */
   return (
-    <div className="relative flex h-screen overflow-hidden bg-white text-slate-900">
-      {sidebarOpen && (
-        <Sidebar
-          open={sidebarOpen}
-          onClose={() => setSidebarOpen(false)}
-          width={leftW}
-          connected={connected}
-          listening={listening}
-          asrReady={asrReady}
-          messageCount={messages.length}
-          hasDiagram={!!(diagram?.elements?.length)}
-          onClear={clearChat}
-          onToggleMic={handleToggleMic}
-          onShareScreen={shareDown}
-          sharing={sharing}
-          visionEnabled={CFG.visionEnabled}
-        />
-      )}
-      {sidebarOpen && (
-        <ResizeHandle
-          onDragStart={startLeftResize}
-          onDrag={resizeLeft}
-          className="max-md:hidden"
-        />
-      )}
-      {sidebarOpen && (
-        <div
-          className="fixed inset-0 z-20 bg-slate-900/20 min-md:hidden"
-          onClick={() => setSidebarOpen(false)}
-          aria-hidden="true"
-        />
-      )}
+    <div
+      className="os-wallpaper photo relative h-screen overflow-hidden text-slate-900"
+      onMouseMove={(e) => {
+        if (e.clientY > window.innerHeight - 72) pokeDock();
+        // Fullscreen: top edge reveals menu bar + title bar, moving away hides.
+        if (maximized) setTopChrome(e.clientY < 64);
+        else if (topChrome) setTopChrome(false);
+      }}
+    >
+      {/* Diwali lights first: below every sibling, above wallpaper only. */}
+      <div className="os-lights os-lights-a" aria-hidden="true" />
+      <div className="os-lights os-lights-b" aria-hidden="true" />
+      <MenuBar
+        activeApp={activeApp}
+        connected={connected}
+        speaking={speaking}
+        listening={listening}
+        typing={typing}
+        clock={clock}
+        date={dateStr}
+        hidden={maximized && !topChrome}
+        onAction={menuAction}
+      />
+      <Widgets />
+      <ProgressWidget days={dayStats} noteCount={notes.length} boardSteps={steps.length} />
 
-      <div className="relative z-10 flex min-w-0 flex-1 flex-col">
-        <VoiceGradient listening={listening} speaking={speaking} userTalking={userTalking} />
-        <header className="relative z-10 flex items-center gap-3 border-b border-slate-200/70 bg-white/70 px-4 py-3 backdrop-blur sm:px-6">
-          <button
-            onClick={() => setSidebarOpen((v) => !v)}
-            className="inline-flex h-9 w-9 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 hover:text-[#ff5a5f]"
-            aria-label={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+      <div className={`absolute inset-x-0 bottom-1 ${maximized && !topChrome ? "top-0" : "top-9"} ${maximized ? "px-0" : "px-2 sm:px-4"}`}>
+        <div className="relative h-full w-full" onClick={onDesktopClick}>
+        {openApps.map((winId) =>
+          minApps[winId] && !leaving[winId] ? null : (
+          /* Click-through layer: only the window box itself is hittable, so a
+             behind window stays clickable through empty desktop area. */
+          <div
+            key={winId}
+            className="pointer-events-none absolute inset-0 transition-transform duration-500 ease-out"
+            style={{ zIndex: 10 + openApps.indexOf(winId), ...fanStyle(visibleApps.indexOf(winId)) }}
           >
-            <FaBars className="h-4 w-4" />
-          </button>
-          <div className="min-w-0">
-            <h1 className="truncate text-sm font-bold tracking-wide text-slate-900">
-              Saathi <span className="font-normal text-slate-400">· Hindi voice tutor</span>
-            </h1>
-          </div>
-          <div className="ml-auto flex items-center gap-2 text-xs font-medium text-slate-500">
-            {asrRejected && (
-              <span className="hidden rounded-full bg-amber-50 px-2.5 py-1 text-[11px] font-semibold text-amber-700 sm:block">
-                {asrRejected}
-              </span>
+        {winId === "tutor" && (
+          <AppWindow
+            title="Tutor"
+            geom={geomFor("tutor")}
+            onGeom={setGeomFor("tutor")}
+            maximized={!!maxed.tutor}
+            cascade={openApps.indexOf("tutor")}
+            leaving={leaving.tutor}
+            hideChrome={!!maxed.tutor && !topChrome}
+            onFocus={() => {
+              setSpreadTop(false); if (activeApp !== "tutor") focusApp("tutor");
+            }}
+            onClose={() => closeApp("tutor")}
+            onMin={() => minimizeApp("tutor")}
+            onMax={() => zoomApp("tutor")}
+          >
+          <div className="flex min-h-0 flex-1">
+            {sidebarOpen && (
+              <Sidebar
+                open={sidebarOpen}
+                onClose={() => setSidebarOpen(false)}
+                width={leftW}
+                connected={connected}
+                listening={listening}
+                asrReady={asrReady}
+                messageCount={messages.length}
+                hasDiagram={!!(diagram?.elements?.length)}
+                onClear={clearChat}
+                onToggleMic={handleToggleMic}
+                onShareScreen={shareDown}
+                sharing={sharing}
+                visionEnabled={CFG.visionEnabled}
+              />
             )}
-            <span
-              className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
-                typing
-                  ? "bg-[#ff5a5f]/10 text-[#ff5a5f]"
-                  : speaking
-                    ? "bg-[#ff5a5f]/10 text-[#ff5a5f]"
-                    : listening
-                      ? userTalking
-                        ? "bg-emerald-50 text-emerald-700"
-                        : "bg-slate-100 text-slate-600"
-                      : "bg-slate-100 text-slate-500"
-              }`}
-            >
-              {typing
-                ? "Thinking…"
-                : speaking
-                  ? "Speaking…"
-                  : listening
-                    ? userTalking
-                      ? "Listening…"
-                      : asrReady
-                        ? "Mic live"
-                        : "Warming up…"
-                    : connected
-                      ? "Ready"
-                      : "Connecting…"}
-            </span>
-            <button
-              onClick={() => setCanvasOpen((v) => !v)}
-              className={`inline-flex h-9 w-9 items-center justify-center rounded-full transition ${
-                canvasOpen
-                  ? "bg-[#ff5a5f]/10 text-[#ff5a5f]"
-                  : "bg-slate-100 text-slate-500 hover:bg-slate-200"
-              }`}
-              aria-label={canvasOpen ? "Hide canvas" : "Show canvas"}
-              title={canvasOpen ? "Hide canvas" : "Show canvas"}
-            >
-              <FaTableColumns className="h-4 w-4" />
-            </button>
-          </div>
-        </header>
-
-        <main className="relative z-10 flex min-h-0 flex-1 overflow-hidden">
-          <section
-            ref={chatEl}
-            className="mx-auto flex min-h-0 w-full max-w-3xl flex-col gap-3 overflow-y-auto px-4 pt-4 pb-2 sm:px-6"
-            aria-live="polite"
-            aria-label="Chat transcript"
-          >
-            {messages.map((message) => {
-              const isUser = message.role === "user";
-              const isError = message.role === "error";
-              return (
-                <article
-                  key={message.id}
-                  className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${
-                    isError
-                      ? "self-start border border-rose-200 bg-rose-50 text-rose-700"
-                      : isUser
-                        ? "self-end bg-[#ff5a5f] text-white"
-                        : "self-start border border-slate-200 bg-white text-slate-700"
-                  }`}
+            {sidebarOpen && (
+              <ResizeHandle
+                onDragStart={startLeftResize}
+                onDrag={resizeLeft}
+                className="max-md:hidden"
+              />
+            )}
+            <div className="relative z-10 flex min-w-0 flex-1 flex-col">
+              <VoiceGradient listening={listening} speaking={speaking} userTalking={userTalking} />
+              {!sidebarOpen && (
+                <button
+                  onClick={() => setSidebarOpen(true)}
+                  className="absolute top-3 left-3 z-20 inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/70 text-slate-500 shadow-md backdrop-blur transition hover:bg-white hover:text-[#ff5a5f]"
+                  aria-label="Show sidebar"
                 >
-                  <div
-                    className={`mb-1 text-[0.62rem] font-bold tracking-[0.12em] uppercase ${
-                      isUser ? "text-white/80" : isError ? "text-rose-500" : "text-[#ff5a5f]"
-                    }`}
-                  >
-                    {isError ? "Notice" : isUser ? "You" : "Tutor"}
-                  </div>
-                  <p className="whitespace-pre-wrap">{message.text}</p>
-                  {message.elapsed != null && (
-                    <span className="mt-2 block text-[0.65rem] opacity-60">
-                      {fmtElapsed(message.elapsed)}
-                    </span>
-                  )}
-                </article>
-              );
-            })}
-            {interim && (
-              <div className="self-end max-w-[88%] rounded-2xl border border-dashed border-[#ff5a5f]/40 bg-[#ff5a5f]/5 px-4 py-3 text-sm leading-6 text-slate-700 shadow-sm">
-                <div className="mb-1 text-[0.62rem] font-bold tracking-[0.12em] text-[#ff5a5f] uppercase">
-                  You’re saying…
-                </div>
-                <p className="whitespace-pre-wrap">{interim}</p>
-              </div>
-            )}
-            {typing && (
-              <div className="self-start rounded-2xl border border-slate-200 bg-white px-4 py-3 text-xs text-slate-400">
-                Tutor is thinking…
-              </div>
-            )}
-          </section>
-        </main>
+                  <FaBars className="h-4 w-4" />
+                </button>
+              )}
+              {asrRejected && (
+                <span className="absolute top-3 left-1/2 z-20 -translate-x-1/2 rounded-full bg-amber-50/90 px-2.5 py-1 text-[11px] font-semibold whitespace-nowrap text-amber-700 shadow-sm backdrop-blur">
+                  {asrRejected}
+                </span>
+              )}
 
-        <BottomBar
-          input={input}
-          setInput={setInput}
-          sendText={sendText}
-          connected={connected}
-          listening={listening}
-          micBusy={micBusy}
-          speaking={speaking}
-          userTalking={userTalking}
-          sharing={sharing}
-          visionEnabled={CFG.visionEnabled}
-          onToggleMic={handleToggleMic}
-          onShareDown={shareDown}
-          onShareUp={shareUp}
-        />
+              <main className="relative z-10 flex min-h-0 flex-1 overflow-hidden">
+                <section
+                  ref={chatEl}
+                  className="mx-auto flex min-h-0 w-full max-w-3xl flex-col gap-3 overflow-y-auto px-4 pt-2 pb-2 sm:px-6"
+                  aria-live="polite"
+                  aria-label="Chat transcript"
+                >
+                  {messages.map((message) => {
+                    const isUser = message.role === "user";
+                    const isError = message.role === "error";
+                    return (
+                      <article
+                        key={message.id}
+                        className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${
+                          isError
+                            ? "self-start border border-rose-200 bg-rose-50 text-rose-700"
+                            : isUser
+                              ? "self-end bg-[#ff5a5f] text-white"
+                              : "self-start border border-white/60 bg-white/80 text-slate-700 backdrop-blur"
+                        }`}
+                      >
+                        <div
+                          className={`mb-1 text-[0.62rem] font-bold tracking-[0.12em] uppercase ${
+                            isUser ? "text-white/80" : isError ? "text-rose-500" : "text-[#ff5a5f]"
+                          }`}
+                        >
+                          {isError ? "Notice" : isUser ? "You" : "Tutor"}
+                        </div>
+                        <p className="whitespace-pre-wrap">{message.text}</p>
+                        {message.elapsed != null && (
+                          <span className="mt-2 block text-[0.65rem] opacity-60">
+                            {fmtElapsed(message.elapsed)}
+                          </span>
+                        )}
+                      </article>
+                    );
+                  })}
+                  {interim && (
+                    <div className="self-end max-w-[88%] rounded-2xl border border-dashed border-[#ff5a5f]/40 bg-[#ff5a5f]/5 px-4 py-3 text-sm leading-6 text-slate-700 shadow-sm">
+                      <div className="mb-1 text-[0.62rem] font-bold tracking-[0.12em] text-[#ff5a5f] uppercase">
+                        You’re saying…
+                      </div>
+                      <p className="whitespace-pre-wrap">{interim}</p>
+                    </div>
+                  )}
+                  {typing && (
+                    <div className="self-start rounded-2xl border border-white/60 bg-white/70 px-4 py-3 text-xs text-slate-400">
+                      Tutor is thinking…
+                    </div>
+                  )}
+                </section>
+              </main>
+
+              <BottomBar
+                input={input}
+                setInput={setInput}
+                sendText={sendText}
+                connected={connected}
+                listening={listening}
+                micBusy={micBusy}
+                speaking={speaking}
+                userTalking={userTalking}
+                sharing={sharing}
+                visionEnabled={CFG.visionEnabled}
+                onToggleMic={handleToggleMic}
+                onShareDown={shareDown}
+                onShareUp={shareUp}
+              />
+            </div>
+          </div>
+          </AppWindow>
+        )}
+
+        {winId === "whiteboard" && (
+          <AppWindow
+            title={`Whiteboard${steps.length ? ` · ${steps.length} step${steps.length > 1 ? "s" : ""}` : ""}`}
+            geom={geomFor("whiteboard")}
+            onGeom={setGeomFor("whiteboard")}
+            maximized={!!maxed.whiteboard}
+            cascade={openApps.indexOf("whiteboard")}
+            leaving={leaving.whiteboard}
+            hideChrome={!!maxed.whiteboard && !topChrome}
+            onFocus={() => {
+              setSpreadTop(false); if (activeApp !== "whiteboard") focusApp("whiteboard");
+            }}
+            onClose={() => closeApp("whiteboard")}
+            onMin={() => minimizeApp("whiteboard")}
+            onMax={() => zoomApp("whiteboard")}
+          >
+            <div className="min-h-0 flex-1 overflow-hidden rounded-b-[18px] bg-white/70">
+              <TutorBoard
+                steps={steps}
+                focus={diagramFocus}
+                stepIndex={stepIndex}
+                followLive={followLive}
+                onStep={(i) => {
+                  setStepIndex(i);
+                  setFollowLive(false);
+                }}
+                onJumpLive={() => {
+                  setFollowLive(true);
+                  setStepIndex(Math.max(0, steps.length - 1));
+                }}
+              />
+            </div>
+          </AppWindow>
+        )}
+
+        {winId === "browser" && (
+          <AppWindow
+            title="Browser"
+            geom={geomFor("browser")}
+            onGeom={setGeomFor("browser")}
+            maximized={!!maxed.browser}
+            cascade={openApps.indexOf("browser")}
+            leaving={leaving.browser}
+            hideChrome={!!maxed.browser && !topChrome}
+            onFocus={() => {
+              setSpreadTop(false); if (activeApp !== "browser") focusApp("browser");
+            }}
+            onClose={() => closeApp("browser")}
+            onMin={() => minimizeApp("browser")}
+            onMax={() => zoomApp("browser")}
+          >
+            <div className="min-h-0 flex-1 p-3 pt-1">
+              <BrowserApp url={browserUrl} onNavigate={setBrowserUrl} />
+            </div>
+          </AppWindow>
+        )}
+
+        {winId === "notes" && (
+          <AppWindow
+            title="Notes"
+            geom={geomFor("notes")}
+            onGeom={setGeomFor("notes")}
+            maximized={!!maxed.notes}
+            cascade={openApps.indexOf("notes")}
+            leaving={leaving.notes}
+            hideChrome={!!maxed.notes && !topChrome}
+            onFocus={() => {
+              setSpreadTop(false); if (activeApp !== "notes") focusApp("notes");
+            }}
+            onClose={() => closeApp("notes")}
+            onMin={() => minimizeApp("notes")}
+            onMax={() => zoomApp("notes")}
+          >
+            <div className="min-h-0 flex-1 p-3 pt-1">
+              <NotesApp
+                notes={notes}
+                activeId={activeNoteId || notes[0]?.id}
+                onSelect={setActiveNoteId}
+                onChange={updateNote}
+                onAdd={addNote}
+                onDelete={deleteNote}
+              />
+            </div>
+          </AppWindow>
+        )}
+        {winId === "code" && (
+          <AppWindow
+            title="Code"
+            geom={geomFor("code")}
+            onGeom={setGeomFor("code")}
+            maximized={!!maxed.code}
+            cascade={openApps.indexOf("code")}
+            leaving={leaving.code}
+            hideChrome={!!maxed.code && !topChrome}
+            onFocus={() => {
+              setSpreadTop(false); if (activeApp !== "code") focusApp("code");
+            }}
+            onClose={() => closeApp("code")}
+            onMin={() => minimizeApp("code")}
+            onMax={() => zoomApp("code")}
+          >
+            <div className="min-h-0 flex-1">
+              <CodeApp
+                onContext={(c) => {
+                  codeCtxRef.current = c;
+                }}
+              />
+            </div>
+          </AppWindow>
+        )}
+          </div>
+        ))}
+        </div>
       </div>
 
-      {canvasOpen && (
-        <ResizeHandle
-          onDragStart={startRightResize}
-          onDrag={resizeRight}
-          className="max-lg:hidden"
-        />
-      )}
-      {canvasOpen && (
-        <aside
-          className="relative z-10 flex h-full flex-col overflow-hidden bg-white max-lg:fixed max-lg:inset-y-0 max-lg:right-0 max-lg:z-40 max-lg:w-[min(92vw,520px)] max-lg:shadow-2xl lg:shrink-0 lg:border-l lg:border-slate-200/80 lg:w-[var(--canvas-w)]"
-          style={{ "--canvas-w": `${rightW}px` }}
-          aria-label="Lesson board"
-        >
-          <div className="flex items-center justify-between border-b border-slate-200/70 px-5 py-3">
-            <div>
-              <span className="block text-[0.64rem] font-bold tracking-[0.14em] text-[#ff5a5f] uppercase">
-                Lesson board{steps.length ? ` · ${steps.length} step${steps.length > 1 ? "s" : ""}` : ""}
-              </span>
-              <h2 className="mt-0.5 text-[1rem] font-semibold tracking-[-0.02em] text-slate-900">
-                Learn step by step
-              </h2>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-[#ff5a5f]" aria-hidden="true" />
-              <button
-                onClick={() => setCanvasOpen(false)}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
-                aria-label="Close whiteboard"
-              >
-                <FaXmark className="h-4 w-4" />
-              </button>
-            </div>
-          </div>
-          <div className="min-h-0 flex-1">
-            <TutorBoard
-              steps={steps}
-              focus={diagramFocus}
-              stepIndex={stepIndex}
-              followLive={followLive}
-              onStep={(i) => {
-                setStepIndex(i);
-                setFollowLive(false);
-              }}
-              onJumpLive={() => {
-                setFollowLive(true);
-                setStepIndex(Math.max(0, steps.length - 1));
-              }}
-            />
-          </div>
-        </aside>
-      )}
+      {/* No desktop popup — the dock is always reachable and opens apps. */}
+      <TutorPopup
+        open={popupOpen}
+        pinned={popupPinned}
+        onTogglePin={() => setPopupPinned((v) => !v)}
+        onOpenTutor={() => openApp("tutor")}
+        speaking={speaking}
+        listening={listening}
+        typing={typing}
+        interim={interim}
+        input={input}
+        setInput={setInput}
+        sendText={sendText}
+        connected={connected}
+        onToggleMic={handleToggleMic}
+        micBusy={micBusy}
+      />
+
+      <Dock
+        activeApp={activeApp}
+        onOpen={toggleDock}
+        visible={dockVisible || visibleApps.length === 0}
+        running={openApps}
+        noteCount={notes.length}
+      />
+      {/* hover strip that reveals the auto-hide dock */}
+      <div
+        className="absolute inset-x-0 bottom-0 z-30 h-6"
+        onMouseEnter={pokeDock}
+        aria-hidden="true"
+      />
     </div>
   );
 }

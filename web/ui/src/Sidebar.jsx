@@ -44,7 +44,7 @@ export default function Sidebar({
             <FaWandMagicSparkles className="h-4 w-4" />
           </span>
           <div>
-            <h1 className="text-sm font-bold tracking-[0.12em] text-slate-900 uppercase">Saathi</h1>
+            <h1 className="text-sm font-bold tracking-[0.12em] text-slate-900 uppercase">Tutor</h1>
             <p className="mt-0.5 text-[11px] text-slate-500">Hindi voice tutor</p>
           </div>
         </div>

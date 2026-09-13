@@ -78,6 +78,9 @@ def clause_units(sent: str, piece_max: int = 110) -> list[str]:
     Within one sentence, cuts land at clause punctuation first, then at
     spaces; short sentences pass through untouched.
 
+    Tiny tails (<30 chars, e.g. "आदि।") merge into the previous piece so
+    they never become a solo TTS generate with a prosody restart.
+
     Every returned piece is <= piece_max chars, so no single audio window can
     grow into a long uninterruptible frame (the #1 thing that kills the
     realtime feel — one giant run-on sentence used to stall TTS for 10s+).
@@ -101,7 +104,12 @@ def clause_units(sent: str, piece_max: int = 110) -> list[str]:
                     last = p + 1
             tail = sentence[last:].strip()
             if tail:
-                out.append(tail)
+                # Merge fragments shorter than a clause into the previous
+                # piece instead of a solo robotic window.
+                if len(tail) < 30 and out and len(out[-1]) + 1 + len(tail) <= piece_max + 30:
+                    out[-1] = f"{out[-1]} {tail}".strip()
+                else:
+                    out.append(tail)
         else:
             out.append(sentence)
     # then hard-split anything still too long at word boundaries
@@ -121,5 +129,9 @@ def clause_units(sent: str, piece_max: int = 110) -> list[str]:
                 final.append(cur)
                 cur = w
         if cur:
-            final.append(cur)
+            # Avoid a dangling 1-2 word tail as its own window.
+            if len(cur) < 30 and final and len(final[-1]) + 1 + len(cur) <= piece_max + 30:
+                final[-1] = f"{final[-1]} {cur}".strip()
+            else:
+                final.append(cur)
     return [p for p in final if p]
