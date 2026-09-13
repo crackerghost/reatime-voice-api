@@ -40,7 +40,11 @@ DIAGRAM_TOOL = {
                             "endNodeId": {"type": "string"},
                             "arrowLabel": {"type": "string"},
                         },
-                        "required": ["id", "type", "x", "y"],
+                        # x/y required only for SHAPES. Arrows are defined by
+                        # startNodeId/endNodeId (server computes their geometry),
+                        # and Groq 400-rejects the whole call when the LLM omits
+                        # arrow coordinates — the top planner failure in prod logs.
+                        "required": ["id", "type"],
                     },
                 },
             },
@@ -85,7 +89,7 @@ def should_generate(text: str, history: list[dict] | None, enabled: bool) -> boo
     return True
 
 
-def _step_prompt(step_text: str, topic: str) -> list[dict]:
+def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
     return [
         {
             "role": "system",
@@ -106,14 +110,17 @@ def _step_prompt(step_text: str, topic: str) -> list[dict]:
                 "always ENGLISH — short English labels (max 6 words), code/tag/ "
                 "attribute/file names exactly as-is (HTML, h1, href, index.html). "
                 "Never Devanagari on the board; Hindi is voice-only. "
-                "Node ids must be unique — prefix every id with the "
-                "given STEP tag. Layout is dynamic per step: top-to-bottom flow for "
-                "sequences/processes (x ~80..400, y growing), side-by-side for "
-                "comparisons (x spread 80..640). Shapes: rectangle = component/step, "
+                "Node ids: ASCII ONLY (a-z, 0-9, hyphen), prefixed with the given "
+                "TAG (e.g. TAG-n1, TAG-n2). Never Devanagari or invented words in "
+                "ids. Shapes give x/y/width/height; ARROWS give ONLY id, type, "
+                "startNodeId, endNodeId — never x/y on arrows. Layout is dynamic "
+                "per step: top-to-bottom flow for sequences/processes "
+                "(x ~80..400, y growing), side-by-side for comparisons "
+                "(x spread 80..640). Shapes: rectangle = component/step, "
                 "ellipse = start/end, diamond = decision, arrow = flow."
             ),
         },
-        {"role": "user", "content": f"TOPIC: {topic[:200]}\nSTEP: {step_text[:600]}"},
+        {"role": "user", "content": f"TAG: {tag}\nTOPIC: {topic[:200]}\nSTEP: {step_text[:600]}"},
     ]
 
 
@@ -149,7 +156,7 @@ def generate_for_step(
     url: str,
     model: str,
     reasoning_effort: str = "",
-    max_tokens: int = 450,
+    max_tokens: int = 700,
     id_prefix: str = "w",
 ) -> dict | None:
     """Watcher planner: one small board delta for ONE spoken window.
@@ -169,7 +176,7 @@ def generate_for_step(
         return None
     payload = {
         "model": model,
-        "messages": _step_prompt(step_text, topic),
+        "messages": _step_prompt(step_text, topic, id_prefix),
         "tools": [DIAGRAM_TOOL],
         "tool_choice": "auto",
         "temperature": 0,
@@ -311,11 +318,35 @@ def normalize(raw: object) -> dict | None:
         if color == "transparent" or re.fullmatch(r"#[0-9a-fA-F]{6}", color):
             normalized["backgroundColor"] = color
         elements.append(normalized)
-    nodes = {
-        item["id"]
+    boxes = {
+        item["id"]: (item["x"], item["y"], item["width"], item["height"])
         for item in elements
         if item["type"] != "arrow" and str(item.get("text", "")).strip()
     }
+    for item in elements:
+        # Arrow geometry is computed HERE from the endpoint boxes — never
+        # trusted from the LLM (it omits arrow x/y, which used to pile every
+        # arrow at 80,80 as floating lines detached from the boxes).
+        if item["type"] != "arrow":
+            continue
+        s = boxes.get(item.get("startNodeId", ""))
+        e = boxes.get(item.get("endNodeId", ""))
+        if not s or not e:
+            continue
+        scx, s_bot, s_right, scy = s[0] + s[2] / 2, s[1] + s[3], s[0] + s[2], s[1] + s[3] / 2
+        ecx, e_top, e_left, ecy = e[0] + e[2] / 2, e[1], e[0], e[1] + e[3] / 2
+        if e[1] >= s[1] + s[3] - 10:
+            p1, p2 = (scx, s_bot), (ecx, e_top)      # flow downward
+        elif e[0] >= s[0] + s[2] - 10:
+            p1, p2 = (s_right, scy), (e_left, ecy)    # flow rightward
+        else:
+            p1, p2 = (scx, s_bot), (ecx, e_top)      # fallback: downward
+        x, y = min(p1[0], p2[0]), min(p1[1], p2[1])
+        item["x"], item["y"] = x, y
+        item["width"] = max(1, abs(p2[0] - p1[0]))
+        item["height"] = max(1, abs(p2[1] - p1[1]))
+        item["points"] = [[p1[0] - x, p1[1] - y], [p2[0] - x, p2[1] - y]]
+    nodes = set(boxes)
     elements = [
         item for item in elements
         if (item["type"] != "arrow" and str(item.get("text", "")).strip())

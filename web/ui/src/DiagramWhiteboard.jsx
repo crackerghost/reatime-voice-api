@@ -87,6 +87,33 @@ function toExcalidrawElements(items) {
     const start = nodes.get(String(item.startNodeId || ""));
     const end = nodes.get(String(item.endNodeId || ""));
     if (!start || !end) continue;
+
+    // Server-computed geometry (points) draws the line exactly from the
+    // source box edge to the target box edge. Binding fallback only for
+    // payloads that predate server geometry.
+    const pts = Array.isArray(item.points) && item.points.length >= 2
+      ? item.points
+      : null;
+    if (pts) {
+      const x = Number.isFinite(item.x) ? item.x : 80;
+      const y = Number.isFinite(item.y) ? item.y : 80;
+      skeletons.push({
+        id: String(item.id).slice(0, 80),
+        type: "arrow",
+        x,
+        y,
+        width: clamp(Number(item.width) || 10, 1, 2000),
+        height: clamp(Number(item.height) || 10, 1, 2000),
+        // Excalidraw points are [x, y] tuples, not {x, y} objects.
+        points: pts.map((p) => [Number(p[0]) || 0, Number(p[1]) || 0]),
+        endArrowhead: "arrow",
+        strokeColor: "#ff5a5f",
+        backgroundColor: "transparent",
+        strokeWidth: 2,
+        roughness: 0,
+      });
+      continue;
+    }
     const sp = nodePos.get(start.id) || { x: 80, y: 80, w: DEFAULT_WIDTH, h: DEFAULT_HEIGHT };
     const ep = nodePos.get(end.id) || { x: 80, y: 80, w: DEFAULT_WIDTH, h: DEFAULT_HEIGHT };
 

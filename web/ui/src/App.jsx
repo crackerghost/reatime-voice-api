@@ -133,6 +133,9 @@ export default function App() {
   const stagedDiagramsRef = useRef(new Map()); // window_n -> elements[]
   const currentWindowRef = useRef(0); // audio window currently playing
   const [diagramFocus, setDiagramFocus] = useState(null); // {ids:[...], tick:n} -> whiteboard scrolls here
+  const revealQueueRef = useRef([]); // single elements awaiting paced draw
+  const revealTimerRef = useRef(0);
+  const REVEAL_MS = 650; // one shape per beat: smooth hand-drawn feel in sync with speech
 
   /* Merge one staged board batch into state (id-keyed, capped). */
   const mergeDiagramBatch = useCallback((incoming) => {
@@ -148,9 +151,35 @@ export default function App() {
     });
   }, []);
 
+  /* Paced reveal: draw ONE shape per beat so the board grows smoothly with
+     the speech instead of popping a whole batch instantly. Each shape gets
+     viewport focus as it appears. Overflow (queue > 12) dumps instantly to
+     avoid falling minutes behind on long turns. */
+  const revealNext = useCallback(() => {
+    const el = revealQueueRef.current.shift();
+    if (!el) {
+      revealTimerRef.current = 0;
+      return;
+    }
+    mergeDiagramBatch([el]);
+    if (el?.id) setDiagramFocus({ ids: [el.id], tick: Date.now() });
+    if (revealQueueRef.current.length > 12) {
+      // Long turn, reveal far behind speech — dump the backlog at once.
+      const rest = revealQueueRef.current.splice(0);
+      mergeDiagramBatch(rest);
+      revealTimerRef.current = 0;
+      return;
+    }
+    if (revealQueueRef.current.length) {
+      revealTimerRef.current = setTimeout(revealNext, REVEAL_MS);
+    } else {
+      revealTimerRef.current = 0;
+    }
+  }, [mergeDiagramBatch]);
+
   /* Flush staged deltas whose audio window has started playing.
-     Batches merge in window order; the whiteboard focuses the newest batch
-     so the viewport follows the spoken step instead of the whole board. */
+     Elements queue in window order for paced reveal — position matches
+     the spoken step, one shape at a time. */
   const flushDiagramsUpTo = useCallback((n) => {
     const staged = stagedDiagramsRef.current;
     if (!staged.size) return;
@@ -158,12 +187,10 @@ export default function App() {
     for (const k of keys) {
       const batch = staged.get(k);
       staged.delete(k);
-      if (batch?.length) {
-        mergeDiagramBatch(batch);
-        setDiagramFocus({ ids: batch.map((el) => el?.id).filter(Boolean), tick: Date.now() + k });
-      }
+      if (batch?.length) revealQueueRef.current.push(...batch);
     }
-  }, [mergeDiagramBatch]);
+    if (revealQueueRef.current.length && !revealTimerRef.current) revealNext();
+  }, [revealNext]);
 
   /* Staggered drain: one board batch per beat so steps draw one-by-one
      instead of dumping all divs at once. (Legacy whole-board path only —
@@ -188,15 +215,21 @@ export default function App() {
     windowOrderRef.current = [];
     audioWindowRef.current = [];
     currentWindowRef.current = 0;
+    revealQueueRef.current = [];
     setDiagramFocus(null);
     if (diagramTimerRef.current) {
       clearTimeout(diagramTimerRef.current);
       diagramTimerRef.current = 0;
     }
+    if (revealTimerRef.current) {
+      clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = 0;
+    }
   }, []);
 
   useEffect(() => () => {
     if (diagramTimerRef.current) clearTimeout(diagramTimerRef.current);
+    if (revealTimerRef.current) clearTimeout(revealTimerRef.current);
   }, []);
   const openAssistantId = useRef(null);
   const assistantTextRef = useRef("");
@@ -381,6 +414,11 @@ export default function App() {
     audioWindowRef.current = [];
     windowOrderRef.current = [];
     stagedDiagramsRef.current.clear();
+    revealQueueRef.current = [];
+    if (revealTimerRef.current) {
+      clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = 0;
+    }
     if (wsRef.current && wsRef.current.readyState === 1) {
       wsRef.current.send(stopMessage());
     }
