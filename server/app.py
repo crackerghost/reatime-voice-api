@@ -1145,8 +1145,10 @@ def _pause_for(key: str, dflt: float) -> float:
 
 
 PAUSE_SECONDS = {
-    ",": _pause_for("COMMA", 0.15),
-    ";": _pause_for("SEMI", 0.2),
+    # Comma is the breath mark: 0.15s rushed clauses together ("robotic").
+    # 0.3s lets each clause land before the next starts.
+    ",": _pause_for("COMMA", 0.3),
+    ";": _pause_for("SEMI", 0.25),
     ".": _pause_for("FULL", 0.3),
     "?": _pause_for("QUESTION", 0.35),
     "!": _pause_for("EXCLAM", 0.4),

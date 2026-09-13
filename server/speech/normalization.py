@@ -5,13 +5,27 @@ import re
 def _preserve_code_tokens(text: str) -> str:
     """Keep code/HTML tokens speakable BEFORE _speechify strips markup.
 
-    <html> / </head> -> " html टैग " (later maps to एचटीएमएल टैग via
-    HINGLISH_TO_DEVANAGARI). Without this, teaching HTML speaks as
-    "टैग्स – आदि" with every tag name eaten by the <tag> stripper.
+    <html> / </head> / <a href="..."> -> " html टैग " (later maps to
+    एचटीएमएल टैग via HINGLISH_TO_DEVANAGARI). Without this, teaching HTML
+    speaks as "टैग्स – आदि" with every tag name eaten by the <tag> stripper,
+    and attribute tags leak raw "<" into speech ("<ए एचरेफ..." in prod logs).
     """
     if not text or "<" not in text:
         return text
-    return re.sub(r"</?\s*([A-Za-z][A-Za-z0-9]*)\s*/?>", r" \1 टैग ", text)
+
+    def _tag_repl(m):
+        name = m.group(1)
+        # Single-letter tag (<a>, <p>): speak the LETTER name (ए टैग),
+        # not the article/vowel (अ टैग). Longer names pass through for
+        # dict mapping (html -> एचटीएमएल).
+        if len(name) == 1:
+            spoken = LATIN_TO_DEVANAGARI.get(name.lower(), name)
+            return f" {spoken} टैग "
+        return f" {name} टैग "
+
+    # Tags WITH attributes first (<a href="x">), then bare tags (<html>).
+    text = re.sub(r"</?\s*([A-Za-z][A-Za-z0-9]*)(\s[^<>]*)?>", _tag_repl, text)
+    return re.sub(r"[<>]", " ", text)  # any leftover brackets -> space, never spoken
 
 
 def _speechify(text: str) -> str:
@@ -189,7 +203,7 @@ HINGLISH_TO_DEVANAGARI = {
     # ---- closed-class function words (finite set, domain-independent) ----
     # These are the commonest Latin slips and the phonetic fallback mangles
     # several (the->थे, of->ओफ, to->टो), so they live in the static core.
-    "the": "द", "a": "अ", "an": "अन",
+    "the": "द", "a": "अ", "an": "ऐन",
     "to": "टू", "two": "टू", "do": "डू", "does": "डज़",
     "be": "बी", "he": "ही", "she": "शी", "me": "मी", "we": "वी", "who": "हू",
     "that": "दैट", "this": "दिस", "these": "दीज़", "those": "दोज़",
@@ -232,6 +246,9 @@ SHUDDH_TO_BOLCHAAL = {
     "उपयोग": "यूज़",
     "प्रयोग": "ट्राई",
     "समस्या": "प्रॉब्लम",
+    "ढांचा": "स्ट्रक्चर",
+    "ढाँचा": "स्ट्रक्चर",
+    "ढाचा": "स्ट्रक्चर",
     "समाधान": "सॉल्यूशन",
     "प्रश्न": "क्वेश्चन",
     "विषय": "सब्जेक्ट",
