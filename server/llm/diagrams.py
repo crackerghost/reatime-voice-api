@@ -138,12 +138,67 @@ _VISUAL_GATE_RE = re.compile(
 )
 
 
+# Dynamic course layer: the course compiler fills these per course/module.
+# The static gate above stays fully generic. Keywords are indexed in BOTH
+# scripts because the gate reads raw LLM text (Devanagari) while authors
+# write Latin: each Latin keyword also indexes its phonetic rendering, and
+# every glossary key AND value is indexed (values are the exact Devanagari
+# the tutor actually speaks, e.g. फोटोसिन्थेसिस).
+_COURSE_KEYWORDS: frozenset = frozenset()
+
+
+def set_course_keywords(words) -> None:
+    """Install this course's domain keywords (feeds the visual gate)."""
+    from server.speech.normalization import _phonetic
+    forms: set[str] = set()
+    for w in (words or []):
+        w = str(w).strip()
+        if not w:
+            continue
+        forms.add(w.lower())
+        if re.search(r"[A-Za-z]", w):
+            try:
+                forms.add(_phonetic(w))
+            except Exception:  # noqa: BLE001 — gate must never break
+                pass
+    global _COURSE_KEYWORDS
+    _COURSE_KEYWORDS = frozenset(f for f in forms if len(f) > 2)
+
+
+def set_course_context(glossary: dict | None = None, keywords=None) -> None:
+    """One call the roadmap integration makes per module/topic.
+
+    Glossary values (exact Devanagari terms) join the keyword index, so a
+    window saying फोटोसिन्थेसिस matches even though the author wrote
+    'photosynthesis'. Also installs the TTS glossary overlay.
+    """
+    from server.speech import normalization as _norm
+    _norm.set_course_glossary(glossary)
+    forms: set[str] = set()
+    for w in (keywords or []):
+        w = str(w).strip()
+        if w:
+            forms.add(w.lower())
+    for k, v in (glossary or {}).items():
+        if str(k).strip():
+            forms.add(str(k).lower())
+        if str(v).strip():
+            forms.add(str(v))
+    set_course_keywords(forms)
+
+
 def is_visual_step(step_text: str) -> bool:
     """Cheap heuristic: does this window merit a planner LLM call?"""
     text = (step_text or "").strip()
     if len(text) < 24:
         return False
-    return bool(_VISUAL_GATE_RE.search(text))
+    if _VISUAL_GATE_RE.search(text):
+        return True
+    # Course domain hit: any keyword (len 3+, avoids ना/पर noise).
+    if _COURSE_KEYWORDS:
+        low = text.lower()
+        return any(len(k) > 2 and k in low for k in _COURSE_KEYWORDS)
+    return False
 
 
 def generate_for_step(
@@ -241,25 +296,38 @@ def generate_for_step(
            or (it.get("startNodeId") in keep and it.get("endNodeId") in keep)]
     if not any(it["type"] != "arrow" for it in out):
         return None
-    # Y-offset per window so steps stack downward instead of overlapping.
-    # Capped + wrapped: unbounded growth (win 8 -> +1540y) pushes new nodes
-    # far below the fitted viewport while old nodes get evicted by the
-    # client's 40-element cap — the board then shows "Scroll back to content"
-    # with apparently nothing on screen. Wrap every 4 windows into a new column.
+    # Deterministic layout: model coordinates are NOT trusted (prod boards
+    # showed boxes piled on top of each other). Each window gets its own
+    # band; shapes stack top-to-bottom inside it, sized to their label, so
+    # batches can never overlap and paced reveal always draws downward.
+    # Wrap every 4 windows into a new column to bound viewport growth.
     try:
         win_n = int(id_prefix.lstrip("w") or 1)
     except ValueError:
         win_n = 1
     row = (win_n - 1) % 4
     col = (win_n - 1) // 4
-    y_off = row * 220
-    x_off = col * 280
+    base_x = 80 + col * 560
+    base_y = 80 + row * 950
+    shapes = [it for it in out if it["type"] != "arrow"]
+    try:
+        shapes.sort(key=lambda it: (float(it.get("y", 80)), float(it.get("x", 80))))
+    except (TypeError, ValueError):
+        pass
+    cy = float(base_y)
+    for item in shapes:
+        label = str(item.get("text", ""))
+        item["width"] = max(180, min(460, 140 + 8 * len(label)))
+        item["height"] = 96 if item["type"] == "diamond" else 84
+        item["x"] = max(-2000, min(2000, float(base_x)))
+        item["y"] = max(-2000, min(2000, cy))
+        cy += float(item["height"]) + 66
+    boxes = {
+        it["id"]: (it["x"], it["y"], it["width"], it["height"]) for it in shapes
+    }
     for item in out:
-        try:
-            item["y"] = max(-2000, min(2000, float(item.get("y", 80)) + y_off))
-            item["x"] = max(-2000, min(2000, float(item.get("x", 80)) + x_off))
-        except (TypeError, ValueError):
-            pass
+        if item["type"] == "arrow":
+            _arrow_geometry(item, boxes)
     return {"elements": out}
 
 
@@ -282,6 +350,31 @@ def _prompt(text: str, history: list[dict]) -> list[dict]:
         },
         {"role": "user", "content": f"Recent context:\n{recent}\n\nCurrent question:\n{text}"},
     ]
+
+
+def _arrow_geometry(item: dict, boxes: dict[str, tuple]) -> None:
+    """Set an arrow's x/y/width/height/points from its endpoint boxes.
+
+    Edge-to-edge line (bottom→top for downward flow, right→left otherwise)
+    so arrows always touch both boxes. No-op when an endpoint is unknown.
+    """
+    s = boxes.get(item.get("startNodeId", ""))
+    e = boxes.get(item.get("endNodeId", ""))
+    if not s or not e:
+        return
+    scx, s_bot, s_right, scy = s[0] + s[2] / 2, s[1] + s[3], s[0] + s[2], s[1] + s[3] / 2
+    ecx, e_top, e_left, ecy = e[0] + e[2] / 2, e[1], e[0], e[1] + e[3] / 2
+    if e[1] >= s[1] + s[3] - 10:
+        p1, p2 = (scx, s_bot), (ecx, e_top)      # flow downward
+    elif e[0] >= s[0] + s[2] - 10:
+        p1, p2 = (s_right, scy), (e_left, ecy)    # flow rightward
+    else:
+        p1, p2 = (scx, s_bot), (ecx, e_top)      # fallback: downward
+    x, y = min(p1[0], p2[0]), min(p1[1], p2[1])
+    item["x"], item["y"] = x, y
+    item["width"] = max(1, abs(p2[0] - p1[0]))
+    item["height"] = max(1, abs(p2[1] - p1[1]))
+    item["points"] = [[p1[0] - x, p1[1] - y], [p2[0] - x, p2[1] - y]]
 
 
 def normalize(raw: object) -> dict | None:
@@ -327,25 +420,8 @@ def normalize(raw: object) -> dict | None:
         # Arrow geometry is computed HERE from the endpoint boxes — never
         # trusted from the LLM (it omits arrow x/y, which used to pile every
         # arrow at 80,80 as floating lines detached from the boxes).
-        if item["type"] != "arrow":
-            continue
-        s = boxes.get(item.get("startNodeId", ""))
-        e = boxes.get(item.get("endNodeId", ""))
-        if not s or not e:
-            continue
-        scx, s_bot, s_right, scy = s[0] + s[2] / 2, s[1] + s[3], s[0] + s[2], s[1] + s[3] / 2
-        ecx, e_top, e_left, ecy = e[0] + e[2] / 2, e[1], e[0], e[1] + e[3] / 2
-        if e[1] >= s[1] + s[3] - 10:
-            p1, p2 = (scx, s_bot), (ecx, e_top)      # flow downward
-        elif e[0] >= s[0] + s[2] - 10:
-            p1, p2 = (s_right, scy), (e_left, ecy)    # flow rightward
-        else:
-            p1, p2 = (scx, s_bot), (ecx, e_top)      # fallback: downward
-        x, y = min(p1[0], p2[0]), min(p1[1], p2[1])
-        item["x"], item["y"] = x, y
-        item["width"] = max(1, abs(p2[0] - p1[0]))
-        item["height"] = max(1, abs(p2[1] - p1[1]))
-        item["points"] = [[p1[0] - x, p1[1] - y], [p2[0] - x, p2[1] - y]]
+        if item["type"] == "arrow":
+            _arrow_geometry(item, boxes)
     nodes = set(boxes)
     elements = [
         item for item in elements

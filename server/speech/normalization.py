@@ -18,6 +18,9 @@ def _speechify(text: str) -> str:
     """Strip markdown/symbols/emoji and flatten to plain spoken sentences."""
     text = re.sub(r"<[^>]+>", " ", text)                    # <tag> leftovers
     text = re.sub(r"[\"'\u201c\u201d\u2018\u2019]+", "", text)  # quotes
+    text = re.sub(r"[:\uFF1A]+", " ", text)  # colons are unreadable aloud ("कैसे:।" -> "कैसे।")
+    text = re.sub(r"&", " और ", text)  # AT&T -> ए टी और टी
+    text = re.sub(r"\+", " प्लस ", text)  # C++ -> सी प्लस प्लस
     text = re.sub(r"[()\[\]{}]+", " ", text)                 # ( ) [ ] { } break the spoken flow
     text = re.sub(r"\*+|_+|`+|#+", "", text)                # *, _, `, #
     text = re.sub(r"^\s*[-=~]{3,}\s*$", " ", text, flags=re.M)  # --- lines
@@ -183,6 +186,23 @@ HINGLISH_TO_DEVANAGARI = {
     "textcontent": "टेक्स्ट कंटेंट", "classname": "क्लास नेम",
     "createelement": "क्रिएट एलिमेंट",
     "appendchild": "अपेंड चाइल्ड",
+    # ---- closed-class function words (finite set, domain-independent) ----
+    # These are the commonest Latin slips and the phonetic fallback mangles
+    # several (the->थे, of->ओफ, to->टो), so they live in the static core.
+    "the": "द", "a": "अ", "an": "अन",
+    "to": "टू", "two": "टू", "do": "डू", "does": "डज़",
+    "be": "बी", "he": "ही", "she": "शी", "me": "मी", "we": "वी", "who": "हू",
+    "that": "दैट", "this": "दिस", "these": "दीज़", "those": "दोज़",
+    "they": "दे", "them": "देम", "then": "देन", "there": "देयर",
+    "than": "दैन", "their": "देअर",
+    "of": "ऑफ़", "on": "ऑन", "not": "नॉट", "yes": "यस",
+    "here": "हियर", "there": "देयर", "where": "वेयर", "fact": "फैक्ट",
+    "now": "नाउ", "how": "हाउ", "cow": "काउ", "down": "डाउन", "town": "टाउन",
+    "can": "कैन", "cannot": "कैनॉट", "could": "कुड",
+    "would": "वुड", "should": "शुड",
+    "has": "हैज़", "have": "हैव", "had": "हैड",
+    "was": "वॉज़", "were": "वर", "got": "गॉट",
+    "took": "टुक", "look": "लुक",
     # ---- connectors / helpers (missed = letter-spell, so keep explicit) ----
     "need": "नीड", "needs": "नीड्स", "and": "एंड", "or": "ऑर",
     "but": "बट", "because": "बिकॉज़", "with": "विद",
@@ -226,6 +246,11 @@ SHUDDH_TO_BOLCHAAL = {
     "अनुभव": "एक्सपीरियंस",
     "महत्वपूर्ण": "इम्पॉर्टेंट",
     "अत्यंत": "बहुत",
+    # Spelling correction the LLM keeps making: बधिया/बढिया (with ध) said
+    # as "ba-dhi-ya" — correct is बढ़िया (with ढ़). Fixes caption + speech.
+    "बधिया": "बढ़िया",
+    "बढिया": "बढ़िया",
+    "बधीया": "बढ़िया",
     "एवं": "और",
     "तथा": "और",
     "किंतु": "लेकिन",
@@ -304,6 +329,345 @@ _DIGIT_HINDI = {
 }
 
 
+# ---------- Dynamic course layer: per-course glossary ----------
+# Empty by default. The course compiler (or roadmap integration later) calls
+# set_course_glossary() once per course/module — checked BEFORE the phonetic
+# fallback, AFTER the static core. No code edits per subject, ever.
+_COURSE_GLOSSARY: dict[str, str] = {}
+
+
+def set_course_glossary(mapping: dict[str, str] | None) -> None:
+    """Install this course's term -> Devanagari pronunciations.
+
+    Example: {"photosynthesis": "फोटोसिन्थेसिस"}. Pass {} / None to clear
+    (free-chat mode with no course). Realtime-safe: single dict swap.
+    """
+    global _COURSE_GLOSSARY
+    _COURSE_GLOSSARY = {str(k).lower(): str(v) for k, v in (mapping or {}).items()}
+
+
+def get_course_glossary() -> dict[str, str]:
+    return dict(_COURSE_GLOSSARY)
+
+
+def _lookup(word: str) -> str | None:
+    """Static core first, then this course's glossary. Both exact-lowercase."""
+    hit = HINGLISH_TO_DEVANAGARI.get(word)
+    if hit:
+        return hit
+    return _COURSE_GLOSSARY.get(word)
+
+
+# ---------- Generic phonetic fallback: ANY Latin word -> Devanagari ----------
+# Rule-based English G2P. Approximate BY DESIGN — exact key terms belong in
+# the course glossary (one compiler pass at course creation). Emits proper
+# orthography (matras, halants, rakar) so speech flows with a Hindi accent.
+# Letter-spelling survives ONLY for true acronyms (ALL-CAPS / vowelless).
+# Each entry: (latin, sign-if-open-consonant, standalone, leaves-syllable-open?).
+# open-after matters only for rules ending in र (start -> स्टार्ट needs the
+# halant on the NEXT consonant).
+_PHONETIC_VOWEL = sorted([
+    ("igh", "ाइ", "आइ", False), ("eigh", "े", "ए", False), ("eau", "्यू", "यू", False),
+    ("ee", "ी", "ई", False), ("ea", "ी", "ई", False), ("ei", "े", "ए", False),
+    ("ie", "ी", "ई", False),
+    ("oa", "ो", "ओ", False), ("oe", "ो", "ओ", False),
+    ("oi", "ॉइ", "ऑइ", False), ("oy", "ॉय", "ऑय", False),
+    ("ou", "ाउ", "आउ", False), ("ow", "ो", "ओ", False),
+    ("ook", "ुक", "उक", False), ("ood", "ुड", "उड", False),
+    ("oot", "ुट", "उट", False),
+    ("oo", "ू", "ऊ", False),
+    ("au", "ौ", "औ", False), ("aw", "ॉ", "ऑ", False),
+    ("ai", "े", "ए", False), ("ay", "े", "ए", False), ("ey", "े", "ए", False),
+    ("ew", "्यू", "यू", False), ("ue", "ू", "ऊ", False),
+    ("ution", "्यूशन", "यूशन", False),
+    ("ia", "िया", "इया", False), ("io", "ियो", "इयो", False),
+    ("ar", "ार", "आर", True), ("oor", "ोर", "ओर", True),
+    ("and", "ैन्ड", "ऐन्ड", False), ("andard", "ैन्डर्ड", "ऐन्डर्ड", False),
+    ("oid", "ॉयड", "ऑयड", False),
+    ("ashion", "ैशन", "ऐशन", False),
+    ("ash", "ॉश", "ऑश", False),
+], key=lambda kv: -len(kv[0]))
+_PHONETIC_CLUSTER = sorted([
+    ("tion", "शन"), ("sion", "शन"), ("ture", "चर"), ("sure", "शर"),
+    ("th", "थ"), ("dh", "ध"), ("bh", "भ"), ("gh", "घ"), ("kh", "ख"),
+    ("ch", "च"), ("sh", "श"), ("ph", "फ"), ("wh", "व्ह"),
+    ("kn", "न"), ("wr", "र"), ("qu", "क्व"), ("ck", "क"),
+    ("tch", "च"), ("dge", "ज"), ("ng", "ंग"), ("nk", "ंक"),
+], key=lambda kv: -len(kv[0]))
+_PHONETIC_CONS = {
+    "b": "ब", "c": "क", "d": "ड", "f": "फ", "g": "ग", "h": "ह",
+    "j": "ज", "k": "क", "l": "ल", "m": "म", "n": "न", "p": "प",
+    "q": "क", "r": "र", "s": "स", "t": "ट", "v": "व", "w": "व",
+    "x": "क्स", "y": "य", "z": "ज़",
+}
+_PHONETIC_VOWELS = frozenset("aeiou")
+_PHONETIC_CONS_LETTERS = frozenset("bcdfghjklmnpqrstvwxz")
+_PHONETIC_MAGIC_RE = re.compile(r"[^aeiou]{0,2}e[ds]?$")  # a/i/u + <=2 cons + (e|ed|es)
+
+
+def _phonetic(word: str) -> str:
+    """Approximate English word -> Devanagari. Pure function, microseconds."""
+    w = word.lower()
+    if not w:
+        return ""
+    # Word-final tails parsed as units: -ther (father/mother -> दर),
+    # -ren (children -> ्रेन), -ed verbs (started/played).
+    tail = ""
+    if len(w) > 5 and w.endswith("ther"):
+        w, tail = w[:-4], "दर"
+    elif len(w) > 4 and w.endswith("ren"):
+        w, tail = w[:-3], "्रेन"
+    elif len(w) > 3 and w.endswith("ed") and w[-3] not in _PHONETIC_VOWELS:
+        w = w[:-2]
+        # Tail decided AFTER parsing the stem (needs its final sound):
+        # wanted (ट) -> ेड, played (vowel) -> ड, rendered (consonant) -> nothing.
+        tail = "ed"
+    # word-final 'mb': b is silent (comb, bomb).
+    if len(w) > 3 and w.endswith("mb"):
+        w = w[:-1]
+    n = len(w)
+    out: list[str] = []
+    open_c = False
+    open_hard = False  # open on a SINGLE consonant (rakar-safe); clusters aren't
+    ends_vowel = False  # last sound was a vowel (drives the -ed tail)
+
+    def put_cons(base: str, nxt: str | None, nxt2: str | None) -> None:
+        nonlocal open_c, open_hard, ends_vowel
+        if open_c:
+            out[-1] += "्"
+        out.append(base)
+        ends_vowel = False
+        # Rakar / y-glide attach to this consonant: no halant now.
+        if nxt == "r" and nxt2 in _PHONETIC_VOWELS:
+            open_c, open_hard = True, True
+        elif nxt == "y":
+            open_c, open_hard = True, True
+        elif nxt in _PHONETIC_CONS_LETTERS:
+            out[-1] += "्"
+            open_c, open_hard = False, False
+        else:
+            open_c, open_hard = True, True
+
+    def put_vowel(sign: str, indep: str, leave_open: bool = False) -> None:
+        nonlocal open_c, open_hard, ends_vowel
+        if open_c:
+            out[-1] += sign
+        else:
+            out.append(indep)
+        open_c = leave_open
+        open_hard = False
+        ends_vowel = True
+
+    def put_cluster(text: str, leave_open: bool = True) -> None:
+        # Clusters end in a consonant sound (फ, थ, शन) — the next vowel
+        # attaches as a matra, so they stay open by default (but never
+        # rakar-hard: bathroom's थ must not become थ्र).
+        nonlocal open_c, open_hard, ends_vowel
+        if open_c:
+            out[-1] += "्"
+        out.append(text)
+        open_c = leave_open
+        open_hard = False
+        ends_vowel = False
+
+    i = 0
+    while i < n:
+        for key, sign, indep, stay_open in _PHONETIC_VOWEL:
+            if w.startswith(key, i):
+                put_vowel(sign, indep, stay_open)
+                i += len(key)
+                break
+        else:
+            for key, text in _PHONETIC_CLUSTER:
+                if w.startswith(key, i):
+                    put_cluster(text)
+                    i += len(key)
+                    break
+            else:
+                ch = w[i]
+                nxt = w[i + 1] if i + 1 < n else None
+                # Geminate collapse (butter/taller/dinner -> single), except
+                # pp after an ऐ/ए sound (apple/happy -> प्प).
+                if (ch in _PHONETIC_CONS_LETTERS and nxt == ch
+                        and not (ch == "p" and out and out[-1][-1:] in ("ै", "े", "ऐ", "ए"))):
+                    i += 1
+                    continue
+                if ch == "a":
+                    rest = w[i + 1:]
+                    if _PHONETIC_MAGIC_RE.fullmatch(rest):
+                        put_vowel("े", "ए")
+                    elif i == n - 1:
+                        put_vowel("ा", "आ")  # china/idea/fa
+                    elif w.startswith("all", i) and i > 0:
+                        # call/ball/hall: ॉ attaches (no halant!), then fresh ल.
+                        put_vowel("ॉ", "ऑ")
+                        out.append("ल")
+                        open_c, open_hard, ends_vowel = True, True, False
+                        i += 3
+                        continue
+                    elif w.startswith("all", i):
+                        out.append("अ")  # allow/alley/allergy
+                        i += 1
+                        continue
+                    elif nxt == "x":
+                        put_vowel("ै", "ऐ")  # tax/max/exam
+                    elif w.startswith("tch", i + 1):
+                        put_vowel("ै", "ऐ")  # match/catch/patch/batch
+                    elif nxt == "t" and i + 2 < n and w[i + 2] == "h":
+                        put_vowel("ा", "आ")  # father/bathroom
+                    elif (nxt in _PHONETIC_CONS_LETTERS and i + 2 < n
+                            and w[i + 2] == nxt):
+                        put_vowel("ै", "ऐ")  # happy/battle/matter
+                    elif (nxt in _PHONETIC_CONS_LETTERS and i + 2 < n
+                            and w[i + 2] in _PHONETIC_VOWELS):
+                        put_vowel("े", "ए")  # shake/paper/cable/halo
+                    elif open_c:
+                        open_c, open_hard, ends_vowel = False, False, False  # schwa: inherent अ
+                    else:
+                        out.append("अ")
+                    i += 1
+                    continue
+                if ch == "e":
+                    if i == n - 1 and open_c and n > 2:
+                        open_c, open_hard, ends_vowel = False, False, False  # silent final e
+                    elif w[i:] == "er":
+                        # teacher/butter/water/paper: consume the r too.
+                        if open_c:
+                            out[-1] += "र"
+                            open_c = True
+                        else:
+                            out.append("र")
+                            open_c, open_hard = True, True
+                        i += 2
+                        continue
+                    elif w[i:] == "en":
+                        # pen/men/ten keep ए; garden/button/open take न.
+                        if len(w) <= 4:
+                            put_vowel("े", "ए")
+                            i += 1
+                        else:
+                            out.append("न")
+                            open_c, open_hard = True, True
+                            i += 2
+                        continue
+                    else:
+                        put_vowel("े", "ए")
+                    i += 1
+                    continue
+                if ch == "i":
+                    rest = w[i + 1:]
+                    if _PHONETIC_MAGIC_RE.fullmatch(rest):
+                        put_vowel("ाइ", "आइ")  # fire/tired/wire
+                    elif nxt == "r" and i + 2 < n and w[i + 2] == "r":
+                        put_vowel("ि", "इ")  # mirror
+                    elif nxt == "r" and (i + 2 >= n or w[i + 2] in _PHONETIC_CONS_LETTERS):
+                        if open_c:  # bird/first/girl/sir -> अ
+                            open_c, open_hard, ends_vowel = False, False, False
+                        else:
+                            out.append("अ")
+                    elif i == n - 1:
+                        put_vowel("ी", "ई")
+                    else:
+                        put_vowel("ि", "इ")
+                    i += 1
+                    continue
+                if ch == "o":
+                    if nxt == "x":
+                        put_vowel("ॉ", "ऑ")  # box/fox/oxygen
+                    elif w[i:] == "or":
+                        # mirror/error/terror -> अ (door/floor use oor)
+                        if open_c:
+                            open_c = False
+                        else:
+                            out.append("अ")
+                    else:
+                        put_vowel("ो", "ओ")
+                    i += 1
+                    continue
+                if ch == "u":
+                    rest = w[i + 1:]
+                    if _PHONETIC_MAGIC_RE.fullmatch(rest):
+                        put_vowel("्यू", "यू")  # tube/fire-rule twin
+                    elif nxt == "r" and i + 2 < n and w[i + 2] in _PHONETIC_VOWELS:
+                        put_vowel("ू", "ऊ")  # during/curious
+                    elif i == n - 1:
+                        put_vowel("ू", "ऊ")
+                    else:
+                        if open_c:  # schwa (but/sun/plus/hurry/under)
+                            open_c, open_hard, ends_vowel = False, False, False
+                        else:
+                            out.append("अ")
+                    i += 1
+                    continue
+                if ch == "y":
+                    if i == n - 1 and n >= 3 and w[i - 1] in _PHONETIC_CONS_LETTERS and w[i - 2] in _PHONETIC_CONS_LETTERS:
+                        put_vowel("ाय", "आय")  # fly/cry/dry/sky/spy (city/duty keep ई)
+                    elif i == n - 1:
+                        put_vowel("ी", "ई")
+                    elif i == 0:
+                        put_cons("य", nxt, None)
+                    elif open_c and nxt in _PHONETIC_CONS_LETTERS:
+                        put_vowel("ि", "इ")
+                    elif open_c and nxt in _PHONETIC_VOWELS:
+                        out[-1] += "्य"
+                        open_c, open_hard, ends_vowel = False, False, False
+                    else:
+                        put_cons("य", nxt, None)
+                    i += 1
+                    continue
+                if ch == "r" and open_c and open_hard and nxt in _PHONETIC_VOWELS:
+                    out[-1] += "्र"  # rakar: train, brown, gravity
+                    open_c, open_hard, ends_vowel = False, False, False
+                    i += 1
+                    continue
+                if ch == "l" and w[i:] == "le":
+                    # -ble = ब + ल (two syllables), NOT the ब्ल conjunct:
+                    # break the peek halant the previous consonant carries.
+                    if out and out[-1].endswith("्"):
+                        out[-1] = out[-1][:-1]
+                    out.append("ल")  # table/apple/cable/single
+                    open_c, open_hard = True, True  # final ल carries inherent अ
+                    i += 2
+                    continue
+                if ch == "c":
+                    put_cons("स" if nxt in ("e", "i", "y") else "क", nxt, None)
+                    i += 1
+                    continue
+                if ch == "g":
+                    put_cons("ज" if nxt in ("e", "i") else "ग", nxt, None)
+                    i += 1
+                    continue
+                base = _PHONETIC_CONS.get(ch)
+                if base is None:
+                    i += 1
+                    continue
+                put_cons(base, nxt, None)
+                i += 1
+                continue
+            continue
+    if tail == "ed":
+        if w[-1:] in ("t", "d"):
+            tail = "ेड"  # wanted/started
+        elif w[-1:] in ("s", "x", "z") or w.endswith(("sh", "ch", "th")):
+            tail = "्ड"  # fixed/mixed/matched/washed
+        elif ends_vowel:
+            tail = "ड"  # played/agreed
+        else:
+            tail = ""  # rendered/opened/listened: silent
+    return "".join(out) + tail
+
+
+def _spell_letters(token: str) -> str:
+    """Letter NAMES + spoken digits (true acronyms only: ATP, DNA)."""
+    out = []
+    for ch in token.lower():
+        if ch.isdigit():
+            out.append(_DIGIT_HINDI.get(ch, ch))
+        else:
+            out.append(LATIN_TO_DEVANAGARI.get(ch, ""))
+    return " ".join(o for o in out if o)
+
+
 def _split_identifier(token: str) -> list[str]:
     """Split code identifiers so dict lookup hits words, not spell-outs.
 
@@ -322,56 +686,82 @@ def _split_identifier(token: str) -> list[str]:
     return parts or [token]
 
 
+def _render_word(word: str) -> str:
+    """One alpha word -> Devanagari: glossary/static hit, else phonetic.
+
+    Two micro-rules for subwords (acronym case/shape is decided by caller):
+    - consonant-only pair (js/db/os/tv) -> letter names (जे एस...),
+    - consonant + y pair (my/by) -> ाय (माय, बाय).
+    """
+    low = word.lower()
+    hit = _lookup(low)
+    if hit:
+        return hit
+    if len(word) == 2:
+        first, second = word[0].lower(), word[1].lower()
+        cons = _PHONETIC_CONS_LETTERS - {"y"}
+        if first in cons and second == "y":
+            base = _PHONETIC_CONS.get(first, "")
+            return (base + "ाय") if base else _spell_letters(word)  # my/by
+        if first in cons and second in cons:
+            return _spell_letters(word)  # js/db/os/tv/pm
+    return _phonetic(word)
+
+
+def _render_alpha_num(part: str) -> str:
+    """Render a subword that may glue digits (h1, covid19): words phonetically."""
+    out: list[str] = []
+    for chunk in re.findall(r"[A-Za-z]+|\d+", part):
+        if not chunk:
+            continue
+        if chunk[0].isdigit():
+            out.append(" ".join(_DIGIT_HINDI.get(d, d) for d in chunk))
+        else:
+            out.append(_render_word(chunk))
+    return " ".join(o for o in out if o)
+
+
 def _devanagari_only(text: str) -> str:
     """Rewrite leftover Latin words as Devanagari so speech keeps the Hindi accent.
 
-    Captures trailing digits with the word (h1 -> एच वन, not एचएक): full-token
-    dict hit first, then camelCase-split word hits (getElementById -> गेट
-    एलिमेंट बाय आईडी), else letter NAMES + spoken digits.
+    Lookup order per word: static core -> course glossary -> true-acronym
+    spelling (ATP, dna) -> generic phonetic fallback (photosynthesis ->
+    फोटोसिन्थेसिस). Dotted/camelCase identifiers split first
+    (getElementById -> गेट एलिमेंट बाय आईडी).
     """
     def repl(m):
         token = m.group(0)
+        # Ransom-note case (MiXeD, 3+ flips) is emphasis/typo, not camelCase:
+        # lowercase it so the splitter doesn't shred it into letters.
+        flips = sum(
+            1 for a, b in zip(token, token[1:])
+            if a.isalpha() and b.isalpha()
+            and (a.islower() != b.islower())
+        )
+        if flips > 2:
+            token = token.lower()
         low = token.lower()
-        if low in HINGLISH_TO_DEVANAGARI:
-            return HINGLISH_TO_DEVANAGARI[low]
-        # camelCase / dotted API names: try joint + per-word dict hits before
-        # falling back to letter spelling (the एल ई टी / डी ओ सी यू एम ई एन टी bug).
+        hit = _lookup(low)
+        if hit:
+            return hit
+        # True acronyms: ALL-CAPS token (ATP), vowelless (gps, tv), or
+        # short with only a final 'a' (dna). Everything else is phonetic.
+        alpha = re.sub(r"[^A-Za-z]", "", token)
+        # y does glide duty (my/fly/gym), so it never counts as "vowelless".
+        novowel = alpha and not re.search(r"[aeiouAEIOUYy]", alpha)
+        final_a_only = bool(re.fullmatch(r"[^aeiouAEIOU]*[aA]", alpha))
+        if alpha and (token == token.upper() and any(c.isupper() for c in token)
+                      or (len(alpha) <= 3 and (novowel or final_a_only))):
+            return _spell_letters(token)
+        # camelCase / dotted names: joint hit, else per-part render.
         subwords = _split_identifier(token)
         if len(subwords) > 1:
             joint = "".join(subwords).lower()
-            if joint in HINGLISH_TO_DEVANAGARI:
-                return HINGLISH_TO_DEVANAGARI[joint]
-            spoken: list[str] = []
-            all_known = True
-            for sub in subwords:
-                hit = HINGLISH_TO_DEVANAGARI.get(sub.lower())
-                if hit:
-                    spoken.append(hit)
-                else:
-                    all_known = False
-                    break
-            if all_known:
-                return " ".join(spoken)
-            # mixed: speak known words, spell only the unknown part
-            out_mixed: list[str] = []
-            for sub in subwords:
-                hit = HINGLISH_TO_DEVANAGARI.get(sub.lower())
-                if hit:
-                    out_mixed.append(hit)
-                else:
-                    letters = [
-                        _DIGIT_HINDI.get(ch.lower(), LATIN_TO_DEVANAGARI.get(ch.lower(), ""))
-                        for ch in sub
-                    ]
-                    out_mixed.append(" ".join(o for o in letters if o))
-            return " ".join(o for o in out_mixed if o)
-        out = []
-        for ch in low:
-            if ch.isdigit():
-                out.append(_DIGIT_HINDI.get(ch, ch))
-            else:
-                out.append(LATIN_TO_DEVANAGARI.get(ch, ""))
-        return " ".join(o for o in out if o)
+            hit = _lookup(joint)
+            if hit:
+                return hit
+            return " ".join(_render_alpha_num(s) for s in subwords)
+        return _render_alpha_num(token)
 
     # Match dotted/chained APIs as ONE token so dots don't survive into speech
     # (document.getElementById -> डॉक्यूमेंट गेट एलिमेंट बाय आईडी, not डॉक्यूमेंट.गेट).
