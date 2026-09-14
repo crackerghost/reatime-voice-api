@@ -333,13 +333,18 @@ export default function App() {
     const rawCap = (assistantTextRef.current || "").slice(-160);
     const cap = normCaption(rawCap);
     const now = Date.now();
+    // Speech-progress release: if the paced queue already drained, the voice
+    // has moved past these elements — release aged waits (>2.5s) in staged
+    // order so the board tracks speech instead of dumping at the 8s clock.
+    const queueEmpty = revealQueueRef.current.length === 0;
     const ready = [];
     waitingRef.current = waitingRef.current.filter((w) => {
       const t = (w.el?.trigger || "").toLowerCase().trim();
       const th = (w.el?.trigger_hi || "").trim();
       const hitEn = t && cap && cap.includes(t);
       const hitHi = th && rawCap && rawCap.includes(th);
-      if (force || !t && !th || hitEn || hitHi || now - w.stagedAt > 8000) {
+      const age = now - w.stagedAt;
+      if (force || !t && !th || hitEn || hitHi || age > 8000 || (queueEmpty && age > 2500)) {
         ready.push(w.el);
         return false;
       }
@@ -349,11 +354,11 @@ export default function App() {
       revealQueueRef.current.push(...ready);
       if (!revealTimerRef.current) revealNext();
     }
-    // Backstop: items still waiting have a future 8s deadline but no timer
-    // is running to enforce it — schedule a sweep so they can't strand.
+    // Backstop: items still waiting have a future 2.5s speech-progress
+    // release but no timer is running to enforce it — schedule a sweep.
     if (waitingRef.current.length && !revealTimerRef.current) {
       const oldest = Math.min(...waitingRef.current.map((w) => w.stagedAt));
-      const delay = Math.max(500, Math.min(8000 - (Date.now() - oldest), 8000));
+      const delay = Math.max(400, Math.min(2500 - (Date.now() - oldest), 2500));
       revealTimerRef.current = setTimeout(revealNext, delay);
     }
   };
@@ -404,12 +409,24 @@ export default function App() {
     }
     const el = revealQueueRef.current.shift();
     if (!el) {
-      // Queue drained but trigger-waits remain: keep polling until their
-      // 8s deadline fires — otherwise steps strand as a blank page.
+      // Queue drained but trigger-waits remain: speech has moved past them —
+      // release aged waits (>2.5s) in order so the board tracks the voice
+      // instead of stranding as a blank page or dumping at the 8s clock.
       if (waitingRef.current.length) {
-        const oldest = Math.min(...waitingRef.current.map((w) => w.stagedAt));
-        const delay = Math.max(500, Math.min(8000 - (Date.now() - oldest), 8000));
-        revealTimerRef.current = setTimeout(revealNext, delay);
+        const now = Date.now();
+        const due = [];
+        waitingRef.current = waitingRef.current.filter((w) => {
+          if (now - w.stagedAt > 2500) { due.push(w.el); return false; }
+          return true;
+        });
+        if (due.length) {
+          revealQueueRef.current.push(...due);
+          revealTimerRef.current = setTimeout(revealNext, REVEAL_MS);
+        } else {
+          const oldest = Math.min(...waitingRef.current.map((w) => w.stagedAt));
+          const delay = Math.max(400, Math.min(2500 - (Date.now() - oldest), 2500));
+          revealTimerRef.current = setTimeout(revealNext, delay);
+        }
       } else {
         revealTimerRef.current = 0;
       }

@@ -73,7 +73,7 @@ HINGLISH_TO_DEVANAGARI = {
     "json": "जेसन", "java": "जावा", "python": "पायथन",
     "javascript": "जावास्क्रिप्ट", "linux": "लिनक्स", "whatsapp": "व्हाट्सऐप",
     "github": "गिटहब", "git": "गिट", "openai": "ओपन एआई",
-    "chatgpt": "चैटजीपीटी", "youtube": "यूट्यूब", "android": "एंड्रॉइड",
+    "react": "रीऐक्ट", "reactjs": "रीऐक्ट जेएस",    "chatgpt": "चैटजीपीटी", "youtube": "यूट्यूब", "android": "एंड्रॉइड",
     "npm": "एनपीएम", "aws": "एडब्ल्यूएस", "kaggle": "कैगल",
     # everyday words that slip through as Latin — say them, don't spell them
     "markup": "मार्कअप", "language": "लैंग्वेज", "languages": "लैंग्वेजेस",

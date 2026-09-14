@@ -798,7 +798,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 "turn_id": diagram_ctx.get("turn_id", ""),
                 "client_turn_id": diagram_ctx.get("client_turn_id", ""),
             }))
-            _labels = [str(e.get("text", ""))[:28] for e in d["elements"] if e.get("type") != "arrow"][:4]
+            _labels = [str(e.get("text", "") or e.get("code", "") or e.get("type", ""))[:28] for e in d["elements"] if e.get("type") != "arrow"][:4]
             log.info("Diagram watcher: window #%d -> %d element(s) [%s]", n, len(d["elements"]), " | ".join(_labels))
         except Exception as e:  # noqa: BLE001 — board must never break voice
             log.warning("Diagram watcher window #%d skipped: %s", n, e)

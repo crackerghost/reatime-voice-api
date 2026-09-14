@@ -284,15 +284,31 @@ export default function TutorBoard({
   const total = steps?.length || 0;
 
   // Viewport follows the freshly drawn element (live mode only).
+  // Container-local scrolling ONLY — scrollIntoView() climbs into the
+  // document and drags the whole page (notch/calendar get cut off).
+  const scrollNodeIntoView = (node, align = "center") => {
+    const box = scrollRef.current;
+    if (!box || !node) return;
+    try {
+      let target;
+      if (node.offsetTop !== undefined && node.offsetParent !== null) {
+        target = align === "start"
+          ? node.offsetTop - 8
+          : node.offsetTop - box.clientHeight / 2 + node.clientHeight / 2;
+      } else {
+        // SVG nodes have no offsetTop — use rect math instead.
+        const r = node.getBoundingClientRect(), b = box.getBoundingClientRect();
+        target = box.scrollTop + (r.top - b.top)
+          - (align === "start" ? 8 : box.clientHeight / 2 - r.height / 2);
+      }
+      if (Number.isFinite(target)) box.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+    } catch { /* noop */ }
+  };
   useEffect(() => {
     if (!followLive || !focus?.ids?.length) return;
     const id = focus.ids[0];
     const node = elRefs.current.get(id);
-    if (node && typeof node.scrollIntoView === "function") {
-      try {
-        node.scrollIntoView({ behavior: "smooth", block: "center" });
-      } catch { /* noop */ }
-    }
+    if (node) scrollNodeIntoView(node, "center");
     // Glide the tutor pen to the drawn element.
     const pen = penRef.current, box = scrollRef.current;
     if (pen && box && node) {
@@ -310,11 +326,7 @@ export default function TutorBoard({
     onStep && onStep(clamped);
     requestAnimationFrame(() => {
       const node = scrollRef.current?.querySelector?.(`[data-step="${clamped}"]`);
-      if (node && typeof node.scrollIntoView === "function") {
-        try {
-          node.scrollIntoView({ behavior: "smooth", block: "start" });
-        } catch { /* noop */ }
-      }
+      if (node) scrollNodeIntoView(node, "start");
     });
   };
 
@@ -372,7 +384,7 @@ export default function TutorBoard({
         />
       </div>
 
-      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto px-3 py-3">
+      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-3">
         {/* Tutor pen: glides to each freshly drawn element. */}
         <div
           ref={penRef}
