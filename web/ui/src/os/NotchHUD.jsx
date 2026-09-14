@@ -17,15 +17,15 @@ const AURA_BG =
   "radial-gradient(circle at 70% 25%, #c4b5fd 0%, transparent 50%)," +
   "conic-gradient(from 120deg, #ff5a5f, #b388ff, #67e8f9, #ff8fab, #ff5a5f)";
 
-function statusOf({ connected, listening, speaking, typing, userTalking, asrReady }) {
+function statusOf({ connected, listening, speaking, turnActive, typing, userTalking, asrReady }) {
   if (typing) return "Thinking…";
-  if (speaking) return "Speaking…";
+  if (speaking || turnActive) return "Speaking…";
   if (listening) return !asrReady ? "Warming up…" : userTalking ? "Hearing you…" : "Listening…";
   return connected ? "Ready" : "Connecting…";
 }
 
 export default function NotchHUD({
-  connected, speaking, listening, userTalking, typing,
+  connected, speaking, turnActive, listening, userTalking, typing,
   interim, input, setInput, sendText,
   onToggleMic, onStop, onShareDown, onShareUp, sharing, visionEnabled,
   llmProvider, llmProviders, llmModels, onProvider,
@@ -37,7 +37,7 @@ export default function NotchHUD({
   const orbRef = useRef(null);
   const miniRef = useRef(null);
   const open = pinned || hover || focused;
-  const status = statusOf({ connected, listening, speaking, typing, userTalking, asrReady });
+  const status = statusOf({ connected, listening, speaking, turnActive, typing, userTalking, asrReady });
   const providers = Array.isArray(llmProviders) && llmProviders.length ? llmProviders : ["groq"];
 
   // Live aura: same voice-driven motion as the old gradient, heavy low-pass
@@ -60,11 +60,19 @@ export default function NotchHUD({
       lvl += (raw - lvl) * 0.06;
       const t = performance.now() / 1000;
       const breathe = Math.sin(t * 2.1) * 0.05;
-      for (const el of [orbRef.current, miniRef.current]) {
-        if (!el) continue;
+      // Panel orb gets the full motion; the mini notch orb is capped so it
+      // never outgrows the pill's padding (no top/bottom clipping).
+      const orb = orbRef.current;
+      if (orb) {
         const s = 1 + lvl * 0.85 + breathe;
-        el.style.transform = `scale(${s.toFixed(3)}) rotate(${(t * 14).toFixed(1)}deg)`;
-        el.style.opacity = active ? String(Math.min(1, 0.75 + lvl * 0.25)) : "0.6";
+        orb.style.transform = `scale(${s.toFixed(3)}) rotate(${(t * 14).toFixed(1)}deg)`;
+        orb.style.opacity = active ? String(Math.min(1, 0.75 + lvl * 0.25)) : "0.6";
+      }
+      const mini = miniRef.current;
+      if (mini) {
+        const s = 1 + lvl * 0.32 + breathe * 0.5;
+        mini.style.transform = `scale(${s.toFixed(3)}) rotate(${(t * 14).toFixed(1)}deg)`;
+        mini.style.opacity = active ? String(Math.min(1, 0.75 + lvl * 0.25)) : "0.6";
       }
       raf = requestAnimationFrame(draw);
     };
@@ -89,9 +97,9 @@ export default function NotchHUD({
           onMouseEnter={() => setHover(true)}
           aria-label={open ? "Collapse tutor" : "Expand tutor"}
           aria-expanded={open}
-          className="pointer-events-auto flex h-8 w-60 items-center gap-2.5 rounded-b-xl bg-black/95 px-4 shadow-[0_10px_36px_rgba(0,0,0,0.45)] backdrop-blur transition hover:bg-black"
+          className="pointer-events-auto flex h-8 w-72 items-center gap-2.5 overflow-visible rounded-b-md bg-black/95 px-4 shadow-[0_10px_36px_rgba(0,0,0,0.45)] backdrop-blur transition hover:bg-black"
         >
-          <span className="relative flex h-5 w-5 shrink-0 items-center justify-center overflow-visible">
+          <span className="relative flex h-6 w-6 shrink-0 items-center justify-center overflow-visible p-0.5">
             <span
               ref={miniRef}
               className="block h-5 w-5 rounded-full"

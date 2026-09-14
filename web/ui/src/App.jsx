@@ -93,6 +93,7 @@ export default function App() {
   const [interim, setInterim] = useState("");
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
+  const [turnActive, setTurnActive] = useState(false); // a reply is owed/playing: steady "Speaking" label
   const [sharing, setSharing] = useState(false); // push-to-see capture active (button held)
   const [diagram, setDiagram] = useState(null);
   // ---- LLM provider: groq | deepseek (per-turn toggle, persisted) ----
@@ -699,6 +700,7 @@ export default function App() {
     }
     speakingRef.current = false;
     setSpeaking(false);
+    setTurnActive(false);
   }, []);
 
   /* ---- push-to-see: hold X (or the screen button) → capture → describe →
@@ -1246,6 +1248,7 @@ export default function App() {
             drainRestartRef.current = false;
             drainStartedRef.current = false;
             setTyping(false);
+            setTurnActive(true); // reply owed: notch shows Speaking until done/error
             // Mark the reply "speaking" from the START of the stream, not
             // when the first sample plays. The mic echo-gates and the server
             // VAD assistant-gate key off this flag; during the jitter-buffer
@@ -1335,12 +1338,14 @@ export default function App() {
             }
             pendingRef.current = [];
             showError("बोलने में त्रुटि: " + m.message);
+            setTurnActive(false);
           } else if (m.type === "done") {
             if (dropRef.current) {
               // closing done of the reply we interrupted — discard silently
               openAssistantId.current = null;
               assistantTextRef.current = "";
               activeRef.current = false;
+              setTurnActive(false);
               return;
             }
             console.info(
@@ -1363,6 +1368,7 @@ export default function App() {
             assistantTextRef.current = "";
             openAssistantId.current = null;
             activeRef.current = false;
+            setTurnActive(false); // stream over — Speaking label now follows playback only
             // Reply stream is complete — if the jitter buffer is still holding
             // frames (never reached jitterFrames), start playback NOW so the
             // tail isn't stranded silent until the next turn.
@@ -2408,6 +2414,7 @@ export default function App() {
       <NotchHUD
         connected={connected}
         speaking={speaking}
+        turnActive={turnActive}
         listening={listening}
         userTalking={userTalking}
         typing={typing}
