@@ -23,7 +23,7 @@ DIAGRAM_TOOL = {
     "type": "function",
     "function": {
         "name": "draw_flowchart_or_diagram",
-        "description": "Render concise concept nodes, notes, and connecting arrows on the whiteboard.",
+        "description": "Render concise concept nodes, notes, code snippets, and connecting arrows on the whiteboard.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -34,12 +34,16 @@ DIAGRAM_TOOL = {
                         "type": "object",
                         "properties": {
                             "id": {"type": "string"},
-                            "type": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "text", "arrow"]},
+                            "type": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "text", "arrow", "code", "note"]},
                             "x": {"type": "number"},
                             "y": {"type": "number"},
                             "width": {"type": "number"},
                             "height": {"type": "number"},
                             "text": {"type": "string"},
+                            "code": {"type": "string", "description": "Short exact code snippet (max ~10 lines) for type=code."},
+                            "language": {"type": "string", "description": "Code label, e.g. HTML, JS, python."},
+                            "side": {"type": "string", "enum": ["left", "right"], "description": "Compare steps only (X vs Y): which column this node belongs to."},
+                            "tone": {"type": "string", "enum": ["core", "example", "warn"], "description": "Semantic color: core concept, example, warning/mistake."},
                             "backgroundColor": {"type": "string"},
                             "startNodeId": {"type": "string"},
                             "endNodeId": {"type": "string"},
@@ -53,6 +57,7 @@ DIAGRAM_TOOL = {
                         # startNodeId/endNodeId (server computes their geometry),
                         # and Groq 400-rejects the whole call when the LLM omits
                         # arrow coordinates — the top planner failure in prod logs.
+                        # code/note need no coordinates (rendered as blocks below).
                         "required": ["id", "type"],
                     },
                 },
@@ -116,14 +121,23 @@ def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
                 "almost always helps grounding. Return no tool call ONLY for pure "
                 "greetings, bare yes/no answers with no explanation, unstructured "
                 "opinions, jokes, or meta talk. When drawing, return a draw_flowchart_or_diagram "
-                "tool call with 3-6 nodes plus arrows for THIS step only. Labels may "
-                "explain, not just name — up to ~15 words per node when the meaning "
-                "needs it (e.g. 'h1-h6 tags: headings, h1 biggest'). Size width to "
-                "fit the text (long text = width 300-500). Every rectangle/ellipse/"
-                "diamond MUST carry non-empty "
+                "tool call for THIS step only, mixing whatever explains best: "
+                "3-6 compact nodes with arrows, PLUS at most ONE short code "
+                "snippet (type=code, exact code/tags as-is, max ~10 lines, with "
+                "a language label) when the step shows code, and at most ONE "
+                "one-line takeaway (type=note) for the key insight. Use type=text "
+                "for free-floating annotations (no box). Labels are SHORT — max "
+                "5-6 words per node (e.g. 'h1-h6: headings, h1 biggest'). "
+                "COMPARISONS (X vs Y, differences, before/after, right/wrong): "
+                "set side=left on every X node and side=right on every Y node, "
+                "with NO arrows crossing sides — the board renders two columns "
+                "with a VS divider. TONE every node: core = the key concept, "
+                "example = an illustration, warn = a common mistake — the board "
+                "colors them coral / teal / amber so importance reads instantly."
+                "Every rectangle/ellipse/diamond MUST carry non-empty "
                 "text naming the concrete thing from the STEP (tag names, file names, "
                 "exact terms — never blank labels). Language rule: the BOARD is "
-                "always ENGLISH — short English labels (max 6 words), code/tag/ "
+                "always ENGLISH — short English labels, code/tag/ "
                 "attribute/file names exactly as-is (HTML, h1, href, index.html). "
                 "Never Devanagari on the board; Hindi is voice-only. "
                 "Node ids: ASCII ONLY (a-z, 0-9, hyphen), prefixed with the given "
@@ -133,11 +147,10 @@ def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
                 "'computer'; 'query selector' -> 'query selector'). The board "
                 "draws each element the instant the tutor speaks its trigger, "
                 "so triggers must be words the STEP actually says. Shapes give x/y/width/height; ARROWS give ONLY id, type, "
-                "startNodeId, endNodeId — never x/y on arrows. Layout is dynamic "
-                "per step: top-to-bottom flow for sequences/processes "
-                "(x ~80..400, y growing), side-by-side for comparisons "
-                "(x spread 80..640). Shapes: rectangle = component/step, "
-                "ellipse = start/end, diamond = decision, arrow = flow."
+                "startNodeId, endNodeId — never x/y on arrows; code/note give "
+                "ONLY id, type, text/code (+language) — never x/y. Shapes: "
+                "rectangle = component/step, ellipse = start/end, "
+                "diamond = decision, text = free annotation, arrow = flow."
             ),
         },
         {"role": "user", "content": f"TAG: {tag}\nTOPIC: {topic[:200]}\nSTEP: {step_text[:600]}"},
@@ -345,41 +358,58 @@ def generate_for_step(
                 if item.get("endNodeId") in nodes:
                     item["endNodeId"] = nodes[item["endNodeId"]]
         # Blank-label nodes render as empty boxes — worse than no board. Drop
-        # shapes with no text, then re-drop arrows left dangling by that.
+        # shapes with no text (code/note survive on snippet/takeaway), then
+        # re-drop arrows left dangling by that.
         out = [it for it in out
-               if it["type"] == "arrow" or str(it.get("text", "")).strip()]
-        keep = {it["id"] for it in out if it["type"] != "arrow"}
+               if it["type"] == "arrow"
+               or str(it.get("text", "")).strip()
+               or (it["type"] == "code" and str(it.get("code", "")).strip())]
+        keep = {it["id"] for it in out if it["type"] in {"rectangle", "ellipse", "diamond", "text"}}
         out = [it for it in out
                if it["type"] != "arrow"
                or (it.get("startNodeId") in keep and it.get("endNodeId") in keep)]
-        if not any(it["type"] != "arrow" for it in out):
+        if not any(it["type"] in {"rectangle", "ellipse", "diamond", "text", "code", "note"} for it in out):
             return None
-        # Deterministic layout: model coordinates are NOT trusted (prod boards
-        # showed boxes piled on top of each other). Each window gets its own
-        # band; shapes stack top-to-bottom inside it, sized to their label, so
-        # batches can never overlap and paced reveal always draws downward.
-        # Wrap every 4 windows into a new column to bound viewport growth.
-        try:
-            win_n = int(id_prefix.lstrip("w") or 1)
-        except ValueError:
-            win_n = 1
-        row = (win_n - 1) % 4
-        col = (win_n - 1) // 4
-        base_x = 80 + col * 560
-        base_y = 80 + row * 950
-        shapes = [it for it in out if it["type"] != "arrow"]
+        # Deterministic COMPACT layout: model coordinates are NOT trusted
+        # (prod boards showed boxes piled on top of each other). Each step is
+        # its own SVG (own viewBox), so coordinates only arrange shapes
+        # WITHIN the step: left-to-right flow with wrapping — 4-6 compact
+        # nodes fit one screen instead of one giant vertical stack.
+        # Compare steps (side=left/right on both sides) get two columns with
+        # a VS divider; unsided shapes flow full-width underneath.
+        def _size(item):
+            label = str(item.get("text", ""))
+            if item["type"] == "text":
+                return max(120, min(520, 90 + 7.5 * len(label))), 30
+            return max(150, min(300, 120 + 7 * len(label))), (68 if item["type"] == "diamond" else 60)
+
+        def _flow(items, x0, y0, width, gap_x=40, gap_y=52):
+            x, y, row_h = float(x0), float(y0), 0.0
+            for item in items:
+                w, h = _size(item)
+                if x + w > x0 + width and x > x0:
+                    x, y, row_h = float(x0), y + row_h + gap_y, 0.0  # wrap row
+                item["width"], item["height"] = w, h
+                item["x"] = max(-2000, min(2000, x))
+                item["y"] = max(-2000, min(2000, y))
+                x += w + gap_x
+                row_h = max(row_h, float(h))
+            return y + row_h  # bottom edge of the laid-out block
+
+        shapes = [it for it in out if it["type"] in {"rectangle", "ellipse", "diamond", "text"}]
         try:
             shapes.sort(key=lambda it: (float(it.get("y", 80)), float(it.get("x", 80))))
         except (TypeError, ValueError):
             pass
-        cy = float(base_y)
-        for item in shapes:
-            label = str(item.get("text", ""))
-            item["width"] = max(180, min(460, 140 + 8 * len(label)))
-            item["height"] = 96 if item["type"] == "diamond" else 84
-            item["x"] = max(-2000, min(2000, float(base_x)))
-            item["y"] = max(-2000, min(2000, cy))
-            cy += float(item["height"]) + 66
+        left = [s for s in shapes if s.get("side") == "left"]
+        right = [s for s in shapes if s.get("side") == "right"]
+        center = [s for s in shapes if not s.get("side")]
+        if left and right:
+            bottom = max(_flow(left, 40, 40, 480), _flow(right, 600, 40, 480))
+            if center:
+                _flow(center, 40, bottom + 48, 1040)
+        else:
+            _flow(shapes, 40, 40, 1040)
         boxes = {
             it["id"]: (it["x"], it["y"], it["width"], it["height"]) for it in shapes
         }
@@ -441,7 +471,7 @@ def _arrow_geometry(item: dict, boxes: dict[str, tuple]) -> None:
 def normalize(raw: object) -> dict | None:
     if not isinstance(raw, dict) or not isinstance(raw.get("elements"), list):
         return None
-    allowed = {"rectangle", "ellipse", "diamond", "text", "arrow"}
+    allowed = {"rectangle", "ellipse", "diamond", "text", "arrow", "code", "note"}
     elements = []
     seen = set()
     for item in raw["elements"][:DIAGRAM_MAX_ELEMENTS]:
@@ -463,8 +493,23 @@ def normalize(raw: object) -> dict | None:
                 normalized[key] = max(40, min(600, float(item.get(key, default))))
             except (TypeError, ValueError):
                 normalized[key] = default
-        if item_type in {"rectangle", "ellipse", "diamond", "text"}:
-            normalized["text"] = _board_text(item.get("text", ""))[:DIAGRAM_MAX_TEXT]
+        if item_type in {"rectangle", "ellipse", "diamond", "text", "code", "note"}:
+            cap = 600 if item_type == "code" else (140 if item_type == "note" else DIAGRAM_MAX_TEXT)
+            normalized["text"] = _board_text(item.get("text", ""))[:cap]
+            side = str(item.get("side", "")).strip().lower()[:8]
+            if side in ("left", "right"):
+                normalized["side"] = side
+            tone = str(item.get("tone", "")).strip().lower()[:8]
+            if tone in ("core", "example", "warn"):
+                normalized["tone"] = tone
+            if item_type == "code":
+                # Exact snippet, Devanagari-stripped text stays in "text" too.
+                snippet = str(item.get("code", "") or "").strip()[:600]
+                if snippet:
+                    normalized["code"] = snippet
+                lang = re.sub(r"[^A-Za-z0-9#+_-]", "", str(item.get("language", ""))).strip()[:16]
+                if lang:
+                    normalized["language"] = lang
             trigger = re.sub(r"[^A-Za-z0-9 ]+", "", str(item.get("trigger", ""))).strip()[:60]
             if trigger:
                 normalized["trigger"] = trigger
@@ -489,7 +534,7 @@ def normalize(raw: object) -> dict | None:
     boxes = {
         item["id"]: (item["x"], item["y"], item["width"], item["height"])
         for item in elements
-        if item["type"] != "arrow" and str(item.get("text", "")).strip()
+        if item["type"] in {"rectangle", "ellipse", "diamond", "text"} and str(item.get("text", "")).strip()
     }
     for item in elements:
         # Arrow geometry is computed HERE from the endpoint boxes — never
@@ -498,15 +543,13 @@ def normalize(raw: object) -> dict | None:
         if item["type"] == "arrow":
             _arrow_geometry(item, boxes)
     nodes = set(boxes)
-    elements = [
-        item for item in elements
-        if (item["type"] != "arrow" and str(item.get("text", "")).strip())
-        or (
-            item["type"] == "arrow"
-            and item.get("startNodeId") in nodes
-            and item.get("endNodeId") in nodes
-        )
-    ]
+    def _kept(item):
+        if item["type"] == "arrow":
+            return item.get("startNodeId") in nodes and item.get("endNodeId") in nodes
+        if item["type"] in ("code", "note"):
+            return bool(str(item.get("text", "")).strip() or str(item.get("code", "")).strip())
+        return bool(str(item.get("text", "")).strip())
+    elements = [item for item in elements if _kept(item)]
     return {"elements": elements} if elements else None
 
 

@@ -14,9 +14,9 @@ import { BOARD_THEME as T } from "./boardTheme.js";
    - followLive, onJumpLive(): resume auto-follow at the newest step.
 */
 
-const DRAW_MS = 900; // stroke-draw animation per shape
+const DRAW_MS = 650; // stroke-draw animation per shape
 
-function StepDiagram({ elements }) {
+function StepDiagram({ elements, focusIds }) {
   const shapes = useMemo(
     () => (elements || []).filter((e) => e && e.type !== "arrow" && (e.text || "").trim()),
     [elements],
@@ -28,14 +28,14 @@ function StepDiagram({ elements }) {
   const box = useMemo(() => {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const e of [...shapes, ...arrows]) {
-      const w = Number(e.width) || 180, h = Number(e.height) || 84;
+      const w = Number(e.width) || 180, h = Number(e.height) || 60;
       minX = Math.min(minX, Number(e.x) || 0);
       minY = Math.min(minY, Number(e.y) || 0);
       maxX = Math.max(maxX, (Number(e.x) || 0) + w);
       maxY = Math.max(maxY, (Number(e.y) || 0) + h);
     }
     if (!isFinite(minX)) return null;
-    const pad = 24;
+    const pad = 20;
     return {
       x: minX - pad, y: minY - pad,
       w: maxX - minX + pad * 2, h: maxY - minY + pad * 2,
@@ -43,16 +43,35 @@ function StepDiagram({ elements }) {
   }, [shapes, arrows]);
 
   const byId = useMemo(() => new Map(shapes.map((s) => [s.id, s])), [shapes]);
+  const hot = useMemo(() => new Set(focusIds || []), [focusIds]);
+  // Compare steps (side=left/right): a VS divider between the columns.
+  const divider = useMemo(() => {
+    let lMax = -Infinity, rMin = Infinity;
+    for (const s of shapes) {
+      if (s.side === "left") lMax = Math.max(lMax, (Number(s.x) || 0) + (Number(s.width) || 0));
+      if (s.side === "right") rMin = Math.min(rMin, Number(s.x) || 0);
+    }
+    return isFinite(lMax) && isFinite(rMin) && rMin > lMax ? (lMax + rMin) / 2 : null;
+  }, [shapes]);
   if (!box) return null;
 
-  const drawStyle = {
-    fill: T.primarySoft,
-    stroke: T.ink,
-    strokeWidth: 2.5,
-    pathLength: 1,
-    strokeDasharray: 1,
-    strokeDashoffset: 1,
-    animation: `tutor-draw ${DRAW_MS}ms ease-out forwards`,
+  const toneOf = (s) => T.tones?.[s?.tone] || T.tones.core;
+  const drawStyleFor = (s) => {
+    const tone = toneOf(s);
+    return {
+      fill: tone.fill,
+      stroke: tone.stroke,
+      strokeWidth: 2,
+      pathLength: 1,
+      strokeDasharray: 1,
+      strokeDashoffset: 1,
+      animation: `tutor-draw ${DRAW_MS}ms ease-out forwards`,
+    };
+  };
+  const hotExtra = {
+    stroke: T.primary,
+    strokeWidth: 2.75,
+    filter: `drop-shadow(0 0 7px ${T.primary}66)`,
   };
 
   return (
@@ -62,25 +81,50 @@ function StepDiagram({ elements }) {
       role="img"
       aria-label="Lesson diagram"
     >
-      <style>{`@keyframes tutor-draw { to { stroke-dashoffset: 0; } }`}</style>
+      <style>{`@keyframes tutor-draw { to { stroke-dashoffset: 0; } }
+@keyframes tutor-fadein { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+@keyframes tutor-flow { to { stroke-dashoffset: -0.105; } }
+@keyframes tutor-pop { 0% { opacity: 0; transform: scale(0.92); } 60% { opacity: 1; transform: scale(1.015); } 100% { opacity: 1; transform: scale(1); } }`}</style>
       {shapes.map((s) => {
-        const w = Number(s.width) || 180, h = Number(s.height) || 84;
+        const w = Number(s.width) || 180, h = Number(s.height) || 60;
         const label = String(s.text || "");
-        const fs = Math.max(12, Math.min(17, w / Math.max(8, label.length * 0.62)));
+        const isHot = hot.has(s.id);
+        // Free-floating annotation: no box, just elegant text (tone-tinted).
+        if (s.type === "text")
+          return (
+            <g key={s.id} style={{ animation: `tutor-fadein 450ms ease both` }}>
+              <text
+                x={s.x} y={s.y + 20}
+                fontSize={14.5} fontWeight={650}
+                fill={s.tone && s.tone !== "core" ? toneOf(s).stroke : T.inkSoft}
+                style={isHot ? { filter: `drop-shadow(0 0 6px ${T.primary}66)` } : undefined}
+              >
+                {label}
+              </text>
+            </g>
+          );
+        const fs = Math.max(11, Math.min(13.5, w / Math.max(8, label.length * 0.62)));
         const labelEl = (
           <text
             x={s.x + w / 2} y={s.y + h / 2}
             textAnchor="middle" dominantBaseline="central"
             fontSize={fs} fontWeight={600} fill={T.ink}
-            style={{ animation: `tutor-fadein 500ms ease ${DRAW_MS}ms both` }}
+            style={{ animation: `tutor-fadein 400ms ease ${DRAW_MS}ms both` }}
           >
-            {label.length > 42 ? label.slice(0, 41) + "…" : label}
+            {label.length > 40 ? label.slice(0, 39) + "…" : label}
           </text>
         );
+        const gStyle = {
+          ...drawStyleFor(s),
+          ...(isHot ? hotExtra : null),
+          transformBox: "fill-box",
+          transformOrigin: "center",
+          animation: `tutor-draw ${DRAW_MS}ms ease-out forwards, tutor-pop 350ms ease ${DRAW_MS}ms both`,
+        };
         if (s.type === "ellipse")
           return (
             <g key={s.id}>
-              <ellipse cx={s.x + w / 2} cy={s.y + h / 2} rx={w / 2} ry={h / 2} style={drawStyle} />
+              <ellipse cx={s.x + w / 2} cy={s.y + h / 2} rx={w / 2} ry={h / 2} style={gStyle} />
               {labelEl}
             </g>
           );
@@ -88,18 +132,32 @@ function StepDiagram({ elements }) {
           const pts = `${s.x + w / 2},${s.y} ${s.x + w},${s.y + h / 2} ${s.x + w / 2},${s.y + h} ${s.x},${s.y + h / 2}`;
           return (
             <g key={s.id}>
-              <polygon points={pts} style={{ ...drawStyle, stroke: T.primary }} />
+              <polygon points={pts} style={gStyle} />
               {labelEl}
             </g>
           );
         }
         return (
           <g key={s.id}>
-            <rect x={s.x} y={s.y} width={w} height={h} rx={T.radius} style={drawStyle} />
+            <rect x={s.x} y={s.y} width={w} height={h} rx={T.radius} style={gStyle} />
             {labelEl}
           </g>
         );
       })}
+      {divider != null && (
+        <g aria-hidden="true">
+          <line
+            x1={divider} y1={box.y + 6} x2={divider} y2={box.y + box.h - 6}
+            stroke={T.faint} strokeWidth={1.5} strokeDasharray="5 5" opacity={0.8}
+          />
+          <g transform={`translate(${divider}, ${box.y + box.h / 2})`}>
+            <rect x={-19} y={-12} width={38} height={24} rx={12} fill={T.ink} />
+            <text textAnchor="middle" dominantBaseline="central" fontSize={11} fontWeight={800} fill="#fff">
+              VS
+            </text>
+          </g>
+        </g>
+      )}
       {arrows.map((a) => {
         if (!byId.get(String(a.startNodeId || "")) || !byId.get(String(a.endNodeId || ""))) return null;
         const [[x1, y1], [x2, y2]] = a.points;
@@ -113,21 +171,38 @@ function StepDiagram({ elements }) {
             </defs>
             <polyline
               points={`${a.x + x1},${a.y + y1} ${a.x + x2},${a.y + y2}`}
-              fill="none" stroke={T.primary} strokeWidth={2.5}
+              fill="none" stroke={T.primary} strokeWidth={2.25}
               markerEnd={`url(#${id})`}
-              pathLength={1} strokeDasharray={1} strokeDashoffset={1}
-              style={{ animation: `tutor-draw ${DRAW_MS}ms ease-out forwards` }}
+              pathLength={1} strokeDasharray="0.06 0.045" strokeDashoffset={1}
+              style={{ animation: `tutor-draw ${DRAW_MS}ms ease-out forwards, tutor-flow 1.15s linear ${DRAW_MS + 50}ms infinite` }}
             />
           </g>
         );
       })}
-      <style>{`@keyframes tutor-fadein { from { opacity: 0; } to { opacity: 1; } }`}</style>
     </svg>
   );
 }
 
-function CodeBlock({ block }) {
+function CodeBlock({ block, caption }) {
   const code = String(block.code || block.text || "");
+  const lines = useMemo(() => code.split("\n"), [code]);
+  // Karaoke: the line whose code-ish tokens best match the spoken caption
+  // (what the tutor is explaining RIGHT NOW) glows. Recomputes as the
+  // caption streams in — no protocol change needed.
+  const hotLine = useMemo(() => {
+    if (!caption) return -1;
+    const cap = String(caption).toLowerCase();
+    let best = -1, bestScore = 0;
+    lines.forEach((ln, i) => {
+      const raw = ln.match(/[A-Za-z_][A-Za-z0-9_#.]*|\d+/g) || [];
+      const toks = [...new Set(raw.map((t) => t.toLowerCase()))]
+        .filter((t, k) => /[0-9_#.]/.test(raw[k]) || raw[k].length >= 7 || /[A-Z]/.test(raw[k]));
+      let s = 0;
+      for (const t of toks) if (t.length >= 2 && cap.includes(t)) s += t.length >= 6 ? 2 : 1;
+      if (s > bestScore) { bestScore = s; best = i; }
+    });
+    return bestScore > 0 ? best : -1;
+  }, [lines, caption]);
   return (
     <div className="overflow-hidden rounded-xl shadow-sm" style={{ background: T.codeBg }}>
       <div className="flex items-center gap-2 px-3.5 py-2" style={{ borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
@@ -135,12 +210,28 @@ function CodeBlock({ block }) {
         <span className="text-[0.68rem] font-bold tracking-[0.1em] uppercase" style={{ color: T.faint }}>
           {block.language || "code"}
         </span>
+        {hotLine >= 0 && (
+          <span className="ml-auto text-[0.62rem] font-bold tracking-wider uppercase" style={{ color: T.primary }}>
+            ◉ line {hotLine + 1}
+          </span>
+        )}
       </div>
       <pre
-        className="overflow-x-auto px-3.5 py-3 font-mono text-[0.8rem] leading-6 whitespace-pre"
+        className="overflow-x-auto py-2 font-mono text-[0.8rem] leading-6"
         style={{ color: T.codeInk }}
       >
-        {code}
+        {lines.map((ln, i) => (
+          <div
+            key={i}
+            className="flex whitespace-pre transition-colors duration-300"
+            style={i === hotLine
+              ? { background: `${T.primary}22`, boxShadow: `inset 3px 0 0 ${T.primary}` }
+              : undefined}
+          >
+            <span className="w-9 shrink-0 pr-2 text-right select-none" style={{ color: "#475569" }}>{i + 1}</span>
+            <span className="pr-3.5">{ln || " "}</span>
+          </div>
+        ))}
       </pre>
     </div>
   );
@@ -183,7 +274,7 @@ function ImageBlock({ block }) {
 }
 
 export default function TutorBoard({
-  steps, focus, stepIndex, onStep, followLive, onJumpLive,
+  steps, focus, stepIndex, onStep, followLive, onJumpLive, caption,
 }) {
   const scrollRef = useRef(null);
   const penRef = useRef(null);
@@ -300,29 +391,55 @@ export default function TutorBoard({
           const shapes = (step.elements || []).filter((e) => e && e.type !== "arrow" && e.type !== "code" && e.type !== "note" && e.type !== "image");
           const extras = (step.elements || []).filter((e) => e && (e.type === "code" || e.type === "note" || e.type === "image"));
           const arrows = (step.elements || []).filter((e) => e && e.type === "arrow");
+          const isLive = si === (steps?.length || 0) - 1;
           return (
             <section key={step.key} data-step={si} className="mb-4 last:mb-1">
-              <p className="mb-1.5 text-[0.62rem] font-bold tracking-[0.14em] uppercase" style={{ color: T.primary }}>
-                Step {si + 1}{step.title ? ` · ${step.title}` : ""}
-              </p>
+              <div className="mb-1.5 flex items-center gap-2">
+                <span
+                  className="inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-[0.62rem] font-extrabold tracking-wide text-white shadow-sm"
+                  style={{ background: T.primary }}
+                >
+                  {si + 1}
+                </span>
+                <p className="text-[0.66rem] font-bold tracking-[0.14em] uppercase" style={{ color: T.muted }}>
+                  Step {si + 1}{step.title ? ` · ${step.title}` : ""}
+                </p>
+                {isLive && (
+                  <span className="ml-auto inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.6rem] font-bold tracking-wider uppercase" style={{ background: `${T.primary}14`, color: T.primary }}>
+                    <span className="relative flex h-1.5 w-1.5">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-60" style={{ background: T.primary }} />
+                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ background: T.primary }} />
+                    </span>
+                    Live
+                  </span>
+                )}
+              </div>
               {(shapes.length > 0 || arrows.length > 0) && (
                 <div
                   ref={shapes[0] ? setElRef(shapes[0].id) : undefined}
-                  className="rounded-2xl bg-white p-1 shadow-sm"
-                  style={{ border: `1px solid ${T.line}` }}
+                  className="rounded-2xl bg-white p-2 shadow-[0_2px_14px_rgba(18,48,74,0.07)]"
+                  style={{
+                    border: `1px solid ${T.line}`,
+                    backgroundImage: `radial-gradient(circle, ${T.line} 1px, transparent 1px)`,
+                    backgroundSize: "22px 22px",
+                  }}
                 >
-                  <StepDiagram elements={[...shapes, ...arrows]} />
+                  <div className="rounded-xl bg-white/85 px-1 py-1" style={{ border: `1px solid ${T.line}66` }}>
+                    <StepDiagram elements={[...shapes, ...arrows]} focusIds={focus?.ids} />
+                  </div>
                 </div>
               )}
-              <div className="mt-2 flex flex-col gap-2">
-                {extras.map((b) => (
-                  <div key={b.id} ref={setElRef(b.id)}>
-                    {b.type === "code" && <CodeBlock block={b} />}
-                    {b.type === "note" && <NoteBlock block={b} />}
-                    {b.type === "image" && <ImageBlock block={b} />}
-                  </div>
-                ))}
-              </div>
+              {!!extras.length && (
+                <div className="mt-2 flex flex-col gap-2">
+                  {extras.map((b) => (
+                    <div key={b.id} ref={setElRef(b.id)}>
+                      {b.type === "code" && <CodeBlock block={b} caption={caption} />}
+                      {b.type === "note" && <NoteBlock block={b} />}
+                      {b.type === "image" && <ImageBlock block={b} />}
+                    </div>
+                  ))}
+                </div>
+              )}
             </section>
           );
         })}

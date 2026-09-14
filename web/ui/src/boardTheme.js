@@ -16,5 +16,11 @@ export const BOARD_THEME = {
   faint: "#94a3b8", // slate-400 placeholders
   codeBg: "#0f172a", // slate-900 code cards
   codeInk: "#e2e8f0", // code text
-  radius: 14, // px — matches rounded-xl/2xl language of chat bubbles
+  radius: 12, // px — compact professional nodes
+  // Semantic tones: the planner tags core concept / example / warning.
+  tones: {
+    core: { fill: "#fff1f1", stroke: "#ff5a5f" },
+    example: { fill: "#ecfdf5", stroke: "#0f766e" },
+    warn: { fill: "#fffbeb", stroke: "#d97706" },
+  },
 };

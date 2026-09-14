@@ -371,6 +371,8 @@ export default function App() {
     const audioStarted = speakingRef.current || currentWindowRef.current > 0;
     if (!force && !audioStarted) return; // speech hasn't begun — keep staging
     pendingBoardRef.current = null;
+    // Canvas always opens FULLSCREEN — one glanceable lesson surface.
+    setMaxed((p) => ({ ...p, whiteboard: true }));
     setOpenApps((prev) =>
       prev.includes("whiteboard")
         ? [...prev.filter((x) => x !== "whiteboard"), "whiteboard"]
@@ -2148,6 +2150,7 @@ export default function App() {
     focusApp(id);
     if (id === "whiteboard") {
       setFollowLive(true);
+      setMaxed((p) => ({ ...p, whiteboard: true })); // canvas is fullscreen
       setStepIndex(Math.max(0, steps.length - 1));
     }
     pokeDock();
@@ -2317,6 +2320,7 @@ export default function App() {
                 focus={diagramFocus}
                 stepIndex={stepIndex}
                 followLive={followLive}
+                caption={assistantTextRef.current}
                 onStep={(i) => {
                   setStepIndex(i);
                   setFollowLive(false);
