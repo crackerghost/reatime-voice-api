@@ -1,13 +1,15 @@
 import { useRef, useState } from "react";
 import {
-  FaGlobe, FaNoteSticky, FaChalkboardUser, FaCode,
+  FaGlobe, FaNoteSticky, FaChalkboardUser, FaCode, FaCircleQuestion, FaGraduationCap,
 } from "react-icons/fa6";
 
 const APPS = [
+  { id: "tutor", name: "Tutor", icon: <FaGraduationCap />, bg: "linear-gradient(165deg,#fda4af 0%,#ff5a5f 60%,#9f1239 100%)", fg: "#fff" },
   { id: "whiteboard", name: "Whiteboard", icon: <FaChalkboardUser />, bg: "linear-gradient(165deg,#fde68a 0%,#f59e0b 60%,#b45309 100%)", fg: "#fff" },
   { id: "browser", name: "Browser", icon: <FaGlobe />, bg: "linear-gradient(165deg,#7dd3fc 0%,#2563eb 60%,#1e3a8a 100%)", fg: "#fff" },
   { id: "code", name: "Code", icon: <FaCode />, bg: "linear-gradient(165deg,#c4b5fd 0%,#7c3aed 60%,#4c1d95 100%)", fg: "#fff" },
   { id: "notes", name: "Notes", icon: <FaNoteSticky />, bg: "linear-gradient(165deg,#fefce8 0%,#fde047 55%,#eab308 100%)", fg: "#92400e" },
+  { id: "help", name: "Help Center", icon: <FaCircleQuestion />, bg: "linear-gradient(165deg,#6ee7b7 0%,#059669 60%,#064e3b 100%)", fg: "#fff" },
 ];
 
 /* Bug OS dock: tutor lives in the notch — the apps it teaches with. */

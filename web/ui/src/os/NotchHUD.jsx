@@ -25,7 +25,7 @@ function statusOf({ connected, listening, speaking, turnActive, typing, userTalk
 }
 
 export default function NotchHUD({
-  connected, speaking, turnActive, listening, userTalking, typing,
+  hidden, connected, speaking, turnActive, listening, userTalking, typing,
   interim, input, setInput, sendText,
   onToggleMic, onStop, onShareDown, onShareUp, sharing, visionEnabled,
   llmProvider, llmProviders, llmModels, onProvider,
@@ -36,8 +36,33 @@ export default function NotchHUD({
   const [focused, setFocused] = useState(false);
   const orbRef = useRef(null);
   const miniRef = useRef(null);
+  const wrapRef = useRef(null);
   const open = pinned || hover || focused;
   const status = statusOf({ connected, listening, speaking, turnActive, typing, userTalking, asrReady });
+  // Auto-collapse: when any app window opens (`hidden` from App.jsx), collapse
+  // the expanded panel if it was open — the notch pill itself always stays.
+  useEffect(() => {
+    if (hidden) {
+      setPinned(false);
+      setHover(false);
+    }
+  }, [hidden]);
+  // Outside click: collapse the expanded panel. The notch pill stays.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) {
+        setPinned(false);
+        setHover(false);
+        setFocused(false);
+        if (document.activeElement && document.activeElement.blur) {
+          try { document.activeElement.blur(); } catch { /* noop */ }
+        }
+      }
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => document.removeEventListener("pointerdown", onDown, true);
+  }, [open]);
   const providers = Array.isArray(llmProviders) && llmProviders.length ? llmProviders : ["groq"];
 
   // Live aura: same voice-driven motion as the old gradient, heavy low-pass
@@ -94,7 +119,7 @@ export default function NotchHUD({
         onMouseLeave={() => setHover(false)}
         aria-hidden="true"
       />
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-[101] flex flex-col items-center">
+      <div ref={wrapRef} className="pointer-events-none absolute inset-x-0 top-0 z-[101] flex flex-col items-center">
         {/* the notch itself — click pins/unpins the panel */}
         <button
           onClick={() => setPinned((v) => !v)}

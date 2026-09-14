@@ -5,12 +5,15 @@ import Dock from "./os/Dock.jsx";
 import Widgets from "./os/Widgets.jsx";
 import ProgressWidget from "./os/ProgressWidget.jsx";
 import CodeApp from "./os/CodeApp.jsx";
+import HelpApp from "./os/HelpApp.jsx";
 import BrowserApp from "./os/BrowserApp.jsx";
 import NotesApp from "./os/NotesApp.jsx";
+import TutorApp from "./os/TutorApp.jsx";
 import NotchHUD from "./os/NotchHUD.jsx";
 import AppWindow from "./os/AppWindow.jsx";
 import { engine } from "./audioEngine.js";
 import { chatMessage, pingMessage, stopMessage } from "./services/ttsProtocol.js";
+import { STUDENT, COURSE, COURSES, INITIAL_PROGRESS, getLessonById, getCourseById, appsForLesson } from "./data/courseData.js";
 
 const GREETING = "नमस्ते! मैं आपका हिंदी ट्यूटर हूँ। माइक दबाकर बोलिए, लिखकर पूछिए — और स्क्रीन दिखाने के लिए X दबाकर रखें, बोलते रहिए, छोड़ते ही मैं स्क्रीन देखकर जवाब दूँगा। जब मैं बोलूँ तो बीच में कुछ भी बोलिए, मैं तुरंत रुक जाऊँगा।";
 const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/tts`;
@@ -86,9 +89,9 @@ const nextId = () => ++msgId;
 
 /* Agent OS control allowlists (mirror server/llm/os_control.py — the client
    re-validates every os_action before executing it). */
-const AGENT_APPS = ["whiteboard", "browser", "notes", "code"];
+const AGENT_APPS = ["whiteboard", "browser", "notes", "code", "help", "tutor"];
 const AGENT_ZONES = ["left", "right", "tl", "tr", "bl", "br"];
-const AGENT_APP_LABEL = { whiteboard: "Whiteboard", browser: "Browser", notes: "Notes", code: "Code" };
+const AGENT_APP_LABEL = { whiteboard: "Whiteboard", browser: "Browser", notes: "Notes", code: "Code", help: "Help Center", tutor: "Tutor" };
 const AGENT_ZONE_LABEL = {
   left: "left half", right: "right half",
   tl: "top-left", tr: "top-right", bl: "bottom-left", br: "bottom-right",
@@ -110,6 +113,27 @@ const SNAP_BOXES = {
 
 export default function App() {
   const [messages, setMessages] = useState([{ id: nextId(), role: "assistant", text: GREETING }]);
+  // ---- Boot splash: smooth OS-style loading with logo + staged app init ----
+  const BOOT_STAGES = useMemo(() => [
+    { label: "Starting Bug OS", apps: [] },
+    { label: "Loading Tutor", apps: ["tutor"] },
+    { label: "Preparing Whiteboard + Browser", apps: ["tutor", "whiteboard", "browser"] },
+    { label: "Warming voice engine", apps: ["tutor", "whiteboard", "browser", "code", "notes"] },
+    { label: "Ready", apps: ["tutor", "whiteboard", "browser", "code", "notes"] },
+  ], []);
+  const [bootStage, setBootStage] = useState(0);
+  const [booting, setBooting] = useState(true);
+  const [bootGone, setBootGone] = useState(false);
+  useEffect(() => {
+    const timers = [];
+    BOOT_STAGES.forEach((_, i) => {
+      if (i === 0) return;
+      timers.push(setTimeout(() => setBootStage(i), i * 450));
+    });
+    timers.push(setTimeout(() => setBooting(false), BOOT_STAGES.length * 450 + 250));
+    timers.push(setTimeout(() => setBootGone(true), BOOT_STAGES.length * 450 + 800));
+    return () => timers.forEach(clearTimeout);
+  }, [BOOT_STAGES]);
   const [connected, setConnected] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [listening, setListening] = useState(false);
@@ -168,7 +192,8 @@ export default function App() {
   }, []);
   // ---- Bug OS window manager: tutor lives in the notch (background agent);
   // it pops Whiteboard/Browser/Notes/Code as it teaches. Last = front. ----
-  const [openApps, setOpenApps] = useState([]);
+  // Tutor opens on boot so courses are discoverable (dock still toggles it).
+  const [openApps, setOpenApps] = useState(["tutor"]);
   const [minApps, setMinApps] = useState({});
   const [maxed, setMaxed] = useState({});
   // Split-screen tiles: id -> "left" | "right" | "tl" | "tr" | "bl" | "br".
@@ -317,8 +342,22 @@ export default function App() {
   // Fullscreen chrome: hidden until the pointer hits the top edge (or Esc).
   const [topChrome, setTopChrome] = useState(false);
   const [browserUrl, setBrowserUrl] = useState("https://www.google.com/webhp?igu=1");
-  // Imperative browser commands from the agent ({cmd, target, tick}).
-  const [browserCmd, setBrowserCmd] = useState(null);
+  const [browserTabs, setBrowserTabs] = useState(1);
+  // Imperative browser moves from the agent: an ORDERED queue ([{cmd, target,
+  // seq}]) drained by BrowserApp. A single object used to collapse when the
+  // director emitted 2+ moves in one turn (same-ms tick) — new tab opened,
+  // navigate never ran. Monotonic seqs => every move executes exactly once.
+  const [browserQueue, setBrowserQueue] = useState([]);
+  const browserSeq = useRef(0);
+  const agentBrowser = (cmd, target) =>
+    setBrowserQueue((q) => [...q.slice(-11), { cmd, ...(target !== undefined ? { target } : {}), seq: ++browserSeq.current }]);
+  const ackBrowser = useCallback((seq) => {
+    setBrowserQueue((q) => (q.some((c) => c.seq === seq) ? q.filter((c) => c.seq !== seq) : q));
+  }, []);
+  const onBrowserNavigate = useCallback((u, meta) => {
+    setBrowserUrl(u);
+    if (meta && typeof meta.tabs === "number") setBrowserTabs(meta.tabs);
+  }, []);
   // Transient "agent did X" pill (also briefly reveals the dock).
   const [agentFlash, setAgentFlash] = useState(null);
   const [notes, setNotes] = useState(() => {
@@ -332,6 +371,56 @@ export default function App() {
     }
   });
   const [activeNoteId, setActiveNoteId] = useState(null);
+  // ---- Course progress (was hardcoded INITIAL_PROGRESS): user picks any
+  // course -> module -> lesson in the Tutor app; Start sends a teaching turn
+  // so the SAME voice+board agent teaches it realtime. Persisted locally. ----
+  const [activeCourseId, setActiveCourseId] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("bugos-course") || "null");
+      if (saved?.courseId && getCourseById(saved.courseId)) return saved.courseId;
+    } catch { /* fresh */ }
+    return INITIAL_PROGRESS.courseId || COURSE.id;
+  });
+  const [activeLessonId, setActiveLessonId] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("bugos-course") || "null");
+      if (saved?.activeLessonId && getLessonById(saved.activeLessonId, getCourseById(saved.courseId) || COURSE)) return saved.activeLessonId;
+    } catch { /* fresh */ }
+    return INITIAL_PROGRESS.activeLessonId;
+  });
+  const [completedLessonIds, setCompletedLessonIds] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("bugos-course") || "null");
+      if (Array.isArray(saved?.completed)) return saved.completed;
+    } catch { /* fresh */ }
+    return INITIAL_PROGRESS.completedLessonIds || [];
+  });
+  const [selectedLesson, setSelectedLesson] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("bugos-course") || "null");
+      if (saved?.selected) return saved.selected;
+    } catch { /* fresh */ }
+    // Default preview = current active lesson (html-3) so Start is one click.
+    for (const c of COURSES) for (const m of c.modules || []) {
+      if ((m.lessons || []).some((l) => l.id === INITIAL_PROGRESS.activeLessonId)) {
+        return { courseId: c.id, moduleId: m.id, lessonId: INITIAL_PROGRESS.activeLessonId };
+      }
+    }
+    return null;
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("bugos-course", JSON.stringify({
+        courseId: activeCourseId, activeLessonId, completed: completedLessonIds, selected: selectedLesson,
+      }));
+    } catch { /* private mode */ }
+  }, [activeCourseId, activeLessonId, completedLessonIds, selectedLesson]);
+  const courseProgress = useMemo(() => ({
+    courseId: activeCourseId,
+    completedLessonIds,
+    activeLessonId,
+    scores: INITIAL_PROGRESS.scores || {},
+  }), [activeCourseId, completedLessonIds, activeLessonId]);
   // Learning activity per local day, powers the desktop progress graph.
   const [dayStats, setDayStats] = useState(() => {
     try {
@@ -949,8 +1038,8 @@ export default function App() {
         holding/talking. The last warm-up's result stays in the server cache.
      3. Release (or 5 s cap) → the FRESHEST frame is attached to the turn as
         {screen: {image, hash, wait_ms}}. A question spoken into the mic
-        during the hold is absorbed and sent as the turn text; with no text
-        the turn IS the screen ("इस स्क्रीन के बारे में बताओ").
+     during the hold is absorbed and sent as the turn text; with no text
+     the turn IS the screen ("Describe what is on this screen").
      4. No GPU/network vision cost while X is NOT held — only the idle local
         capture stream (no frames fetched, no uploads). Revoke anytime via
         Chrome's own "Stop sharing" bar. */
@@ -1055,11 +1144,11 @@ export default function App() {
   const startPushCapture = useCallback(async () => {
     if (sharingRef.current || pushActiveRef.current) return;
     if (!CFG.visionEnabled) {
-      showError("सर्वर पर vision चालू नहीं है — .env में VISION_BACKEND जाँचें।");
+      showError("Vision is disabled on the server — check VISION_BACKEND in .env.");
       return;
     }
     if (!navigator.mediaDevices?.getDisplayMedia) {
-      showError("इस ब्राउज़र में स्क्रीन कैप्चर उपलब्ध नहीं है — Chrome/Edge आज़माएँ।");
+      showError("Screen capture is not available in this browser — try Chrome/Edge.");
       return;
     }
     try {
@@ -1086,9 +1175,9 @@ export default function App() {
       }, CFG.pushMaxMs);
     } catch (e) {
       if (e && e.name === "NotAllowedError") {
-        showError("स्क्रीन कैप्चर की अनुमति नहीं मिली — दोबारा कोशिश करें और 'Share' दबाएँ।");
+        showError("Screen capture permission denied — try again and press 'Share'.");
       } else {
-        showError("स्क्रीन कैप्चर शुरू नहीं हो पाया: " + (e.message || e.name));
+        showError("Could not start screen capture: " + (e.message || e.name));
       }
       console.warn("[push] getDisplayMedia failed:", e);
     }
@@ -1140,7 +1229,7 @@ export default function App() {
     // A question spoken during the hold wins; typed text second; screen-only
     // (no words) makes the turn "describe what you see".
     const text = (pushTextRef.current || "").trim() || (input || "").trim()
-      || "इस स्क्रीन के बारे में बताओ — क्या दिख रहा है?";
+      || "Describe what is on this screen — what do you see?";
     pushTextRef.current = "";
     setInput("");
     submitPushChat(text, frame, heldMs);
@@ -1198,11 +1287,11 @@ export default function App() {
   const startScreenShare = useCallback(async () => {
     if (sharingRef.current) return;
     if (!CFG.visionEnabled) {
-      showError("सर्वर पर vision चालू नहीं है — .env में VISION_BACKEND जाँचें।");
+      showError("Vision is disabled on the server — check VISION_BACKEND in .env.");
       return;
     }
     if (!navigator.mediaDevices?.getDisplayMedia) {
-      showError("इस ब्राउज़र में स्क्रीन शेयर उपलब्ध नहीं है — Chrome/Edge आज़माएँ।");
+      showError("Screen sharing is not available in this browser — try Chrome/Edge.");
       return;
     }
     try {
@@ -1236,9 +1325,9 @@ export default function App() {
       // VISIBLE failures: a swallowed NotAllowedError made users believe the
       // screen was being shared when the browser had actually blocked it.
       if (e && e.name === "NotAllowedError") {
-        showError("स्क्रीन शेयर की अनुमति नहीं मिली — दोबारा कोशिश करें और 'Share' दबाएँ।");
+        showError("Screen share permission denied — try again and press 'Share'.");
       } else {
-        showError("स्क्रीन शेयर शुरू नहीं हो पाया: " + (e.message || e.name));
+        showError("Could not start screen sharing: " + (e.message || e.name));
       }
       console.warn("[screen] getDisplayMedia failed:", e);
     }
@@ -1303,7 +1392,7 @@ export default function App() {
           setTimeout(() => submitChat(rawText, screenFrame), 350);
           return;
         }
-        showError("सर्वर कनेक्शन नहीं है — रुकिए, फिर से पूछिए।");
+        showError("No server connection — please wait and ask again.");
         return;
       }
       // dropRef stays true (set by hardStop) until the server's "start" for
@@ -1363,16 +1452,28 @@ export default function App() {
           minimized: Object.keys(minApps).filter((k) => minApps[k]),
           snapped: snaps,
           browserUrl,
+          browserTabs,
           note: (() => {
             const n = notes.find((x) => x.id === (activeNoteId || notes[0]?.id));
             return n ? { title: n.title, snippet: String(n.body || "").slice(0, 600) } : null;
           })(),
           whiteboardSteps: steps.length,
           code: codeCtxRef.current,
+          // Hardcoded learner + curriculum context (generic schema — same keys
+          // work for any subject, not just MERN/coding). Server may ignore
+          // unknown keys; sanitizer keeps what it allows.
+          student: { name: STUDENT.name, gender: STUDENT.gender, qualification: STUDENT.qualification, college: STUDENT.college },
+          courseId: activeCourseId,
+          progress: { completed: completedLessonIds, activeLessonId, scores: INITIAL_PROGRESS.scores },
+          lesson: (() => {
+            const course = getCourseById(activeCourseId) || COURSE;
+            const l = getLessonById(activeLessonId, course);
+            return l ? { id: l.id, title: l.title, kind: l.kind, objective: l.objective } : null;
+          })(),
         },
       }));
     },
-    [hardStop, activeApp, openApps, minApps, snaps, browserUrl, notes, activeNoteId, steps.length]
+    [hardStop, activeApp, openApps, minApps, snaps, browserUrl, browserTabs, notes, activeNoteId, steps.length, activeCourseId, activeLessonId, completedLessonIds]
   );
 
   /* Push-to-see turn: text + the frame captured during the hold. */
@@ -1594,7 +1695,7 @@ export default function App() {
               currentSourceRef.current = null;
             }
             pendingRef.current = [];
-            showError("बोलने में त्रुटि: " + m.message);
+            showError("Speech error: " + m.message);
             setTurnActive(false);
           } else if (m.type === "done") {
             if (dropRef.current) {
@@ -1850,7 +1951,7 @@ export default function App() {
           // surfaced as a server error.
           if (asrClosedCount >= 3 && !asrWarned) {
             asrWarned = true;
-            showError("वॉयस इंजन (Whisper) से कनेक्ट नहीं हो पा रहा — कृपया सर्वर रीस्टार्ट करें (python voice_api.py)।");
+            showError("Cannot connect to the voice engine (Whisper) — please restart the server (python voice_api.py).");
           }
         }
       };
@@ -1993,7 +2094,7 @@ export default function App() {
           specSentFor = ""; // never let a dead utterance's guard leak into the next one
           if (asrReconnecting) setAsrReconnecting(false);
           setInterim("");
-          showError("बोलने की पहचान में त्रुटि: " + (m.message || ""));
+          showError("Speech recognition error: " + (m.message || ""));
         }
       };
     };
@@ -2266,7 +2367,7 @@ export default function App() {
       const ok = await engine.startMic(); // AEC-enabled mic (inside the click)
       if (!ok) {
         disableMic();
-        showError("माइक अनुमति नहीं मिली। ब्राउज़र में माइक की अनुमति दें और दोबारा दबाएँ।");
+        showError("Microphone permission denied. Allow mic access in the browser and try again.");
         return;
       }
       connectAsr();
@@ -2275,8 +2376,8 @@ export default function App() {
         disableMic();
         const msg =
           tapped.error
-            ? `ऑडियो स्ट्रीमिंग उपलब्ध नहीं है — ${tapped.error}. Chrome/Edge आज़माएँ।`
-            : "इस ब्राउज़र में ऑडियो स्ट्रीमिंग उपलब्ध नहीं है — Chrome/Edge आज़माएँ।";
+            ? `Audio streaming is not available — ${tapped.error}. Try Chrome/Edge.`
+            : "Audio streaming is not available in this browser — try Chrome/Edge.";
         showError(msg);
       }
     };
@@ -2526,7 +2627,10 @@ export default function App() {
       return true;
     };
     const ensureBrowser = () => {
-      if (!openApps.includes("browser")) openApp("browser");
+      // Unconditional: opens if closed, fronts + unminimizes if open (focusApp
+      // clears min). The old conditional left navigate running in a minimized
+      // window the user couldn't see.
+      openApp("browser");
     };
     switch (op) {
       case "open_app":
@@ -2541,6 +2645,7 @@ export default function App() {
         return true;
       case "close_app":
         if (!needApp()) return false;
+        if (app === "browser") setBrowserQueue([]); // stale moves must not fire on next open
         closeApp(app);
         flashAgent(`Closed ${AGENT_APP_LABEL[app]}`);
         return true;
@@ -2600,24 +2705,34 @@ export default function App() {
           return false;
         }
         ensureBrowser();
-        setBrowserCmd({ cmd: "navigate", target, tick: Date.now() });
+        agentBrowser("navigate", target);
         flashAgent(`Browser → ${target.slice(0, 42)}`);
         return true;
       }
       case "browser_back":
         ensureBrowser();
-        setBrowserCmd({ cmd: "back", tick: Date.now() });
+        agentBrowser("back");
         flashAgent("Browser ← back");
         return true;
       case "browser_forward":
         ensureBrowser();
-        setBrowserCmd({ cmd: "forward", tick: Date.now() });
+        agentBrowser("forward");
         flashAgent("Browser → forward");
         return true;
       case "browser_new_tab":
         ensureBrowser();
-        setBrowserCmd({ cmd: "newtab", tick: Date.now() });
+        agentBrowser("newtab");
         flashAgent("Browser new tab");
+        return true;
+      case "browser_reload":
+        ensureBrowser();
+        agentBrowser("reload");
+        flashAgent("Browser reloaded");
+        return true;
+      case "browser_close_tab":
+        if (!openApps.includes("browser")) return true; // nothing to close
+        agentBrowser("closetab");
+        flashAgent("Browser tab closed");
         return true;
       case "note_add": {
         const n = {
@@ -2690,6 +2805,67 @@ export default function App() {
       if (activeNoteId === id) setActiveNoteId(next[0]?.id || null);
       return next;
     });
+  /* ---------- Tutor: select + start teaching a lesson ----------
+     How realtime tutoring works here (same pipeline as any question):
+     submitChat(text) -> WS /ws/tts -> LLM streams Hinglish-Devenagari reply
+     -> TTS windows stream audio blobs -> client plays them in order ->
+     diagram sidecar streams board deltas keyed by audio window ->
+     flushed exactly when that window's speech plays (audio-synced board).
+     OS Director sidecar opens/tiles Browser/Code/Notes as needed.
+     Start = set active lesson + pre-open its suggested apps + submit a rich
+     teaching prompt carrying objective/summary/terms/board/quiz, so the agent
+     teaches THAT lesson with voice + board + quiz — interruptible anytime. */
+  const selectLesson = (courseId, moduleId, lessonId) => {
+    setSelectedLesson({ courseId, moduleId, lessonId });
+  };
+  const completeLesson = (courseId, moduleId, lessonId, advance = false) => {
+    const course = getCourseById(courseId) || COURSE;
+    const flat = course.modules?.flatMap((m) => (m.lessons || []).map((l) => ({ courseId: course.id, moduleId: m.id, ...l }))) || [];
+    const i = flat.findIndex((l) => l.id === lessonId);
+    setCompletedLessonIds((prev) => (prev.includes(lessonId) ? prev : [...prev, lessonId]));
+    if (advance && i >= 0 && i < flat.length - 1) {
+      const n = flat[i + 1];
+      setActiveLessonId(n.id);
+      setSelectedLesson({ courseId: n.courseId, moduleId: n.moduleId, lessonId: n.id });
+    } else if (!advance && i >= 0 && i < flat.length - 1 && lessonId === activeLessonId) {
+      // Completing the active lesson advances the "in progress" marker too.
+      const n = flat[i + 1];
+      setActiveLessonId(n.id);
+      setSelectedLesson({ courseId: n.courseId, moduleId: n.moduleId, lessonId: n.id });
+    }
+  };
+  const startLesson = (courseId, moduleId, lessonId) => {
+    const course = getCourseById(courseId) || COURSE;
+    const mod = course.modules?.find((m) => m.id === moduleId);
+    const lesson = mod?.lessons?.find((l) => l.id === lessonId) || getLessonById(lessonId, course);
+    if (!lesson) return;
+    setActiveCourseId(course.id);
+    setActiveLessonId(lesson.id);
+    setSelectedLesson({ courseId: course.id, moduleId: mod?.id || "", lessonId: lesson.id });
+    // Pre-open the lesson's suggested apps (whiteboard first = fullscreen
+    // canvas, others tiled beside it) — the director may refine mid-reply.
+    const apps = appsForLesson(lesson);
+    const wins = [];
+    if (apps.includes("whiteboard")) wins.push("whiteboard");
+    if (apps.includes("code")) wins.push("code");
+    if (apps.includes("browser")) wins.push("browser");
+    if (apps.includes("notes")) wins.push("notes");
+    wins.forEach((w) => openApp(w));
+    if (wins.length >= 2) setTimeout(() => tileGrid(), 60);
+    // Professional touch: for lessons with a video/docs query, load a relevant
+    // result in the Browser automatically so learner sees docs + video + board.
+    if (apps.includes("browser") && lesson.videoQuery) {
+      agentBrowser("navigate", lesson.videoQuery);
+    }
+    const quizLine = lesson.quiz ? ` End with this exact 1 quiz: "${lesson.quiz.q}" Options: ${(lesson.quiz.options || []).join(" | ")}.` : "";
+    submitChat(
+      `Help me learn the lesson "${lesson.title}". Course: ${course.title}, Module: ${mod?.title || ""}. ` +
+      `Objective: ${lesson.objective || ""} Summary: ${lesson.summary || ""} ` +
+      `Key terms: ${(lesson.keyTerms || []).join(", ")}. ` +
+      `Board flow: ${(lesson.boardOutline || []).join(" > ")}.${quizLine} ` +
+      `Teach in real tutoring style — start with the direct answer, then 2-3 short steps, one daily-life example, and end with one short question.`,
+    );
+  };
   // Single AI response for the notch HUD: the newest assistant message
   // (streams live — messages update per text event). User bubbles are gone.
   const latestAssistant = useMemo(() => {
@@ -2859,7 +3035,7 @@ export default function App() {
             onMax={() => zoomApp("browser")}
           >
             <div className="min-h-0 flex-1 p-3 pt-1">
-              <BrowserApp url={browserUrl} onNavigate={setBrowserUrl} command={browserCmd} />
+              <BrowserApp url={browserUrl} onNavigate={onBrowserNavigate} queue={browserQueue} onAck={ackBrowser} />
             </div>
           </AppWindow>
         )}
@@ -2925,6 +3101,65 @@ export default function App() {
             </div>
           </AppWindow>
         )}
+        {winId === "help" && (
+          <AppWindow
+            title="Help Center"
+            geom={geomFor("help")}
+            onGeom={setGeomFor("help")}
+            maximized={!!maxed.help}
+            snap={snaps.help}
+            onSnap={(zone) => doSnap("help", zone)}
+            onUnsnap={(geom) => unsnap("help", geom)}
+            onSnapPreview={setSnapPreview}
+            cascade={openApps.indexOf("help")}
+            leaving={leaving.help}
+            hideChrome={!!maxed.help && !topChrome}
+            onFocus={() => {
+              setSpreadTop(false); if (activeApp !== "help") focusApp("help");
+            }}
+            onClose={() => closeApp("help")}
+            onMin={() => minimizeApp("help")}
+            onMax={() => zoomApp("help")}
+          >
+            <div className="min-h-0 flex-1 p-3 pt-1">
+              <HelpApp />
+            </div>
+          </AppWindow>
+        )}
+        {winId === "tutor" && (
+          <AppWindow
+            title="Tutor — Courses"
+            geom={geomFor("tutor")}
+            onGeom={setGeomFor("tutor")}
+            maximized={!!maxed.tutor}
+            snap={snaps.tutor}
+            onSnap={(zone) => doSnap("tutor", zone)}
+            onUnsnap={(geom) => unsnap("tutor", geom)}
+            onSnapPreview={setSnapPreview}
+            cascade={openApps.indexOf("tutor")}
+            leaving={leaving.tutor}
+            hideChrome={!!maxed.tutor && !topChrome}
+            onFocus={() => {
+              setSpreadTop(false); if (activeApp !== "tutor") focusApp("tutor");
+            }}
+            onClose={() => closeApp("tutor")}
+            onMin={() => minimizeApp("tutor")}
+            onMax={() => zoomApp("tutor")}
+          >
+            <div className="min-h-0 flex-1 p-3 pt-1">
+              <TutorApp
+                courses={COURSES}
+                progress={courseProgress}
+                activeCourseId={activeCourseId}
+                activeLessonId={activeLessonId}
+                selected={selectedLesson}
+                onSelect={selectLesson}
+                onStartLesson={startLesson}
+                onCompleteLesson={completeLesson}
+              />
+            </div>
+          </AppWindow>
+        )}
           </div>
         ))}
         {/* Drag-to-snap preview: glass highlight where the window will tile.
@@ -2956,8 +3191,11 @@ export default function App() {
         </div>
       </div>
 
-      {/* Tutor lives in the notch — voice agent background, no popup. */}
+      {/* Tutor lives in the notch — voice agent background, no popup.
+          Auto-collapses its expanded panel when any app window opens;
+          the notch pill itself always stays visible. */}
       <NotchHUD
+        hidden={visibleApps.length > 0}
         connected={connected}
         speaking={speaking}
         turnActive={turnActive}
@@ -3005,6 +3243,49 @@ export default function App() {
         onMouseEnter={pokeDock}
         aria-hidden="true"
       />
+      {/* ── Boot splash: logo + staged loading, fades out smoothly ── */}
+      {!bootGone && (
+        <div
+          className={`absolute inset-0 z-[200] flex flex-col items-center justify-center text-slate-900 transition-opacity duration-500 ${
+            booting ? "opacity-100" : "pointer-events-none opacity-0"
+          }`}
+          style={{
+            backgroundColor: "#ffffff",
+            backgroundImage:
+              "linear-gradient(rgba(15,23,42,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(15,23,42,0.06) 1px, transparent 1px)",
+            backgroundSize: "44px 44px",
+          }}
+          aria-hidden={!booting}
+          aria-label="Loading Bug OS"
+        >
+          <img src="/logo.png" alt="Bug OS" className="h-16 w-16 rounded-2xl border border-slate-200 object-cover shadow-[0_12px_40px_rgba(255,90,95,0.35)]" />
+          <p className="mt-4 text-lg font-bold tracking-tight">Bug OS</p>
+          <p className="mt-1 text-xs text-slate-500">Hindi voice tutor desktop</p>
+          <div className="mt-6 h-1 w-56 overflow-hidden rounded-full bg-slate-200">
+            <div
+              className="h-full rounded-full bg-[#ff5a5f] transition-all duration-300"
+              style={{ width: `${((bootStage + 1) / BOOT_STAGES.length) * 100}%` }}
+            />
+          </div>
+          <p className="mt-3 text-xs font-semibold text-slate-600" aria-live="polite">{BOOT_STAGES[bootStage]?.label}…</p>
+          <div className="mt-4 flex items-center gap-2 text-[11px] text-slate-500">
+            {["tutor", "whiteboard", "browser", "code", "notes"].map((a) => {
+              const ready = (BOOT_STAGES[bootStage]?.apps || []).includes(a);
+              return (
+                <span
+                  key={a}
+                  className={`flex items-center gap-1 rounded-full px-2 py-1 ring-1 transition ${
+                    ready ? "bg-red-50 text-slate-800 ring-[#ff5a5f]/40" : "bg-white text-slate-400 ring-slate-200"
+                  }`}
+                >
+                  <span className={`h-1.5 w-1.5 rounded-full ${ready ? "bg-[#ff5a5f]" : "bg-slate-300"}`} />
+                  {a === "tutor" ? "Tutor" : a === "whiteboard" ? "Board" : a[0].toUpperCase() + a.slice(1)}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

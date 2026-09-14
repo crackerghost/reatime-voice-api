@@ -14,7 +14,7 @@ import json
 import re
 import threading
 
-APPS = ("whiteboard", "browser", "notes", "code")
+APPS = ("whiteboard", "browser", "notes", "code", "help", "tutor")
 ZONES = ("left", "right", "tl", "tr", "bl", "br")
 MAX_ACTIONS = 6
 
@@ -23,7 +23,7 @@ _APP_OPS = {
     "open_app", "focus_app", "close_app", "minimize_app",
     "maximize_app", "restore_app", "tile_app", "float_app",
 }
-_BROWSER_OPS = {"browser_back", "browser_forward", "browser_new_tab"}
+_BROWSER_OPS = {"browser_back", "browser_forward", "browser_new_tab", "browser_reload", "browser_close_tab"}
 _NOARG_OPS = {"tile_grid"}
 OPS = _APP_OPS | _BROWSER_OPS | _NOARG_OPS | {"browser_navigate", "note_add", "clear_board"}
 
@@ -65,15 +65,21 @@ OS_CONTROL_TOOL = {
 }
 
 _DIRECTOR_SYSTEM = (
-    "You are the OS director for a voice-tutored desktop with four apps: "
-    "whiteboard (lesson board), browser (tabbed web), notes, code (editor). "
+    "You are the OS director for a voice-tutored desktop with six apps: "
+    "tutor (course list + Start teaching), "
+    "whiteboard (lesson board), browser (tabbed web), notes, code (editor), "
+    "help (help center with every command and how-to). "
     "Read the USER request + OS snapshot, then call control_os with the MINIMAL "
     "window actions that fulfill it — usually 1-3, never more than 6, in execution "
-    "order. Rules: act ONLY when the user explicitly asks for an app, a website, "
-    "docs, a video, a search, or a note — or names something to show/open. Plain "
+    "order. The USER may write in ANY language — "
+    "judge by MEANING, never by language or script. Rules: act ONLY when the user explicitly asks for an app, a website, "
+    "docs, a video, a search, a note, or the help center — or names something to show/open. Plain "
     "teaching questions with no such ask need NO action (the whiteboard appears by "
     "itself): return no tool call. browser_navigate opens the browser by itself; "
-    "target may be a full URL or plain search words. open_app before acting on a "
+    "target may be a full URL or plain search words. browser_navigate reuses "
+    "the CURRENT tab (it opens the browser by itself); browser_new_tab ONLY "
+    "when the user explicitly asks for a new tab — never open one just to "
+    "visit a site. open_app before acting on a "
     "closed app. Never close or minimize anything the user didn't ask to close. "
     "Reply ONLY via the tool call."
 )
@@ -96,11 +102,31 @@ def should_direct(text: str) -> bool:
 # Blocking path gate: the user is asking FOR a desktop move (open the
 # browser, write a note, search something...). Broad on purpose — the
 # director LLM is the real judge and returns no tool call when nothing fits.
-# Pure "what is X?" definitions are excluded so teaching turns never pay the
-# blocking call's latency.
+# Multilingual by design (the director judges MEANING in any language): the
+# fast path covers Hindi, English + 10 more (es/fr/de/pt/ta/te/kn/ml/bn/mr)
+# with high-precision stems/nouns; every OTHER language still gets its moves
+# via the zero-latency background sidecar (only the same-reply narration
+# needs the fast path). Pure "what is X?" definitions are excluded so
+# teaching turns never pay the blocking call's latency.
 _OS_REQUEST_RE = re.compile(
-    r"(ब्राउज़र|नोट|टैब|सर्च|खोज|खोल|बंद\s*कर|टाइल|लिखो?|"
+    r"(ब्राउज़र|नोट|टैब|सर्च|खोज|खोल|बंद\s*कर|टाइल|लिखो?|मदद|हेल्प\s*सेंटर|"
+    r"ओपन|साफ़?|बोर्ड|व्हाइटबोर्ड|कोड\s*(खोल|दिखा)|"
+    r"कोर्स|लेसन|पाठ्यक्रम|पढ़ा|सिखा|ट्यूटर|"
+    r"उघड|ब्राउझर|शोध|"
+    r"খুল|বন্ধ|ব্রাউজার|নোট|খুঁজ|"
+    r"திறக்க|மூடு|உலாவி|குறிப்பு|தேடு|"
+    r"తెరువు|మూసి|బ్రౌజర్|గమనిక|వెతకు|శోధన|"
+    r"ತೆರೆ|ಮುಚ್ಚು|ಬ್ರೌಸರ್|ಟಿಪ್ಪಣಿ|ಹುಡುಕು|"
+    r"തുറക്ക|അടയ്ക്ക|ബ്രൗസർ|കുറിപ്പ്|തിരയു|"
     r"\bbrowser\b|\bnotes?\b|\btab\b|\bsearch\b|\bopen\b|\bclose\b|"
+    r"\bclear\b|\bboard\b|\bwhiteboard\b|"
+    r"\bcourse\b|\blesson\b|\btutor\b|\bteach\b|\bstart\s*(course|lesson)\b|"
+    r"\babrir\b|\bnavegador\b|\bpestaña\b|\bbuscar\b|\bnota\b|\baba\b|\bpesquisar\b|"
+    r"\bouvrir\b|\bouvre\b|\bfermer\b|\bferme\b|\bonglet\b|\brechercher\b|"
+    r"\böffnen\b|\böffne\b|\bschließen\b|\bnotiz\b|\bsuchen\b|"
+    r"\bfechar\b|\bfeche\b|"
+    r"\bhelp\s*cent(re|er)\b|\bopen\s*help\b|"
+    r"\breload\b|\brefresh\b|"
     r"side\s*by\s*side|\btile\b|\bgoogle\b|\byoutube\b|\bwebsite\b|\bdocs?\b|\bvideo\b)",
     re.IGNORECASE,
 )
@@ -122,10 +148,12 @@ def wants_os_action(text: str) -> bool:
 
 
 _APP_NAMES = {
+    "tutor": "the Tutor courses",
     "whiteboard": "the Whiteboard",
     "browser": "the Browser",
     "notes": "Notes",
     "code": "the Code editor",
+    "help": "the Help Center",
 }
 _ZONE_NAMES = {
     "left": "the left half", "right": "the right half",
@@ -166,6 +194,10 @@ def describe_action(action: dict) -> str:
         return "went forward in the Browser"
     if op == "browser_new_tab":
         return "opened a new browser tab"
+    if op == "browser_reload":
+        return "reloaded the browser page"
+    if op == "browser_close_tab":
+        return "closed the browser tab"
     if op == "note_add":
         title = str(action.get("title", "")).strip()[:60]
         return f"added a note{f' {title!r}' if title else ''}"
@@ -212,6 +244,12 @@ def sanitize_os_snapshot(raw) -> dict:
     url = str(raw.get("browserUrl") or "")[:500]
     if url:
         snap["browserUrl"] = url
+    try:
+        tabs = int(raw.get("browserTabs") if raw.get("browserTabs") is not None else raw.get("tabs") or 0)
+    except (TypeError, ValueError):
+        tabs = 0
+    if tabs > 0:
+        snap["browserTabs"] = min(tabs, 32)
     try:
         steps = int(raw.get("whiteboardSteps") or 0)
     except (TypeError, ValueError):

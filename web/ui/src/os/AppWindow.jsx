@@ -257,10 +257,16 @@ export default function AppWindow({
           className={`os-titlebar relative z-20 flex shrink-0 cursor-grab touch-none items-center px-4 transition-all duration-200 select-none active:cursor-grabbing ${hideChrome ? "h-0 overflow-hidden border-0 opacity-0" : "h-10 opacity-100"}`}
           aria-label={`${title} title bar, drag to move`}
         >
-          <span className="flex items-center gap-2">
-            <button onClick={onClose} aria-label="Close window" className="traffic h-3.5 w-3.5 rounded-full bg-[#ff5f57] transition hover:brightness-90" />
-            <button onClick={onMin} aria-label="Minimize window" className="traffic h-3.5 w-3.5 rounded-full bg-[#febc2e] transition hover:brightness-90" />
-            <button onClick={onMax} aria-label="Zoom window" className="traffic h-3.5 w-3.5 rounded-full bg-[#28c840] transition hover:brightness-90" />
+          <span className="traffic-group flex items-center gap-2">
+            <button onClick={onClose} aria-label="Close window" className="traffic flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#ff5f57] transition hover:brightness-90">
+              <svg viewBox="0 0 8 8" className="traffic-icon h-2 w-2" aria-hidden="true"><path d="M1.5 1.5l4.7 4.7M6.2 1.5L1.5 6.2" stroke="rgba(90,20,20,0.85)" strokeWidth="1.2" strokeLinecap="round" /></svg>
+            </button>
+            <button onClick={onMin} aria-label="Minimize window" className="traffic flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#febc2e] transition hover:brightness-90">
+              <svg viewBox="0 0 8 8" className="traffic-icon h-2 w-2" aria-hidden="true"><path d="M1.5 4h5" stroke="rgba(120,70,0,0.85)" strokeWidth="1.2" strokeLinecap="round" /></svg>
+            </button>
+            <button onClick={onMax} aria-label="Zoom window" className="traffic flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#28c840] transition hover:brightness-90">
+              <svg viewBox="0 0 8 8" className="traffic-icon h-2 w-2" aria-hidden="true"><path d="M1.8 4.2L4 1.8l2.2 2.4M1.8 5.8L4 6.6l2.2-.8" stroke="rgba(10,80,30,0.85)" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" fill="none" /></svg>
+            </button>
           </span>
           <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[13px] font-bold text-slate-700">
             {title}

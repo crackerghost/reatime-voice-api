@@ -38,113 +38,138 @@ let tabSeq = 1;
 const makeTab = (url) => ({ id: `t${tabSeq++}`, history: [url || GOOGLE_HOME], idx: 0, reload: 0 });
 
 /* Professional tabbed browser: toolbar, omnibox, tabs, new-tab page.
-   Active-tab URL is shared upward so the tutor sees what you browse.
-   `command` ({cmd, target, tick}) executes imperative moves from the agent
-   (navigate/back/forward/newtab) — each tick runs once. */
-export default function BrowserApp({ url, onNavigate, command }) {
-  const [tabs, setTabs] = useState(() => [makeTab(url || GOOGLE_HOME)]);
+   Active-tab URL (+ tab count) is shared upward so the tutor sees what you
+   browse. `queue` ([{cmd, target, seq}]) executes imperative moves from the
+   agent (navigate/back/forward/newtab/reload/closetab/home) — IN ORDER, each
+   seq exactly once. A queue (not a single object) is required: the director
+   can emit several browser moves in one turn and same-ms ticks would
+   otherwise collapse them into one (new tab opened, navigate never ran). */
+export default function BrowserApp({ url, onNavigate, queue, onAck }) {
+  const cleanInitial = url && url !== NEWTAB ? url : GOOGLE_HOME;
+  const [tabs, setTabs] = useState(() => [makeTab(cleanInitial)]);
   const [activeId, setActiveId] = useState(() => "t1");
-  const [draft, setDraft] = useState(url || GOOGLE_HOME);
+  // Never leak the internal "bugos:newtab" id into the omnibox (it used to
+  // happen on remount and broke hero search: submit navigated the literal id).
+  const [draft, setDraft] = useState(() => (url && url !== NEWTAB ? url : ""));
   const [hero, setHero] = useState("");
 
-  const active = tabs.find((t) => t.id === activeId) || tabs[0];
-  const current = active.history[active.idx];
-  const canBack = active.idx > 0;
-  const canFwd = active.idx < active.history.length - 1;
+  // Ref mirror so agent commands always act on the LATEST tabs even when
+  // several land inside one React batch (setState updaters stay pure — all
+  // reporting happens outside them).
+  const stateRef = useRef({ tabs: null, activeId: "t1" });
+  stateRef.current = { tabs, activeId };
 
-  const commit = (next) => {
-    const cur = next.find((t) => t.id === activeId) || next[0];
-    onNavigate(cur.history[cur.idx]);
+  const report = (next, id) => {
+    const t = next.find((x) => x.id === id) || next[0];
+    onNavigate(t.history[t.idx], { tabs: next.length });
+  };
+
+  const applyTabs = (next, id) => {
+    setTabs(next);
+    setActiveId(id);
+    const t = next.find((x) => x.id === id) || next[0];
+    const u = t.history[t.idx];
+    setDraft(u === NEWTAB ? "" : u);
+    report(next, id);
+  };
+
+  const snapshot = () => {
+    const { tabs: ts, activeId: aid } = stateRef.current;
+    const list = ts && ts.length ? ts : tabs;
+    const a = list.find((t) => t.id === aid) || list[0];
+    return { list, active: a };
   };
 
   const navigate = (raw) => {
     const target = toUrl(raw);
-    setTabs((prev) => {
-      const next = prev.map((t) =>
-        t.id === activeId
-          ? { ...t, history: [...t.history.slice(0, t.idx + 1), target], idx: t.idx + 1 }
-          : t,
-      );
-      commit(next);
-      return next;
-    });
-    setDraft(target);
+    const { list, active } = snapshot();
+    const next = list.map((t) =>
+      t.id === active.id
+        ? { ...t, history: [...t.history.slice(0, t.idx + 1), target], idx: t.idx + 1 }
+        : t,
+    );
+    applyTabs(next, active.id);
   };
 
   const goBack = () => {
-    if (!canBack) return;
-    setTabs((prev) => {
-      const next = prev.map((t) => (t.id === activeId ? { ...t, idx: t.idx - 1 } : t));
-      commit(next);
-      return next;
-    });
-    setDraft(active.history[active.idx - 1]);
+    const { list, active } = snapshot();
+    if (active.idx <= 0) return;
+    const next = list.map((t) => (t.id === active.id ? { ...t, idx: t.idx - 1 } : t));
+    applyTabs(next, active.id);
   };
 
   const goFwd = () => {
-    if (!canFwd) return;
-    setTabs((prev) => {
-      const next = prev.map((t) => (t.id === activeId ? { ...t, idx: t.idx + 1 } : t));
-      commit(next);
-      return next;
-    });
-    setDraft(active.history[active.idx + 1]);
+    const { list, active } = snapshot();
+    if (active.idx >= active.history.length - 1) return;
+    const next = list.map((t) => (t.id === active.id ? { ...t, idx: t.idx + 1 } : t));
+    applyTabs(next, active.id);
   };
 
-  const reload = () =>
-    setTabs((prev) => prev.map((t) => (t.id === activeId ? { ...t, reload: t.reload + 1 } : t)));
+  const reload = () => {
+    const { list, active } = snapshot();
+    setTabs(list.map((t) => (t.id === active.id ? { ...t, reload: t.reload + 1 } : t)));
+  };
 
   const goHome = () => navigate(GOOGLE_HOME);
 
   const addTab = () => {
     const t = makeTab(NEWTAB);
-    setTabs((prev) => [...prev, t]);
-    setActiveId(t.id);
-    setDraft("");
-    onNavigate(NEWTAB);
+    const { list } = snapshot();
+    setHero("");
+    applyTabs([...list, t], t.id);
   };
 
   const closeTab = (e, id) => {
-    e.stopPropagation();
-    setTabs((prev) => {
-      if (prev.length === 1) {
-        const fresh = [makeTab(NEWTAB)];
-        setActiveId(fresh[0].id);
-        setDraft("");
-        onNavigate(NEWTAB);
-        return fresh;
-      }
-      const next = prev.filter((t) => t.id !== id);
-      if (id === activeId) {
-        const cur = next[next.length - 1];
-        setActiveId(cur.id);
-        setDraft(cur.history[cur.idx] === NEWTAB ? "" : cur.history[cur.idx]);
-        onNavigate(cur.history[cur.idx]);
-      }
-      return next;
-    });
+    e?.stopPropagation?.();
+    const { list, active } = snapshot();
+    const target = id || active.id;
+    if (list.length === 1) {
+      const fresh = [makeTab(NEWTAB)];
+      setHero("");
+      applyTabs(fresh, fresh[0].id);
+      return;
+    }
+    const next = list.filter((t) => t.id !== target);
+    const cur = next[next.length - 1];
+    applyTabs(next, target === active.id ? cur.id : active.id);
   };
 
   const switchTab = (id) => {
+    const { list } = snapshot();
+    const t = list.find((x) => x.id === id);
+    if (!t) return;
     setActiveId(id);
-    const t = tabs.find((x) => x.id === id);
     const u = t.history[t.idx];
     setDraft(u === NEWTAB ? "" : u);
-    onNavigate(u);
+    report(list, id);
   };
 
-  // Agent commands: run once per tick (navigate reuses toUrl, so search
-  // words and URLs both work exactly like the omnibox).
-  const lastCmd = useRef(0);
+  // Agent command queue: drain in order, each seq once (doneRef = idempotent
+  // even if the effect re-fires), then ack so App drops it from the queue.
+  const doneRef = useRef(new Set());
   useEffect(() => {
-    if (!command || command.tick === lastCmd.current) return;
-    lastCmd.current = command.tick;
-    if (command.cmd === "navigate" && command.target) navigate(command.target);
-    else if (command.cmd === "back") goBack();
-    else if (command.cmd === "forward") goFwd();
-    else if (command.cmd === "newtab") addTab();
+    if (!queue || !queue.length) return;
+    if (doneRef.current.size > 500) doneRef.current.clear();
+    for (const c of queue) {
+      if (!c || c.seq == null || doneRef.current.has(c.seq)) continue;
+      doneRef.current.add(c.seq);
+      if (c.cmd === "navigate" && c.target) navigate(c.target);
+      else if (c.cmd === "back") goBack();
+      else if (c.cmd === "forward") goFwd();
+      else if (c.cmd === "newtab") addTab();
+      else if (c.cmd === "reload") reload();
+      else if (c.cmd === "closetab") closeTab(null, c.target || undefined);
+      else if (c.cmd === "home") goHome();
+      try { onAck && onAck(c.seq); } catch { /* noop */ }
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [command]);
+  }, [queue]);
+
+  // Render-time view of the active tab (handlers above use the ref mirror).
+  const active = tabs.find((t) => t.id === activeId) || tabs[0];
+  const current = active.history[active.idx];
+  const canBack = active.idx > 0;
+  const canFwd = active.idx < active.history.length - 1;
 
   const submit = (e) => {
     e?.preventDefault();

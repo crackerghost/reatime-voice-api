@@ -2,6 +2,7 @@ import { useState } from "react";
 import { FaWifi, FaBatteryFull } from "react-icons/fa6";
 
 const APP_META = {
+  tutor: { name: "Tutor" },
   whiteboard: { name: "Whiteboard" },
   code: { name: "Code" },
   browser: { name: "Browser" },
@@ -11,7 +12,7 @@ const APP_META = {
 const MENUS = {
   File: ["new-note", "close-window"],
   Edit: ["clear-chat"],
-  View: ["open-whiteboard", "open-browser", "open-notes", "open-code"],
+  View: ["open-tutor", "open-whiteboard", "open-browser", "open-notes", "open-code"],
   Window: ["minimize", "maximize", "tile-left", "tile-right", "tile-grid", "tile-clear"],
   Help: ["about"],
 };
@@ -20,6 +21,7 @@ const ACTION_LABEL = {
   "new-note": "New Note",
   "close-window": "Close Window",
   "clear-chat": "Clear Chat",
+  "open-tutor": "Open Tutor",
   "open-whiteboard": "Open Whiteboard",
   "open-browser": "Open Browser",
   "open-notes": "Open Notes",
