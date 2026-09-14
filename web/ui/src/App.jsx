@@ -112,6 +112,43 @@ export default function App() {
   const [canvasOpen, setCanvasOpen] = useState(() => typeof window !== "undefined" && window.innerWidth >= 1024);
   const [leftW, setLeftW] = useState(288);
   const [rightW, setRightW] = useState(520);
+  // ---- LLM provider: groq | deepseek (per-turn toggle, persisted) ----
+  const [llmProvider, setLlmProvider] = useState(() => {
+    try {
+      const saved = localStorage.getItem("bugos-llm-provider");
+      return saved === "deepseek" || saved === "groq" ? saved : "groq";
+    } catch {
+      return "groq";
+    }
+  });
+  const [llmProviders, setLlmProviders] = useState(["groq"]);
+  const [llmModels, setLlmModels] = useState({});
+  const llmProviderRef = useRef(llmProvider);
+  useEffect(() => {
+    llmProviderRef.current = llmProvider;
+    try {
+      localStorage.setItem("bugos-llm-provider", llmProvider);
+    } catch { /* private mode */ }
+  }, [llmProvider]);
+  // Learn the server's available providers once (which API keys exist).
+  useEffect(() => {
+    fetch(CONFIG_URL)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((c) => {
+        if (!c) return;
+        if (Array.isArray(c.llm_providers) && c.llm_providers.length) {
+          setLlmProviders(c.llm_providers);
+        }
+        if (c.llm_models && typeof c.llm_models === "object") setLlmModels(c.llm_models);
+        const dflt = c.llm_provider;
+        try {
+          const saved = localStorage.getItem("bugos-llm-provider");
+          if (saved && c.llm_providers?.includes(saved)) return; // keep user's choice
+        } catch { /* ignore */ }
+        if (dflt === "deepseek" || dflt === "groq") setLlmProvider(dflt);
+      })
+      .catch(() => {});
+  }, []);
   // ---- SaathiOS: desktop state (pure UI, voice logic untouched) ----
   // ---- Bug OS window manager: several apps open at once, last = front ----
   const [openApps, setOpenApps] = useState(["tutor"]);
@@ -301,7 +338,9 @@ export default function App() {
   const normCaption = (s) => (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ");
   // Plain per-render closure (refs + stable setters only — no staleness),
   // callable from stable callbacks and the WS handler without dep churn.
-  const matchWaiting = () => {
+  // force=true (turn done): draw everything regardless of trigger match —
+  // a missed trigger must never strand a step as a blank page.
+  const matchWaiting = (force = false) => {
     if (!waitingRef.current.length) return;
     const rawCap = assistantTextRef.current || "";
     const cap = normCaption(rawCap);
@@ -312,7 +351,7 @@ export default function App() {
       const th = (w.el?.trigger_hi || "").trim();
       const hitEn = t && cap && cap.includes(t);
       const hitHi = th && rawCap && rawCap.includes(th);
-      if (!t && !th || hitEn || hitHi || now - w.stagedAt > 8000) {
+      if (force || !t && !th || hitEn || hitHi || now - w.stagedAt > 8000) {
         ready.push(w.el);
         return false;
       }
@@ -321,6 +360,13 @@ export default function App() {
     if (ready.length) {
       revealQueueRef.current.push(...ready);
       if (!revealTimerRef.current) revealNext();
+    }
+    // Backstop: items still waiting have a future 8s deadline but no timer
+    // is running to enforce it — schedule a sweep so they can't strand.
+    if (waitingRef.current.length && !revealTimerRef.current) {
+      const oldest = Math.min(...waitingRef.current.map((w) => w.stagedAt));
+      const delay = Math.max(500, Math.min(8000 - (Date.now() - oldest), 8000));
+      revealTimerRef.current = setTimeout(revealNext, delay);
     }
   };
 
@@ -341,7 +387,15 @@ export default function App() {
     }
     const el = revealQueueRef.current.shift();
     if (!el) {
-      revealTimerRef.current = 0;
+      // Queue drained but trigger-waits remain: keep polling until their
+      // 8s deadline fires — otherwise steps strand as a blank page.
+      if (waitingRef.current.length) {
+        const oldest = Math.min(...waitingRef.current.map((w) => w.stagedAt));
+        const delay = Math.max(500, Math.min(8000 - (Date.now() - oldest), 8000));
+        revealTimerRef.current = setTimeout(revealNext, delay);
+      } else {
+        revealTimerRef.current = 0;
+      }
       return;
     }
     mergeDiagramBatch([el]);
@@ -362,10 +416,35 @@ export default function App() {
 
   /* Flush staged deltas whose audio window has started playing.
      Trigger-bearing elements wait for their spoken word (matchWaiting);
-     the rest join the paced reveal queue in window order. */
-  const flushDiagramsUpTo = useCallback((n) => {
+     the rest join the paced reveal queue in window order.
+     force=true (reply done): bypass trigger gating — draw everything now. */
+  const flushDiagramsUpTo = useCallback((n, force = false) => {
     const staged = stagedDiagramsRef.current;
-    if (!staged.size) return;
+    if (force) {
+      // Turn over: nothing more will be spoken, so triggers can never hit.
+      // Drain staged + waiting straight into the reveal queue.
+      const all = [];
+      for (const k of [...staged.keys()].sort((a, b) => a - b)) {
+        const batch = staged.get(k);
+        staged.delete(k);
+        if (batch?.length) all.push(...batch);
+      }
+      if (waitingRef.current.length) {
+        all.push(...waitingRef.current.map((w) => w.el));
+        waitingRef.current = [];
+      }
+      if (all.length) {
+        revealQueueRef.current.push(...all);
+        if (!revealTimerRef.current) revealNext();
+      }
+      return;
+    }
+    if (!staged.size) {
+      // No new deltas, but waiting triggers may have hit their deadline —
+      // still run the backstop so steps can't strand as a blank page.
+      matchWaiting();
+      return;
+    }
     const keys = [...staged.keys()].filter((k) => k <= n).sort((a, b) => a - b);
     const now = Date.now();
     for (const k of keys) {
@@ -1002,6 +1081,7 @@ export default function App() {
         history: historyRef.current,
         nfeStep: CFG.chatStep,
         clientTurnId: activeTurnIdRef.current,
+        provider: llmProviderRef.current,
       };
       // Push-to-see: the held button already captured + warmed the frame.
       // Attach it (with wait_ms) so the server waits briefly for the in-flight
@@ -1274,9 +1354,9 @@ export default function App() {
               );
             }
             if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
-            // Reply stream done: draw any planner deltas that arrived after
-            // their audio already finished (slow planner tail) — nothing strands.
-            try { flushDiagramsUpTo(Number.MAX_SAFE_INTEGER); } catch { /* noop */ }
+            // Reply stream done: draw EVERYTHING still staged/waiting (slow
+            // planner tail + unmatched triggers) — nothing strands as blank.
+            try { flushDiagramsUpTo(Number.MAX_SAFE_INTEGER, true); } catch { /* noop */ }
 
             assistantTextRef.current = "";
             openAssistantId.current = null;
@@ -2248,6 +2328,10 @@ export default function App() {
                 onShareScreen={shareDown}
                 sharing={sharing}
                 visionEnabled={CFG.visionEnabled}
+                llmProvider={llmProvider}
+                llmProviders={llmProviders}
+                llmModels={llmModels}
+                onProvider={setLlmProvider}
               />
             )}
             {sidebarOpen && (

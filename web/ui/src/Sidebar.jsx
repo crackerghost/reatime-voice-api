@@ -22,6 +22,10 @@ export default function Sidebar({
   onShareScreen,
   sharing,
   visionEnabled,
+  llmProvider,
+  llmProviders,
+  llmModels,
+  onProvider,
 }) {
   const status = connected
     ? listening
@@ -30,6 +34,8 @@ export default function Sidebar({
         : "Warming up"
       : "Ready"
     : "Connecting";
+  const providers = Array.isArray(llmProviders) && llmProviders.length ? llmProviders : ["groq"];
+  const modelOf = (p) => (llmModels && llmModels[p]) || (p === "deepseek" ? "deepseek-chat" : "groq");
 
   return (
     <aside
@@ -70,6 +76,38 @@ export default function Sidebar({
       </div>
 
       <nav className="mt-4 flex flex-col gap-1 px-3" aria-label="Tutor actions">
+        {/* LLM provider toggle: groq <-> deepseek (per-turn, server falls back) */}
+        <div className="mb-1 rounded-xl bg-slate-50 p-1.5" aria-label="LLM provider">
+          <p className="px-1.5 pb-1 text-[10px] font-bold tracking-[0.12em] text-slate-400 uppercase">
+            AI Provider
+          </p>
+          <div className="grid grid-cols-2 gap-1">
+            {["groq", "deepseek"].map((p) => {
+              const available = providers.includes(p);
+              const active = llmProvider === p;
+              return (
+                <button
+                  key={p}
+                  onClick={() => available && onProvider && onProvider(p)}
+                  disabled={!available}
+                  title={available ? modelOf(p) : `${p} API key not set in .env`}
+                  className={`rounded-lg px-2 py-1.5 text-xs font-bold capitalize transition ${
+                    active
+                      ? "bg-[#ff5a5f] text-white shadow-sm"
+                      : available
+                        ? "text-slate-600 hover:bg-white hover:text-[#ff5a5f]"
+                        : "cursor-not-allowed text-slate-300"
+                  }`}
+                >
+                  {p}
+                </button>
+              );
+            })}
+          </div>
+          <p className="truncate px-1.5 pt-1 text-[10px] text-slate-400" title={modelOf(llmProvider || "groq")}>
+            {modelOf(llmProvider || "groq")}
+          </p>
+        </div>
         <button
           onClick={onToggleMic}
           className="group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-[#ff5a5f]/5 hover:text-[#ff5a5f]"

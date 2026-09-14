@@ -35,6 +35,7 @@ def make_schemas(*, default_speed: float, step_min: int, step_max: int, default_
     class ChatRequest(BaseModel):
         messages: list[ChatMsg] = Field(..., min_length=1, max_length=MAX_HISTORY_MESSAGES)
         temperature: float = Field(0.7, ge=0.0, le=2.0)
+        provider: str | None = Field(None, description="LLM provider: groq | deepseek (default from server)")
 
     class VisionRequest(BaseModel):
         image: str = Field(..., min_length=32, max_length=MAX_IMAGE_BASE64_LENGTH,

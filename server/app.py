@@ -236,6 +236,16 @@ LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "550"))
 # "low" keeps first-audio fast; set LLM_REASONING_EFFORT="" to omit the param.
 LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
 MISTRAL_URL = os.environ.get("MISTRAL_URL", "https://api.groq.com/openai/v1/chat/completions")
+# ---------- LLM provider 2: DeepSeek (OpenAI-compatible) ----------
+# Toggle per turn from the UI ("provider": "groq" | "deepseek").
+# Set DEEPSEEK_MODEL to whatever DeepSeek serves you (e.g. deepseek-chat;
+# use the exact "flash" model id they gave you if different).
+LLM_PROVIDER_DEFAULT = os.environ.get("LLM_PROVIDER", "groq").strip().lower() or "groq"
+if LLM_PROVIDER_DEFAULT not in ("groq", "deepseek"):
+    LLM_PROVIDER_DEFAULT = "groq"
+DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions").strip() or "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
+DEEPSEEK_DIAGRAM_MODEL = os.environ.get("DEEPSEEK_DIAGRAM_MODEL", "").strip() or DEEPSEEK_MODEL
 LLM_STREAM_TIMEOUT = float(os.environ.get("VOICE_LLM_TIMEOUT", "120.0"))  # httpx stream read timeout (s)
 VISION_TIMEOUT = float(os.environ.get("VOICE_VISION_TIMEOUT", "90.0"))
 # Extra attempts for TRANSIENT LLM failures (429 rate-limit, 5xx, network
@@ -442,16 +452,56 @@ def _should_include_screen_context(text: str, history: list[dict] | None = None)
 WEB_DIR = HERE / "web" / "ui" / "dist"
 
 
-def _llm_api_key() -> str:
+def _deepseek_api_key() -> str:
+    return os.environ.get("DEEPSEEK_API_KEY", "").strip()
+
+
+def _llm_api_key(provider: str | None = None) -> str:
     """LLM API key: GROQ_API_KEY -> LLM_API_KEY -> MISTRAL_API_KEY.
 
+    provider="groq" forces the Groq chain, "deepseek" the DeepSeek key.
+    provider=None returns whichever is configured (Groq first).
     .env is loaded once at startup by _load_dotenv(); read from os.environ only.
     """
+    if (provider or "").strip().lower() == "deepseek":
+        return _deepseek_api_key()
+    if (provider or "").strip().lower() == "groq":
+        for name in ("GROQ_API_KEY", "LLM_API_KEY", "MISTRAL_API_KEY"):
+            key = os.environ.get(name, "").strip()
+            if key:
+                return key
+        return ""
     for name in ("GROQ_API_KEY", "LLM_API_KEY", "MISTRAL_API_KEY"):
         key = os.environ.get(name, "").strip()
         if key:
             return key
-    return ""
+    return _deepseek_api_key()
+
+
+def _llm_providers_available() -> list[str]:
+    out = []
+    if _llm_api_key("groq"):
+        out.append("groq")
+    if _llm_api_key("deepseek"):
+        out.append("deepseek")
+    return out
+
+
+def _resolve_llm(provider: str | None) -> dict:
+    """Per-turn provider config: {name, key, url, model, reasoning_effort}."""
+    name = (provider or LLM_PROVIDER_DEFAULT).strip().lower()
+    if name not in ("groq", "deepseek"):
+        name = LLM_PROVIDER_DEFAULT
+    if name == "deepseek":
+        model = DEEPSEEK_MODEL
+        reasoning = ""  # DeepSeek has no reasoning_effort param; reasoner models think on their own
+        return {"name": name, "key": _deepseek_api_key(), "url": DEEPSEEK_URL,
+                "model": model, "reasoning_effort": reasoning,
+                "diagram_model": DEEPSEEK_DIAGRAM_MODEL}
+    reasoning = LLM_REASONING_EFFORT if "gpt-oss" in LLM_MODEL else ""
+    return {"name": name, "key": _llm_api_key("groq"), "url": MISTRAL_URL,
+            "model": LLM_MODEL, "reasoning_effort": reasoning,
+            "diagram_model": DIAGRAM_MODEL}
 
 
 class _LLMRetryable(Exception):
@@ -478,6 +528,9 @@ def _llm_stream_phrases(
     http_client: httpx.Client,
     max_tokens: int | None = None,
     phrase_chars: int = FIRST_WINDOW_CHARS,
+    model: str | None = None,
+    url: str | None = None,
+    reasoning_effort: str | None = None,
 ):
     """Stream LLM tokens and yield speakable phrases as soon as they're ready.
 
@@ -495,21 +548,24 @@ def _llm_stream_phrases(
     total_attempts = 1 + max(0, LLM_RETRIES)
     attempt = 0
     tok_budget = max_tokens or LLM_MAX_TOKENS
+    use_model = model or LLM_MODEL
+    use_url = url or MISTRAL_URL
+    use_reasoning = reasoning_effort if reasoning_effort is not None else LLM_REASONING_EFFORT
     while True:
         payload = {
-            "model": LLM_MODEL,
+            "model": use_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": tok_budget,
             "stream": True,
         }
-        if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
-            payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
+        if use_reasoning and "gpt-oss" in use_model:
+            payload["reasoning_effort"] = use_reasoning  # cap thinking time
         buf = ""
         yielded = False
         retry_wait = 0.8
         try:
-            with http_client.stream("POST", MISTRAL_URL, headers=headers, json=payload) as r:
+            with http_client.stream("POST", use_url, headers=headers, json=payload) as r:
                 if r.status_code != 200:
                     body = r.read()[:300]
                     if r.status_code == 429 or r.status_code >= 500:
@@ -584,7 +640,8 @@ def _llm_stream_phrases(
 
 
 def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt, t0=None,
-                 http_client: httpx.Client | None = None, diagram_ctx: dict | None = None):
+                 http_client: httpx.Client | None = None, diagram_ctx: dict | None = None,
+                 llm_cfg: dict | None = None):
     """3-thread pipeline: LLM producer -> text/windowing -> audio synth.
 
     Pipeline (all three run concurrently, so nothing serializes):
@@ -612,6 +669,11 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
     """
     if http_client is None:
         http_client = state.runtime.provider_clients.llm()
+    cfg = llm_cfg or {}
+    cfg_model = cfg.get("model") or LLM_MODEL
+    cfg_url = cfg.get("url") or MISTRAL_URL
+    cfg_reasoning = cfg.get("reasoning_effort", LLM_REASONING_EFFORT)
+    cfg_diagram_model = cfg.get("diagram_model") or DIAGRAM_MODEL
     # Small talk stays short (same rule as /api/chat): stop after 2 sentences
     last_user = messages[-1]["content"] if messages else ""
     is_greeting = bool(GREETING_RE.search(last_user))
@@ -630,7 +692,10 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
 
     def llm_producer():
         try:
-            for raw, complete in _llm_stream_phrases(key, messages, temperature, http_client):
+            for raw, complete in _llm_stream_phrases(
+                key, messages, temperature, http_client,
+                model=cfg_model, url=cfg_url, reasoning_effort=cfg_reasoning,
+            ):
                 if stop_evt is not None and stop_evt.is_set():
                     return
                 if producer_stop.is_set():
@@ -706,8 +771,8 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             # window had them mangled for TTS (एचटीएमएल टैग, एच वन...).
             d = _generate_step(
                 diagram_ctx["key"], raw_text or win_text, diagram_ctx.get("topic", ""),
-                stop_evt, client=http_client, url=MISTRAL_URL,
-                model=DIAGRAM_MODEL, max_tokens=DIAGRAM_MAX_TOKENS,
+                stop_evt, client=http_client, url=diagram_ctx.get("diagram_url") or cfg_url,
+                model=diagram_ctx.get("diagram_model") or cfg_diagram_model, max_tokens=DIAGRAM_MAX_TOKENS,
                 id_prefix=f"w{n}",
             )
             if not d or (stop_evt is not None and stop_evt.is_set()):
@@ -969,6 +1034,9 @@ def api_config():
         "llm_model": LLM_MODEL,
         "llm_temperature": LLM_TEMPERATURE,
         "llm_max_tokens": LLM_MAX_TOKENS,
+        "llm_provider": LLM_PROVIDER_DEFAULT,
+        "llm_providers": _llm_providers_available(),
+        "llm_models": {"groq": LLM_MODEL, "deepseek": DEEPSEEK_MODEL},
         "diagram_enabled": DIAGRAM_ENABLED,
         "diagram_model": DIAGRAM_MODEL,
         "diagram_max_tokens": DIAGRAM_MAX_TOKENS,
@@ -1239,10 +1307,13 @@ async def ws_tts(websocket: WebSocket):
                 except (TypeError, ValueError):
                     await websocket.send_text(json.dumps({"type": "error", "message": "bad numeric params"}))
                     continue
-                key = _llm_api_key()
+                key = None
+                llm_cfg = _resolve_llm(data.get("provider") or data.get("llm_provider"))
+                key = llm_cfg["key"]
                 if not key:
+                    missing = "DEEPSEEK_API_KEY" if llm_cfg["name"] == "deepseek" else "GROQ_API_KEY"
                     await websocket.send_text(
-                        json.dumps({"type": "error", "message": "LLM API key not configured (set GROQ_API_KEY or MISTRAL_API_KEY in .env)"})
+                        json.dumps({"type": "error", "message": f"LLM API key not configured for {llm_cfg['name']} (set {missing} in .env)"})
                     )
                     continue
                 history = [
@@ -1391,7 +1462,7 @@ async def ws_tts(websocket: WebSocket):
                 turn_id = uuid.uuid4().hex
                 client_turn_id = str(data.get("client_turn_id", ""))[:80]
                 should_diagram = _should_generate_diagram(text, history, DIAGRAM_ENABLED)
-                log.info("WS chat request: %s%s", text[:50], " [diagram candidate]" if should_diagram else "")
+                log.info("WS chat request [%s/%s]: %s%s", llm_cfg["name"], llm_cfg["model"], text[:50], " [diagram candidate]" if should_diagram else "")
                 busy[0] = True
                 # _screen_paused pauses background screen warm-ups until this
                 # reply finishes streaming (covers disconnects/exceptions too)
@@ -1402,12 +1473,14 @@ async def ws_tts(websocket: WebSocket):
                     # ("diagram") alongside voice — voice never waits for them.
                     diagram_ctx = (
                         {"key": key, "topic": text, "turn_id": turn_id,
-                         "client_turn_id": client_turn_id}
+                          "client_turn_id": client_turn_id,
+                          "diagram_model": llm_cfg.get("diagram_model"),
+                          "diagram_url": llm_cfg.get("url")}
                         if should_diagram else None
                     )
                     threading.Thread(
                         target=_chat_worker,
-                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client, diagram_ctx),
+                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client, diagram_ctx, llm_cfg),
                         daemon=True,
                     ).start()
 
@@ -1971,34 +2044,36 @@ def api_vision(req: VisionRequest):
 
 # ---------- LLM chat (keeps the API key server-side) ----------
 def chat(req: ChatRequest, request: Request):
-    key = _llm_api_key()
+    llm_cfg = _resolve_llm(getattr(req, "provider", None))
+    key = llm_cfg["key"]
     if not key:
+        missing = "DEEPSEEK_API_KEY" if llm_cfg["name"] == "deepseek" else "GROQ_API_KEY"
         raise HTTPException(
             status_code=503,
-            detail="LLM API key not configured. Create Voice_Cloning/.env with GROQ_API_KEY=... (or legacy MISTRAL_API_KEY=...)",
+            detail=f"LLM API key not configured for {llm_cfg['name']}. Create Voice_Cloning/.env with {missing}=...",
         )
 
     http_client = request.app.state.runtime.provider_clients.llm()
 
     def _call(messages: list[dict]) -> str:
         payload = {
-            "model": LLM_MODEL,
+            "model": llm_cfg["model"],
             "messages": messages,
             "temperature": req.temperature,
             "max_tokens": LLM_MAX_TOKENS,
         }
-        if LLM_REASONING_EFFORT and "gpt-oss" in LLM_MODEL:
-            payload["reasoning_effort"] = LLM_REASONING_EFFORT  # cap thinking time
+        if llm_cfg["reasoning_effort"] and "gpt-oss" in llm_cfg["model"]:
+            payload["reasoning_effort"] = llm_cfg["reasoning_effort"]  # cap thinking time
         try:
             r = http_client.post(
-                MISTRAL_URL,
+                llm_cfg["url"],
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json=payload,
             )
         except httpx.HTTPError as e:
             raise HTTPException(status_code=502, detail=f"LLM request failed: {e}") from e
         if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Mistral API {r.status_code}: {r.text[:300]}")
+            raise HTTPException(status_code=502, detail=f"{llm_cfg['name']} API {r.status_code}: {r.text[:300]}")
         try:
             return r.json()["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, ValueError) as e:
@@ -2022,7 +2097,7 @@ def chat(req: ChatRequest, request: Request):
     if GREETING_RE.search(last_user):
         reply = _short_greeting(reply)
     log.info("LLM reply: %s", reply[:80])
-    return {"reply": reply, "model": LLM_MODEL}
+    return {"reply": reply, "model": llm_cfg["model"], "provider": llm_cfg["name"]}
 
 
 from server.routes import asr as asr_routes
