@@ -6,17 +6,32 @@ import { useRef, useState, useEffect } from "react";
    stacked windows keep their title bars visible.
    Drag uses pointer capture on the title bar + a 4px threshold, so a press
    starting anywhere on the bar (even on a traffic button) drags on move and
-   still clicks when released in place. */
+   still clicks when released in place.
+   Split-screen: dragging the title bar to a screen edge/corner previews a
+   tile (halves on sides, quarters in corners, fullscreen on top) and snaps
+   on release — like a real OS. Dragging a snapped tile floats it again. */
 export default function AppWindow({
   title, geom, onGeom, maximized, cascade = 0, leaving, hideChrome,
   parked, parkIndex = 0,
+  snap, onSnap, onUnsnap, onSnapPreview,
   onClose, onMin, onMax, onFocus, children,
 }) {
   const winRef = useRef(null);
   const MIN_W = 480;
   const MIN_H = 340;
-  // Ease animated geometry changes: fullscreen zoom and desktop-park spread
-  // (drag/resize must still track the pointer 1:1).
+  // Tile boxes mirror SNAP_BOXES in App.jsx (same gap math) so the drag
+  // preview lands exactly where the window will.
+  const GAP = 8;
+  const TILE_BOXES = {
+    left: { left: GAP, top: GAP, width: `calc(50% - ${GAP * 1.5}px)`, height: `calc(100% - ${GAP * 2}px)` },
+    right: { left: `calc(50% + ${GAP / 2}px)`, top: GAP, width: `calc(50% - ${GAP * 1.5}px)`, height: `calc(100% - ${GAP * 2}px)` },
+    tl: { left: GAP, top: GAP, width: `calc(50% - ${GAP * 1.5}px)`, height: `calc(50% - ${GAP * 1.5}px)` },
+    tr: { left: `calc(50% + ${GAP / 2}px)`, top: GAP, width: `calc(50% - ${GAP * 1.5}px)`, height: `calc(50% - ${GAP * 1.5}px)` },
+    bl: { left: GAP, top: `calc(50% + ${GAP / 2}px)`, width: `calc(50% - ${GAP * 1.5}px)`, height: `calc(50% - ${GAP * 1.5}px)` },
+    br: { left: `calc(50% + ${GAP / 2}px)`, top: `calc(50% + ${GAP / 2}px)`, width: `calc(50% - ${GAP * 1.5}px)`, height: `calc(50% - ${GAP * 1.5}px)` },
+  };
+  // Ease animated geometry changes: fullscreen zoom, tile snaps and
+  // desktop-park spread (drag/resize must still track the pointer 1:1).
   const [gliding, setGliding] = useState(false);
   const firstMount = useRef(true);
   useEffect(() => {
@@ -27,10 +42,11 @@ export default function AppWindow({
     setGliding(true);
     const t = setTimeout(() => setGliding(false), 560);
     return () => clearTimeout(t);
-  }, [maximized, parked]);
+  }, [maximized, parked, snap]);
 
   // Default (never dragged/resized): 70% x 70% window, centered, cascaded
   // so stacked windows keep their title bars visible.
+  // Snapped (split-screen tile): fixed tile box, always above floating geom.
   // Parked (desktop spread): a clickable title-bar strip tucked under the
   // menu bar — always hittable, fanned per window.
   const box = maximized || !geom
@@ -38,13 +54,17 @@ export default function AppWindow({
       ? { left: 0, top: 0, width: "100%", height: "100%" }
       : parked
         ? { left: `${4 + parkIndex * 8}%`, top: 2, width: "30%", height: 46 }
-        : {
+        : snap && TILE_BOXES[snap]
+          ? { ...TILE_BOXES[snap] }
+          : {
             left: `calc(15% + ${cascade * 36}px)`,
             top: `calc(15% + ${cascade * 44}px)`,
             width: "70%",
             height: "70%",
           }
-    : parked
+    : snap && TILE_BOXES[snap] && !parked
+      ? { ...TILE_BOXES[snap] }
+      : parked
       ? { left: `${4 + parkIndex * 8}%`, top: 2, width: "30%", height: 46 }
       : { left: geom.x, top: geom.y, width: geom.w, height: geom.h };
 
@@ -64,6 +84,28 @@ export default function AppWindow({
     const sx = e.clientX;
     const sy = e.clientY;
     let dragging = false;
+    let floated = false; // snapped tile converted to floating geom this gesture
+    let lastZone = null;
+    // Real-OS snap zones: generous corners (quarters) win over thin edges
+    // (halves), top edge means fullscreen.
+    const EDGE = 24;
+    const CORNER = 72;
+    const zoneAt = (cx, cy) => {
+      const px = cx - parent.left;
+      const py = cy - parent.top;
+      const lClose = px <= CORNER;
+      const rClose = px >= parent.width - CORNER;
+      const tClose = py <= CORNER;
+      const bClose = py >= parent.height - CORNER;
+      if (tClose && lClose) return "tl";
+      if (tClose && rClose) return "tr";
+      if (bClose && lClose) return "bl";
+      if (bClose && rClose) return "br";
+      if (px <= EDGE) return "left";
+      if (px >= parent.width - EDGE) return "right";
+      if (py <= EDGE) return "top";
+      return null;
+    };
     try {
       header.setPointerCapture && header.setPointerCapture(e.pointerId);
     } catch {
@@ -72,14 +114,51 @@ export default function AppWindow({
     const move = (ev) => {
       if (!dragging && Math.hypot(ev.clientX - sx, ev.clientY - sy) < 4) return;
       dragging = true;
+      // First real move on a snapped tile: float it in place (tile pixel
+      // rect becomes the floating geom) so there's no position jump, then
+      // drag normally. A click without movement never unsnaps.
+      if (snap && !floated) {
+        floated = true;
+        onUnsnap && onUnsnap({
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          x: Math.round(Math.max(0, Math.min(r.left - parent.left, parent.width - 140))),
+          y: Math.round(Math.max(0, Math.min(r.top - parent.top, parent.height - 48))),
+        });
+      }
       const x = Math.max(0, Math.min(ev.clientX - parent.left - ox, parent.width - 140));
       const y = Math.max(0, Math.min(ev.clientY - parent.top - oy, parent.height - 48));
       onGeom({ w: Math.round(r.width), h: Math.round(r.height), x: Math.round(x), y: Math.round(y) });
+      const zone = zoneAt(ev.clientX, ev.clientY);
+      if (zone !== lastZone) {
+        lastZone = zone;
+        onSnapPreview && onSnapPreview(zone);
+      }
     };
     const up = () => {
       header.removeEventListener("pointermove", move);
       header.removeEventListener("pointerup", up);
       header.removeEventListener("pointercancel", up);
+      // Release inside a snap zone tiles the window (top edge = fullscreen
+      // zoom). A rejected 5th tile keeps the deny highlight briefly, then
+      // stays floating where it was dropped.
+      if (dragging && lastZone) {
+        const zone = lastZone;
+        lastZone = null;
+        if (zone === "top") {
+          onSnapPreview && onSnapPreview(null);
+          onMax && onMax();
+        } else {
+          const ok = onSnap ? onSnap(zone) : true;
+          if (ok === false) {
+            setTimeout(() => onSnapPreview && onSnapPreview(null), 450);
+          } else {
+            onSnapPreview && onSnapPreview(null);
+          }
+        }
+      } else if (!dragging) {
+        onSnapPreview && onSnapPreview(null);
+      }
     };
     header.addEventListener("pointermove", move);
     header.addEventListener("pointerup", up);
@@ -87,7 +166,7 @@ export default function AppWindow({
   };
 
   const startResize = (dir) => (e) => {
-    if (maximized || parked) return;
+    if (maximized || parked || snap) return;
     if (e.button !== undefined && e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
@@ -173,7 +252,7 @@ export default function AppWindow({
         <div
           onPointerDown={startDrag}
           onDoubleClick={onMax}
-          title="Drag to move"
+          title={snap ? "Drag to float • double-click to zoom" : "Drag to move • drop on screen edges/corners to split"}
           aria-hidden={hideChrome}
           className={`os-titlebar relative z-20 flex shrink-0 cursor-grab touch-none items-center px-4 transition-all duration-200 select-none active:cursor-grabbing ${hideChrome ? "h-0 overflow-hidden border-0 opacity-0" : "h-10 opacity-100"}`}
           aria-label={`${title} title bar, drag to move`}
@@ -189,7 +268,9 @@ export default function AppWindow({
         </div>
         <div className={`relative z-10 flex min-h-0 flex-col transition-all duration-300 ${parked ? "h-0 flex-none overflow-hidden opacity-0" : "flex-1 opacity-100"}`}>{children}</div>
 
-        {!maximized && !parked && (
+        {/* Split-screen tiles size via their tile box, not free resize:
+            drag the title bar to float the window before resizing. */}
+        {!maximized && !parked && !snap && (
           <>
             <div onPointerDown={startResize("n")} className={`${edge} top-0 right-4 left-4 h-1.5 cursor-ns-resize`} aria-label="Resize top" />
             <div onPointerDown={startResize("s")} className={`${edge} right-4 bottom-0 left-4 h-1.5 cursor-ns-resize`} aria-label="Resize bottom" />

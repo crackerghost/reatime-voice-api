@@ -84,6 +84,20 @@ if (typeof fetch === "function") {
 let msgId = 0;
 const nextId = () => ++msgId;
 
+/* Shared tile geometry (px gap + calc tiles). AppWindow renders the same
+   boxes for snapped windows; the drag preview below mirrors them so the
+   highlight is exactly where the window will land. */
+const SNAP_GAP = 8;
+const SNAP_BOXES = {
+  left: { left: SNAP_GAP, top: SNAP_GAP, width: `calc(50% - ${SNAP_GAP * 1.5}px)`, height: `calc(100% - ${SNAP_GAP * 2}px)` },
+  right: { left: `calc(50% + ${SNAP_GAP / 2}px)`, top: SNAP_GAP, width: `calc(50% - ${SNAP_GAP * 1.5}px)`, height: `calc(100% - ${SNAP_GAP * 2}px)` },
+  tl: { left: SNAP_GAP, top: SNAP_GAP, width: `calc(50% - ${SNAP_GAP * 1.5}px)`, height: `calc(50% - ${SNAP_GAP * 1.5}px)` },
+  tr: { left: `calc(50% + ${SNAP_GAP / 2}px)`, top: SNAP_GAP, width: `calc(50% - ${SNAP_GAP * 1.5}px)`, height: `calc(50% - ${SNAP_GAP * 1.5}px)` },
+  bl: { left: SNAP_GAP, top: `calc(50% + ${SNAP_GAP / 2}px)`, width: `calc(50% - ${SNAP_GAP * 1.5}px)`, height: `calc(50% - ${SNAP_GAP * 1.5}px)` },
+  br: { left: `calc(50% + ${SNAP_GAP / 2}px)`, top: `calc(50% + ${SNAP_GAP / 2}px)`, width: `calc(50% - ${SNAP_GAP * 1.5}px)`, height: `calc(50% - ${SNAP_GAP * 1.5}px)` },
+  top: { left: SNAP_GAP, top: SNAP_GAP, width: `calc(100% - ${SNAP_GAP * 2}px)`, height: `calc(100% - ${SNAP_GAP * 2}px)` },
+};
+
 export default function App() {
   const [messages, setMessages] = useState([{ id: nextId(), role: "assistant", text: GREETING }]);
   const [connected, setConnected] = useState(false);
@@ -138,6 +152,18 @@ export default function App() {
   const [openApps, setOpenApps] = useState([]);
   const [minApps, setMinApps] = useState({});
   const [maxed, setMaxed] = useState({});
+  // Split-screen tiles: id -> "left" | "right" | "tl" | "tr" | "bl" | "br".
+  // Max 4 snapped windows (2x2 square grid). A snapped window is always
+  // un-maximized and un-minimized; dragging it floats it again.
+  const [snaps, setSnaps] = useState({});
+  const snapsRef = useRef({});
+  useEffect(() => { snapsRef.current = snaps; }, [snaps]);
+  // Live drag-snap preview zone (rendered as a glass highlight) + brief
+  // deny flash when a 5th tile is rejected.
+  const [snapPreview, setSnapPreview] = useState(null);
+  const [snapDeny, setSnapDeny] = useState(false);
+  const denyTimer = useRef(0);
+  useEffect(() => () => clearTimeout(denyTimer.current), []);
   // Per-app window geometry (drag/resize memory). null = centered default.
   const [winGeom, setWinGeom] = useState({});
   // Exit animations: a closing/minimizing window plays its shrink-out
@@ -163,8 +189,108 @@ export default function App() {
       return n;
     });
   };
-  const visibleApps = openApps.filter((id) => !minApps[id] && !leaving[id]);
-  const activeApp = visibleApps.length ? visibleApps[visibleApps.length - 1] : null;
+  // EDGE-CASE FIX 1 — stable active window during exit animations.
+  // `leaving` windows still render (shrink-out) for 180ms. The old code
+  // excluded them from `visibleApps`, so `activeApp` flipped to the window
+  // below the instant close/minimize started: MenuBar relabeled mid-flight,
+  // the container's fullscreen padding toggled early, and z-order fought the
+  // exit animation. Now the leaving window stays active (and on top) until
+  // its timer actually removes/minimizes it.
+  const navigatingApps = openApps.filter((id) => !minApps[id]); // includes leaving
+  const visibleApps = navigatingApps.filter((id) => !leaving[id]);
+  const activeApp = navigatingApps.length ? navigatingApps[navigatingApps.length - 1] : null;
+  // EDGE-CASE FIX 2 — z-order follows the visible stack so minimized
+  // windows never leave stacking gaps; the leaving window pins to the top.
+  const zFor = (id) => {
+    if (leaving[id]) return 10 + openApps.length + 5;
+    const i = visibleApps.indexOf(id);
+    return i === -1 ? 10 + openApps.indexOf(id) : 10 + i;
+  };
+  // ---- split-screen helpers (max 4 tiled windows) ----
+  const snappedIds = Object.keys(snaps).filter(
+    (id) => snaps[id] && openApps.includes(id) && !minApps[id],
+  );
+  const flashDeny = () => {
+    setSnapDeny(true);
+    clearTimeout(denyTimer.current);
+    denyTimer.current = setTimeout(() => setSnapDeny(false), 450);
+  };
+  const doSnap = (id, zone) => {
+    if (!id || !zone) return false;
+    const cur = snapsRef.current;
+    // Re-tiling an already-snapped window never counts against the cap.
+    if (!cur[id]) {
+      const n = Object.keys(cur).filter(
+        (k) => cur[k] && openApps.includes(k) && !minApps[k],
+      ).length;
+      if (n >= 4) {
+        flashDeny(); // square is full — reject the 5th tile
+        return false;
+      }
+    }
+    cancelLeave(id);
+    setSpreadTop(false);
+    setMinApps((p) => (p[id] ? { ...p, [id]: false } : p));
+    setMaxed((p) => (p[id] ? { ...p, [id]: false } : p)); // tiles are never maximized
+    setSnaps((p) => ({ ...p, [id]: zone }));
+    focusApp(id);
+    return true;
+  };
+  const unsnap = (id, geom) => {
+    setSnaps((p) => {
+      if (!p[id]) return p;
+      const n = { ...p };
+      delete n[id];
+      return n;
+    });
+    // A dragged tile keeps its on-screen pixel rect as its floating geom so
+    // the window doesn't jump back to a stale position mid-gesture.
+    if (geom) setWinGeom((p) => ({ ...p, [id]: geom }));
+  };
+  // Auto-arrange up to 4 visible windows into the square grid:
+  // 1 -> fullscreen, 2 -> halves, 3 -> half + 2 quarters, 4 -> 2x2.
+  const tileGrid = () => {
+    const wins = visibleApps.slice(0, 4);
+    if (!wins.length) return;
+    setSpreadTop(false);
+    let zones = [];
+    if (wins.length === 1) zones = ["left", "right"]; // placeholder, normalized below
+    else if (wins.length === 2) zones = ["left", "right"];
+    else if (wins.length === 3) zones = ["left", "tr", "br"];
+    else zones = ["tl", "tr", "bl", "br"];
+    if (wins.length === 1) {
+      // Single window: true fullscreen beats a lonely half tile.
+      const id = wins[0];
+      cancelLeave(id);
+      setSnaps((p) => {
+        if (!p[id]) return p;
+        const n = { ...p };
+        delete n[id];
+        return n;
+      });
+      setMinApps((p) => (p[id] ? { ...p, [id]: false } : p));
+      setMaxed((p) => ({ ...p, [id]: true }));
+      focusApp(id);
+      return;
+    }
+    const next = {};
+    wins.forEach((id, i) => {
+      cancelLeave(id);
+      next[id] = zones[i];
+    });
+    setMinApps((p) => {
+      const n = { ...p };
+      wins.forEach((id) => { delete n[id]; });
+      return n;
+    });
+    setMaxed((p) => {
+      const n = { ...p };
+      wins.forEach((id) => { delete n[id]; });
+      return n;
+    });
+    setSnaps((p) => ({ ...p, ...next }));
+    focusApp(wins[wins.length - 1]);
+  };
   const maximized = !!(activeApp && maxed[activeApp]);
   const geomFor = (id) => winGeom[id] || null;
   const setGeomFor = (id) => (g) => setWinGeom((p) => ({ ...p, [id]: g }));
@@ -385,8 +511,12 @@ export default function App() {
     pendingBoardRef.current = null;
     // Canvas always opens FULLSCREEN, centered — and cancels desktop spread
     // (a stuck spread shrinks windows to the top, which reads as "went up").
+    // Split-screen respect: a user-tiled whiteboard stays tiled (just focus
+    // it); only an untiled board is yanked to fullscreen with the speech.
     setSpreadTop(false);
-    setMaxed((p) => ({ ...p, whiteboard: true }));
+    if (!snapsRef.current.whiteboard) {
+      setMaxed((p) => ({ ...p, whiteboard: true }));
+    }
     setOpenApps((prev) =>
       prev.includes("whiteboard")
         ? [...prev.filter((x) => x !== "whiteboard"), "whiteboard"]
@@ -2176,15 +2306,29 @@ export default function App() {
     focusApp(id);
     if (id === "whiteboard") {
       setFollowLive(true);
+      // Explicit open = fullscreen canvas: leave the tile grid first so
+      // snap and maximize never fight over the same window.
+      setSnaps((p) => {
+        if (!p.whiteboard) return p;
+        const n = { ...p };
+        delete n.whiteboard;
+        return n;
+      });
       setMaxed((p) => ({ ...p, whiteboard: true })); // canvas is fullscreen
       setStepIndex(Math.max(0, steps.length - 1));
     }
     pokeDock();
   };
-  // Dock toggle: restore if minimized, minimize if front, focus otherwise.
+  // EDGE-CASE FIX 3 — dock clicks during the 180ms exit used to be
+  // swallowed (`if (leaving[id]) return`), so rapid minimize/restore felt
+  // stuck. Now they cancel the exit and restore, matching focusApp.
   const codeCtxRef = useRef(null);
   const toggleDock = (id) => {
-    if (leaving[id]) return;
+    if (leaving[id]) {
+      focusApp(id); // cancels the exit, restores the window
+      pokeDock();
+      return;
+    }
     if (minApps[id]) focusApp(id);
     else if (!openApps.includes(id)) focusApp(id);
     else if (activeApp === id) minimizeApp(id);
@@ -2199,6 +2343,12 @@ export default function App() {
       delete leaveTimers.current[id];
       if (action === "close") {
         setOpenApps((prev) => prev.filter((x) => x !== id));
+        setSnaps((p) => {
+          if (!p[id]) return p;
+          const n = { ...p };
+          delete n[id];
+          return n;
+        });
         setMinApps((p) => {
           if (!p[id]) return p;
           const n = { ...p };
@@ -2231,6 +2381,14 @@ export default function App() {
   const minimizeApp = (id) => scheduleLeave(id, "min");
   const zoomApp = (id) => {
     setSpreadTop(false);
+    // Green zoom always leaves the tile grid: a maximized window owns the
+    // screen, a zoomed-out one returns to floating (re-snap via drag/menu).
+    setSnaps((p) => {
+      if (!p[id]) return p;
+      const n = { ...p };
+      delete n[id];
+      return n;
+    });
     setMinApps((p) => (p[id] ? { ...p, [id]: false } : p));
     setMaxed((p) => ({ ...p, [id]: !p[id] }));
   };
@@ -2254,6 +2412,14 @@ export default function App() {
       if (activeApp) minimizeApp(activeApp);
     } else if (action === "maximize") {
       if (activeApp) zoomApp(activeApp);
+    } else if (action === "tile-left") {
+      if (activeApp) doSnap(activeApp, "left");
+    } else if (action === "tile-right") {
+      if (activeApp) doSnap(activeApp, "right");
+    } else if (action === "tile-grid") {
+      tileGrid();
+    } else if (action === "tile-clear") {
+      if (activeApp) unsnap(activeApp);
     } else if (action.startsWith("open-")) {
       openApp(action.slice(5));
     }
@@ -2322,7 +2488,10 @@ export default function App() {
           <div
             key={winId}
             className="pointer-events-none absolute inset-0 transition-transform duration-500 ease-out"
-            style={{ zIndex: 10 + openApps.indexOf(winId), ...fanStyle(visibleApps.indexOf(winId)) }}
+            style={{
+              zIndex: zFor(winId),
+              ...(visibleApps.includes(winId) ? fanStyle(visibleApps.indexOf(winId)) : {}),
+            }}
           >
         {winId === "whiteboard" && (
           <AppWindow
@@ -2330,6 +2499,10 @@ export default function App() {
             geom={geomFor("whiteboard")}
             onGeom={setGeomFor("whiteboard")}
             maximized={!!maxed.whiteboard}
+            snap={snaps.whiteboard}
+            onSnap={(zone) => doSnap("whiteboard", zone)}
+            onUnsnap={(geom) => unsnap("whiteboard", geom)}
+            onSnapPreview={setSnapPreview}
             cascade={openApps.indexOf("whiteboard")}
             leaving={leaving.whiteboard}
             hideChrome={!!maxed.whiteboard && !topChrome}
@@ -2366,6 +2539,10 @@ export default function App() {
             geom={geomFor("browser")}
             onGeom={setGeomFor("browser")}
             maximized={!!maxed.browser}
+            snap={snaps.browser}
+            onSnap={(zone) => doSnap("browser", zone)}
+            onUnsnap={(geom) => unsnap("browser", geom)}
+            onSnapPreview={setSnapPreview}
             cascade={openApps.indexOf("browser")}
             leaving={leaving.browser}
             hideChrome={!!maxed.browser && !topChrome}
@@ -2388,6 +2565,10 @@ export default function App() {
             geom={geomFor("notes")}
             onGeom={setGeomFor("notes")}
             maximized={!!maxed.notes}
+            snap={snaps.notes}
+            onSnap={(zone) => doSnap("notes", zone)}
+            onUnsnap={(geom) => unsnap("notes", geom)}
+            onSnapPreview={setSnapPreview}
             cascade={openApps.indexOf("notes")}
             leaving={leaving.notes}
             hideChrome={!!maxed.notes && !topChrome}
@@ -2416,6 +2597,10 @@ export default function App() {
             geom={geomFor("code")}
             onGeom={setGeomFor("code")}
             maximized={!!maxed.code}
+            snap={snaps.code}
+            onSnap={(zone) => doSnap("code", zone)}
+            onUnsnap={(geom) => unsnap("code", geom)}
+            onSnapPreview={setSnapPreview}
             cascade={openApps.indexOf("code")}
             leaving={leaving.code}
             hideChrome={!!maxed.code && !topChrome}
@@ -2437,6 +2622,32 @@ export default function App() {
         )}
           </div>
         ))}
+        {/* Drag-to-snap preview: glass highlight where the window will tile.
+            Red flash = the 2x2 square is full (max 4). */}
+        {snapPreview && (
+          <div
+            className="pointer-events-none absolute z-[60] rounded-[18px] border-2 border-dashed transition-all duration-150"
+            style={{
+              ...(SNAP_BOXES[snapPreview] || SNAP_BOXES.left),
+              background: snapDeny ? "rgba(255,80,80,0.22)" : "rgba(120,180,255,0.22)",
+              borderColor: snapDeny ? "rgba(255,80,80,0.9)" : "rgba(140,200,255,0.95)",
+              boxShadow: snapDeny
+                ? "0 0 0 4px rgba(255,80,80,0.15)"
+                : "0 0 0 4px rgba(140,200,255,0.18)",
+            }}
+            aria-hidden="true"
+          >
+            <span
+              className="absolute top-2 left-1/2 -translate-x-1/2 rounded-full px-2.5 py-0.5 text-[11px] font-bold whitespace-nowrap"
+              style={{
+                background: snapDeny ? "rgba(180,30,30,0.85)" : "rgba(30,80,160,0.85)",
+                color: "#fff",
+              }}
+            >
+              {snapDeny ? "Split view full (max 4)" : `${snappedIds.length}/4 tiled — release to snap`}
+            </span>
+          </div>
+        )}
         </div>
       </div>
 

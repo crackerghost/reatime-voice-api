@@ -82,11 +82,14 @@ export default function NotchHUD({
 
   return (
     <>
-      {/* hover strip: drift to the very top edge and the panel appears;
-          leaving it collapses (moving into the notch/panel re-asserts open).
-          z-100: always above windows, dock and menu bar — never hidden. */}
+      {/* hover strip: drift to the notch at the very top edge and the panel
+          appears; leaving it collapses (moving into the notch/panel
+          re-asserts open). Narrow (just wider than the notch pill) so
+          hovering window title bars or the menu bar never opens the panel —
+          ONLY the notch area triggers it. z-100: always above windows, dock
+          and menu bar — never hidden. */}
       <div
-        className="absolute inset-x-0 top-0 z-[100] h-8"
+        className="absolute top-0 left-1/2 z-[100] h-8 w-80 -translate-x-1/2"
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         aria-hidden="true"

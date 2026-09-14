@@ -12,7 +12,7 @@ const MENUS = {
   File: ["new-note", "close-window"],
   Edit: ["clear-chat"],
   View: ["open-whiteboard", "open-browser", "open-notes", "open-code"],
-  Window: ["minimize", "maximize"],
+  Window: ["minimize", "maximize", "tile-left", "tile-right", "tile-grid", "tile-clear"],
   Help: ["about"],
 };
 
@@ -26,6 +26,10 @@ const ACTION_LABEL = {
   "open-code": "Open Code",
   minimize: "Minimize",
   maximize: "Zoom",
+  "tile-left": "Tile Left",
+  "tile-right": "Tile Right",
+  "tile-grid": "Tile 2×2 Grid (max 4)",
+  "tile-clear": "Float Window",
   about: "About Bug OS",
 };
 
