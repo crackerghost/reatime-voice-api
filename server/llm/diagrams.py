@@ -259,42 +259,66 @@ def generate_for_step(
     if not _PLANNER_SEMAPHORE.acquire(blocking=False):
         return None
     try:
-        payload = {
-            "model": model,
-            "messages": _step_prompt(step_text, topic, id_prefix),
-            "tools": [DIAGRAM_TOOL],
-            "tool_choice": "auto",
-            "temperature": 0,
-            "max_tokens": max_tokens,
-        }
-        if thinking is not None:
-            payload["thinking"] = thinking  # DeepSeek V4: disabled = fast tool call
-        # Deliberately no reasoning_effort: see docstring.
-        response = None
-        try:
-            response = client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=payload,
-            )
-            response.raise_for_status()
-        except Exception as e:
-            # Log the body once — Groq 400s carry the real reason (bad tool
-            # payload, token budget, model capability). Voice is unaffected.
-            try:
-                body = response.text[:300] if response is not None else ""
-            except Exception:
-                body = ""
-            import logging as _logging
-            _logging.getLogger("voice_api").warning("Diagram planner skipped (%s) %s", e, body)
-            return None
-        message = (response.json().get("choices") or [{}])[0].get("message") or {}
+        import logging as _logging
+        _log = _logging.getLogger("voice_api")
+        # Two budgets: the configured one, then +50% once. Truncated tool
+        # JSON (Groq 400 tool_use_failed / finish_reason "length") is the
+        # top planner failure in prod — a bigger second attempt usually
+        # completes the same board instead of dropping the whole step.
+        budgets = [max_tokens, int(max_tokens * 1.5)]
         arguments = None
-        for call in message.get("tool_calls") or []:
-            function = call.get("function") or {}
-            if function.get("name") == "draw_flowchart_or_diagram":
-                arguments = function.get("arguments")
-                break
+        for attempt, budget in enumerate(budgets):
+            payload = {
+                "model": model,
+                "messages": _step_prompt(step_text, topic, id_prefix),
+                "tools": [DIAGRAM_TOOL],
+                "tool_choice": "auto",
+                "temperature": 0,
+                "max_tokens": budget,
+            }
+            if thinking is not None:
+                payload["thinking"] = thinking  # DeepSeek V4: disabled = fast tool call
+            # Deliberately no reasoning_effort: see docstring.
+            response = None
+            try:
+                response = client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+                response.raise_for_status()
+            except Exception as e:
+                try:
+                    body = response.text[:300] if response is not None else ""
+                except Exception:
+                    body = ""
+                # Truncation 400 -> retry once with the bigger budget.
+                if attempt == 0 and ("tool_use_failed" in body or "Failed to parse tool call" in body):
+                    _log.info("Diagram planner retrying window %s with %d tokens (truncated JSON)", id_prefix, budgets[1])
+                    continue
+                # Log the body once — Groq 400s carry the real reason (bad tool
+                # payload, token budget, model capability). Voice is unaffected.
+                _log.warning("Diagram planner skipped (%s) %s", e, body)
+                return None
+            choice = (response.json().get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            arguments = None
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                if function.get("name") == "draw_flowchart_or_diagram":
+                    arguments = function.get("arguments")
+                    break
+            if not arguments:
+                return None  # judge decided: nothing drawable this step
+            try:
+                json.loads(arguments)
+                break  # valid JSON — stop retrying
+            except (TypeError, ValueError):
+                if attempt == 0:
+                    _log.info("Diagram planner retrying window %s with %d tokens (bad JSON)", id_prefix, budgets[1])
+                    arguments = None
+                    continue
+                return None
         if not arguments:
             return None
         try:
@@ -304,11 +328,13 @@ def generate_for_step(
         if not diagram or stop_evt.is_set():
             return None
         # Namespace ids per window so deltas merge without collisions.
+        # The model is told to prefix with TAG already — don't double it.
         nodes = {}
         out = []
         for item in diagram["elements"]:
             old_id = item["id"]
-            new_id = f"{id_prefix}-{old_id}"[:80]
+            new_id = old_id if old_id.startswith(f"{id_prefix}-") else f"{id_prefix}-{old_id}"
+            new_id = new_id[:80]
             nodes[old_id] = new_id
             item["id"] = new_id
             out.append(item)

@@ -265,10 +265,11 @@ DIAGRAM_ENABLED = os.environ.get("DIAGRAM_EVENTS", "1") == "1"
 #   developer tier serves no faster tool-capable model than gpt-oss-20b, so
 #   the delay win comes from zero reasoning + small token budget + gating,
 #   not from switching models. Set this later if Groq ships a faster one.
-# - DIAGRAM_MAX_TOKENS: per-window tool-call budget (700 fits 3-6 nodes;
-#   450 truncated mid-JSON and Groq 400-rejected the call — prod log proof).
+# - DIAGRAM_MAX_TOKENS: per-window tool-call budget (1000 fits 3-6 nodes;
+#   700 truncated mid-JSON on long labels and Groq 400-rejected the call —
+#   prod log proof. The planner retries once at +50% anyway).
 DIAGRAM_MODEL = os.environ.get("DIAGRAM_MODEL", "").strip() or LLM_MODEL
-DIAGRAM_MAX_TOKENS = int(os.environ.get("DIAGRAM_MAX_TOKENS", "700"))
+DIAGRAM_MAX_TOKENS = int(os.environ.get("DIAGRAM_MAX_TOKENS", "1000"))
 
 from server.llm.prompts import (
     LLM_SYSTEM_PROMPT,
