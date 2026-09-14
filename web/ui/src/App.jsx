@@ -1,7 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FaBars, FaClock, FaDesktop, FaMicrophone, FaPaperPlane, FaStop, FaTableColumns, FaTrash, FaVolumeHigh, FaWandMagicSparkles, FaXmark } from "react-icons/fa6";
-import Sidebar from "./Sidebar.jsx";
-import BottomBar from "./BottomBar.jsx";
 import TutorBoard from "./TutorBoard.jsx";
 import MenuBar from "./os/MenuBar.jsx";
 import Dock from "./os/Dock.jsx";
@@ -10,10 +7,8 @@ import ProgressWidget from "./os/ProgressWidget.jsx";
 import CodeApp from "./os/CodeApp.jsx";
 import BrowserApp from "./os/BrowserApp.jsx";
 import NotesApp from "./os/NotesApp.jsx";
-import TutorPopup from "./os/TutorPopup.jsx";
+import NotchHUD from "./os/NotchHUD.jsx";
 import AppWindow from "./os/AppWindow.jsx";
-import ResizeHandle from "./ResizeHandle.jsx";
-import VoiceGradient from "./VoiceGradient.jsx";
 import { engine } from "./audioEngine.js";
 import { chatMessage, pingMessage, stopMessage } from "./services/ttsProtocol.js";
 
@@ -89,13 +84,6 @@ if (typeof fetch === "function") {
 let msgId = 0;
 const nextId = () => ++msgId;
 
-const fmtClock = (ts) =>
-  ts ? new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-const fmtElapsed = (s) => {
-  if (s == null) return "";
-  return s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${s.toFixed(1)}s`;
-};
-
 export default function App() {
   const [messages, setMessages] = useState([{ id: nextId(), role: "assistant", text: GREETING }]);
   const [connected, setConnected] = useState(false);
@@ -105,13 +93,8 @@ export default function App() {
   const [interim, setInterim] = useState("");
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
-  const [micBusy, setMicBusy] = useState(false);
   const [sharing, setSharing] = useState(false); // push-to-see capture active (button held)
   const [diagram, setDiagram] = useState(null);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [canvasOpen, setCanvasOpen] = useState(() => typeof window !== "undefined" && window.innerWidth >= 1024);
-  const [leftW, setLeftW] = useState(288);
-  const [rightW, setRightW] = useState(520);
   // ---- LLM provider: groq | deepseek (per-turn toggle, persisted) ----
   const [llmProvider, setLlmProvider] = useState(() => {
     try {
@@ -149,9 +132,9 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
-  // ---- SaathiOS: desktop state (pure UI, voice logic untouched) ----
-  // ---- Bug OS window manager: several apps open at once, last = front ----
-  const [openApps, setOpenApps] = useState(["tutor"]);
+  // ---- Bug OS window manager: tutor lives in the notch (background agent);
+  // it pops Whiteboard/Browser/Notes/Code as it teaches. Last = front. ----
+  const [openApps, setOpenApps] = useState([]);
   const [minApps, setMinApps] = useState({});
   const [maxed, setMaxed] = useState({});
   // Per-app window geometry (drag/resize memory). null = centered default.
@@ -199,7 +182,6 @@ export default function App() {
     }
   });
   const [activeNoteId, setActiveNoteId] = useState(null);
-  const [popupPinned, setPopupPinned] = useState(false);
   // Learning activity per local day, powers the desktop progress graph.
   const [dayStats, setDayStats] = useState(() => {
     try {
@@ -243,8 +225,6 @@ export default function App() {
       localStorage.setItem("bugos-notes", JSON.stringify(notes));
     } catch { /* private mode — notes stay in memory */ }
   }, [notes]);
-  const leftDragStartRef = useRef(0);
-  const rightDragStartRef = useRef(0);
 
   // Desktop spread: clicking empty wallpaper fans all windows to the top
   // (Apple-like), clicking again restores. Focusing any window also restores.
@@ -263,7 +243,6 @@ export default function App() {
   };
   // ---- mutable runtime state (safe across renders) ----
   const wsRef = useRef(null);
-  const chatEl = useRef(null);
   const apiRef = useRef({});
   const historyRef = useRef([]);
   const pendingRef = useRef([]);
@@ -336,6 +315,11 @@ export default function App() {
   // draws now; 8s deadline backstop so a missed trigger never strands content.
   const waitingRef = useRef([]); // [{el, stagedAt}]
   const normCaption = (s) => (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ");
+  // Whiteboard entrance: the board must NEVER pop before the tutor speaks.
+  // Diagram deltas only STAGE content (audio-synced to the spoken windows);
+  // this fronts the Whiteboard the moment the turn's audio starts playing —
+  // canvas arrives WITH speech, never first. Plain closure like matchWaiting
+  // (refs + stable setters only — safe from the long-lived WS handler).
   // Plain per-render closure (refs + stable setters only — no staleness),
   // callable from stable callbacks and the WS handler without dep churn.
   // force=true (turn done): draw everything regardless of trigger match —
@@ -370,10 +354,35 @@ export default function App() {
     }
   };
 
+  // Whiteboard entrance: the board must NEVER pop before the tutor speaks.
+  // Diagram deltas only STAGE content (audio-synced to the spoken windows);
+  // this fronts the Whiteboard the moment the turn's audio starts playing —
+  // canvas arrives WITH speech, never first. Plain closure like matchWaiting
+  // (refs + stable setters only — safe from the long-lived WS handler).
+  const pendingBoardRef = useRef(null); // turn_id whose visuals are staged but not yet shown
+  const frontBoardIfReady = (force = false) => {
+    if (!pendingBoardRef.current) return;
+    const hasVisuals =
+      revealQueueRef.current.length > 0 ||
+      waitingRef.current.length > 0 ||
+      stagedDiagramsRef.current.size > 0;
+    if (!hasVisuals) return;
+    const audioStarted = speakingRef.current || currentWindowRef.current > 0;
+    if (!force && !audioStarted) return; // speech hasn't begun — keep staging
+    pendingBoardRef.current = null;
+    setOpenApps((prev) =>
+      prev.includes("whiteboard")
+        ? [...prev.filter((x) => x !== "whiteboard"), "whiteboard"]
+        : [...prev, "whiteboard"],
+    );
+    setMinApps((p) => (p.whiteboard ? { ...p, whiteboard: false } : p));
+    setFollowLive(true);
+  };
+
   /* Paced reveal: draw ONE shape per beat so the board grows smoothly with
      the speech instead of popping a whole batch instantly. Each shape gets
-     viewport focus as it appears. Overflow (queue > 12) dumps instantly to
-     avoid falling minutes behind on long turns. */
+     viewport focus as it appears. Backlog (>12) catches up at a fast beat —
+     still stepwise, never an instant dump. */
   const revealNext = useCallback(() => {
     // Sweep expired trigger-waits first (deadline backstop).
     if (waitingRef.current.length) {
@@ -401,10 +410,9 @@ export default function App() {
     mergeDiagramBatch([el]);
     if (el?.id) setDiagramFocus({ ids: [el.id], tick: Date.now() });
     if (revealQueueRef.current.length > 12) {
-      // Long turn, reveal far behind speech — dump the backlog at once.
-      const rest = revealQueueRef.current.splice(0);
-      mergeDiagramBatch(rest);
-      revealTimerRef.current = 0;
+      // Long turn, reveal far behind speech — catch up at a fast beat,
+      // still one shape at a time (never an instant wall of content).
+      revealTimerRef.current = setTimeout(revealNext, 250);
       return;
     }
     if (revealQueueRef.current.length) {
@@ -485,6 +493,7 @@ export default function App() {
     currentWindowRef.current = 0;
     revealQueueRef.current = [];
     waitingRef.current = [];
+    pendingBoardRef.current = null;
     setDiagramFocus(null);
     if (diagramTimerRef.current) {
       clearTimeout(diagramTimerRef.current);
@@ -545,12 +554,6 @@ export default function App() {
   const micToggleRef = useRef(null); // set once by the mic effect; survives re-renders
 
   // ---------- helpers ----------
-  const scrollToBottom = () => {
-    const el = chatEl.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  };
-  useEffect(scrollToBottom, [messages, typing]);
-
   const pushHistory = (role, content) => {
     historyRef.current.push({ role, content });
     if (historyRef.current.length > CFG.maxHistory) historyRef.current.shift();
@@ -628,7 +631,9 @@ export default function App() {
       currentWindowRef.current = winN || 0;
       // Audio-synced board: this window's diagram delta (if already arrived)
       // appears exactly when its speech starts — position matches explanation.
+      // First audio also fronts the staged Whiteboard (canvas with speech).
       try { flushDiagramsUpTo(currentWindowRef.current); } catch { /* board must never break voice */ }
+      try { frontBoardIfReady(); } catch { /* board must never break voice */ }
       // decode the NEXT queued frame in parallel with playing this one, so
       // the handoff is gapless instead of "play -> stop -> decode -> play"
       const pre = (pendingRef.current.length > 0)
@@ -1267,20 +1272,13 @@ export default function App() {
             // Whole-board (legacy) or window delta (watcher sidecar).
             const incoming = m.diagram?.elements?.length ? m.diagram.elements : (m.elements?.length ? m.elements : null);
             if (!incoming) return;
-            // Tutor called canvas: first visual of a turn opens Whiteboard and
-            // brings it front so the tutor draws where the learner looks.
+            // Tutor called canvas: first visual of a turn only STAGES the
+            // board — it fronts when the turn's audio starts (frontBoardIfReady),
+            // so the canvas arrives with speech, never before it.
             // Functional setStates only — safe inside this long-lived handler.
             const isNewVisualTurn = m.turn_id && diagramTurnRef.current !== m.turn_id;
             if (m.turn_id) diagramTurnRef.current = m.turn_id;
-            if (isNewVisualTurn) {
-              setOpenApps((prev) =>
-                prev.includes("whiteboard")
-                  ? [...prev.filter((x) => x !== "whiteboard"), "whiteboard"]
-                  : [...prev, "whiteboard"],
-              );
-              setMinApps((p) => (p.whiteboard ? { ...p, whiteboard: false } : p));
-              setFollowLive(true);
-            }
+            if (isNewVisualTurn) pendingBoardRef.current = m.turn_id;
             console.info(`[diagram] ${m.mode === "append" ? `delta window #${m.window_n ?? "?"}` : "board"}: +${incoming.length} element(s)`);
             if (m.mode === "append" && m.window_n != null) {
               // Audio-synced staging: draw only when window_n's speech plays.
@@ -1292,8 +1290,10 @@ export default function App() {
               }
               stagedDiagramsRef.current.set(wn, prev);
               // Late planner (diagram arrived after its audio already played)
-              // still draws immediately instead of stranding the step forever.
+              // still draws instead of stranding the step forever — and fronts
+              // the board now that speech is already going.
               try { flushDiagramsUpTo(currentWindowRef.current); } catch { /* noop */ }
+              try { frontBoardIfReady(); } catch { /* noop */ }
             } else {
               mergeDiagramBatch(incoming);
             }
@@ -1356,7 +1356,9 @@ export default function App() {
             if (assistantTextRef.current) pushHistory("assistant", assistantTextRef.current);
             // Reply stream done: draw EVERYTHING still staged/waiting (slow
             // planner tail + unmatched triggers) — nothing strands as blank.
+            // Paced reveal keeps it stepwise; board fronts now if not yet shown.
             try { flushDiagramsUpTo(Number.MAX_SAFE_INTEGER, true); } catch { /* noop */ }
+            try { frontBoardIfReady(true); } catch { /* noop */ }
 
             assistantTextRef.current = "";
             openAssistantId.current = null;
@@ -2126,21 +2128,6 @@ export default function App() {
     if (CFG.pushMode && apiRef.current.pushActiveRef?.current) apiRef.current.releasePush();
   }, []);
 
-  /* ---------- draggable panel resize ---------- */
-  const clampW = (value, min, max) => Math.min(max, Math.max(min, value));
-  const startLeftResize = useCallback(() => {
-    leftDragStartRef.current = leftW;
-  }, [leftW]);
-  const resizeLeft = useCallback((dx) => {
-    setLeftW(clampW(leftDragStartRef.current + dx, 200, 560));
-  }, []);
-  const startRightResize = useCallback(() => {
-    rightDragStartRef.current = rightW;
-  }, [rightW]);
-  const resizeRight = useCallback((dx) => {
-    // Handle sits on the panel's LEFT edge: dragging left (dx<0) must WIDEN.
-    setRightW(clampW(rightDragStartRef.current - dx, 340, 900));
-  }, []);
 
   /* ---------- SaathiOS: glass desktop, one focused app + auto-hide dock ----------
      Tutor keeps the full voice+chat pipeline; Whiteboard/Browser/Notes share
@@ -2249,8 +2236,14 @@ export default function App() {
       if (activeNoteId === id) setActiveNoteId(next[0]?.id || null);
       return next;
     });
-  const tutorActive = speaking || listening || typing || !!interim;
-  const popupOpen = popupPinned || (activeApp !== "tutor" && tutorActive);
+  // Single AI response for the notch HUD: the newest assistant message
+  // (streams live — messages update per text event). User bubbles are gone.
+  const latestAssistant = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return messages[i].text;
+    }
+    return "";
+  }, [messages]);
   // Reveal the auto-hide dock briefly on boot so it's discoverable.
   useEffect(() => {
     pokeDock();
@@ -2296,141 +2289,6 @@ export default function App() {
             className="pointer-events-none absolute inset-0 transition-transform duration-500 ease-out"
             style={{ zIndex: 10 + openApps.indexOf(winId), ...fanStyle(visibleApps.indexOf(winId)) }}
           >
-        {winId === "tutor" && (
-          <AppWindow
-            title="Tutor"
-            geom={geomFor("tutor")}
-            onGeom={setGeomFor("tutor")}
-            maximized={!!maxed.tutor}
-            cascade={openApps.indexOf("tutor")}
-            leaving={leaving.tutor}
-            hideChrome={!!maxed.tutor && !topChrome}
-            onFocus={() => {
-              setSpreadTop(false); if (activeApp !== "tutor") focusApp("tutor");
-            }}
-            onClose={() => closeApp("tutor")}
-            onMin={() => minimizeApp("tutor")}
-            onMax={() => zoomApp("tutor")}
-          >
-          <div className="flex min-h-0 flex-1">
-            {sidebarOpen && (
-              <Sidebar
-                open={sidebarOpen}
-                onClose={() => setSidebarOpen(false)}
-                width={leftW}
-                connected={connected}
-                listening={listening}
-                asrReady={asrReady}
-                messageCount={messages.length}
-                hasDiagram={!!(diagram?.elements?.length)}
-                onClear={clearChat}
-                onToggleMic={handleToggleMic}
-                onShareScreen={shareDown}
-                sharing={sharing}
-                visionEnabled={CFG.visionEnabled}
-                llmProvider={llmProvider}
-                llmProviders={llmProviders}
-                llmModels={llmModels}
-                onProvider={setLlmProvider}
-              />
-            )}
-            {sidebarOpen && (
-              <ResizeHandle
-                onDragStart={startLeftResize}
-                onDrag={resizeLeft}
-                className="max-md:hidden"
-              />
-            )}
-            <div className="relative z-10 flex min-w-0 flex-1 flex-col">
-              <VoiceGradient listening={listening} speaking={speaking} userTalking={userTalking} />
-              {!sidebarOpen && (
-                <button
-                  onClick={() => setSidebarOpen(true)}
-                  className="absolute top-3 left-3 z-20 inline-flex h-9 w-9 items-center justify-center rounded-full bg-white/70 text-slate-500 shadow-md backdrop-blur transition hover:bg-white hover:text-[#ff5a5f]"
-                  aria-label="Show sidebar"
-                >
-                  <FaBars className="h-4 w-4" />
-                </button>
-              )}
-              {asrRejected && (
-                <span className="absolute top-3 left-1/2 z-20 -translate-x-1/2 rounded-full bg-amber-50/90 px-2.5 py-1 text-[11px] font-semibold whitespace-nowrap text-amber-700 shadow-sm backdrop-blur">
-                  {asrRejected}
-                </span>
-              )}
-
-              <main className="relative z-10 flex min-h-0 flex-1 overflow-hidden">
-                <section
-                  ref={chatEl}
-                  className="mx-auto flex min-h-0 w-full max-w-3xl flex-col gap-3 overflow-y-auto px-4 pt-2 pb-2 sm:px-6"
-                  aria-live="polite"
-                  aria-label="Chat transcript"
-                >
-                  {messages.map((message) => {
-                    const isUser = message.role === "user";
-                    const isError = message.role === "error";
-                    return (
-                      <article
-                        key={message.id}
-                        className={`max-w-[88%] rounded-2xl px-4 py-3 text-sm leading-6 shadow-sm ${
-                          isError
-                            ? "self-start border border-rose-200 bg-rose-50 text-rose-700"
-                            : isUser
-                              ? "self-end bg-[#ff5a5f] text-white"
-                              : "self-start border border-white/60 bg-white/80 text-slate-700 backdrop-blur"
-                        }`}
-                      >
-                        <div
-                          className={`mb-1 text-[0.62rem] font-bold tracking-[0.12em] uppercase ${
-                            isUser ? "text-white/80" : isError ? "text-rose-500" : "text-[#ff5a5f]"
-                          }`}
-                        >
-                          {isError ? "Notice" : isUser ? "You" : "Tutor"}
-                        </div>
-                        <p className="whitespace-pre-wrap">{message.text}</p>
-                        {message.elapsed != null && (
-                          <span className="mt-2 block text-[0.65rem] opacity-60">
-                            {fmtElapsed(message.elapsed)}
-                          </span>
-                        )}
-                      </article>
-                    );
-                  })}
-                  {interim && (
-                    <div className="self-end max-w-[88%] rounded-2xl border border-dashed border-[#ff5a5f]/40 bg-[#ff5a5f]/5 px-4 py-3 text-sm leading-6 text-slate-700 shadow-sm">
-                      <div className="mb-1 text-[0.62rem] font-bold tracking-[0.12em] text-[#ff5a5f] uppercase">
-                        You’re saying…
-                      </div>
-                      <p className="whitespace-pre-wrap">{interim}</p>
-                    </div>
-                  )}
-                  {typing && (
-                    <div className="self-start rounded-2xl border border-white/60 bg-white/70 px-4 py-3 text-xs text-slate-400">
-                      Tutor is thinking…
-                    </div>
-                  )}
-                </section>
-              </main>
-
-              <BottomBar
-                input={input}
-                setInput={setInput}
-                sendText={sendText}
-                connected={connected}
-                listening={listening}
-                micBusy={micBusy}
-                speaking={speaking}
-                userTalking={userTalking}
-                sharing={sharing}
-                visionEnabled={CFG.visionEnabled}
-                onToggleMic={handleToggleMic}
-                onShareDown={shareDown}
-                onShareUp={shareUp}
-              />
-            </div>
-          </div>
-          </AppWindow>
-        )}
-
         {winId === "whiteboard" && (
           <AppWindow
             title={`Whiteboard${steps.length ? ` · ${steps.length} step${steps.length > 1 ? "s" : ""}` : ""}`}
@@ -2546,22 +2404,31 @@ export default function App() {
         </div>
       </div>
 
-      {/* No desktop popup — the dock is always reachable and opens apps. */}
-      <TutorPopup
-        open={popupOpen}
-        pinned={popupPinned}
-        onTogglePin={() => setPopupPinned((v) => !v)}
-        onOpenTutor={() => openApp("tutor")}
+      {/* Tutor lives in the notch — voice agent background, no popup. */}
+      <NotchHUD
+        connected={connected}
         speaking={speaking}
         listening={listening}
+        userTalking={userTalking}
         typing={typing}
         interim={interim}
         input={input}
         setInput={setInput}
         sendText={sendText}
-        connected={connected}
         onToggleMic={handleToggleMic}
-        micBusy={micBusy}
+        onStop={hardStop}
+        onShareDown={shareDown}
+        onShareUp={shareUp}
+        sharing={sharing}
+        visionEnabled={CFG.visionEnabled}
+        llmProvider={llmProvider}
+        llmProviders={llmProviders}
+        llmModels={llmModels}
+        onProvider={setLlmProvider}
+        response={latestAssistant}
+        asrReady={asrReady}
+        asrRejected={asrRejected}
+        onClear={clearChat}
       />
 
       <Dock

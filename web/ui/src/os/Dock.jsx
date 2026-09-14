@@ -1,17 +1,16 @@
 import { useRef, useState } from "react";
 import {
-  FaGraduationCap, FaGlobe, FaNoteSticky, FaChalkboardUser, FaCode,
+  FaGlobe, FaNoteSticky, FaChalkboardUser, FaCode,
 } from "react-icons/fa6";
 
 const APPS = [
-  { id: "tutor", name: "Tutor", icon: <FaGraduationCap />, bg: "linear-gradient(165deg,#ffb199 0%,#ff5a5f 55%,#d63a4e 100%)", fg: "#fff" },
   { id: "whiteboard", name: "Whiteboard", icon: <FaChalkboardUser />, bg: "linear-gradient(165deg,#fde68a 0%,#f59e0b 60%,#b45309 100%)", fg: "#fff" },
   { id: "browser", name: "Browser", icon: <FaGlobe />, bg: "linear-gradient(165deg,#7dd3fc 0%,#2563eb 60%,#1e3a8a 100%)", fg: "#fff" },
   { id: "code", name: "Code", icon: <FaCode />, bg: "linear-gradient(165deg,#c4b5fd 0%,#7c3aed 60%,#4c1d95 100%)", fg: "#fff" },
   { id: "notes", name: "Notes", icon: <FaNoteSticky />, bg: "linear-gradient(165deg,#fefce8 0%,#fde047 55%,#eab308 100%)", fg: "#92400e" },
 ];
 
-/* Bug OS dock: the 4 apps, mac-style cursor magnification, running dots. */
+/* Bug OS dock: tutor lives in the notch — the apps it teaches with. */
 export default function Dock({ activeApp, onOpen, visible, running, noteCount }) {
   const trackRef = useRef(null);
   const [mag, setMag] = useState([]);
