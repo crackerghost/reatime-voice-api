@@ -46,6 +46,7 @@ from server.runtime import VoiceRuntime
 from server.settings import Settings
 
 from server.llm.diagrams import generate_for_step as _generate_step, should_generate as _should_generate_diagram
+from server.llm.os_control import plan_os_actions as _plan_os, sanitize_os_snapshot as _sanitize_os, should_direct as _should_direct, wants_os_action as _wants_os_action, ack_block as _os_ack_block
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("voice_api")
@@ -260,6 +261,13 @@ VISION_TIMEOUT = float(os.environ.get("VOICE_VISION_TIMEOUT", "90.0"))
 # sentence is spoken, so a retry can never interrupt a playing reply.
 LLM_RETRIES = int(os.environ.get("LLM_RETRIES", "2"))
 DIAGRAM_ENABLED = os.environ.get("DIAGRAM_EVENTS", "1") == "1"
+# OS Director: per-turn sidecar that lets the tutor open/arrange apps and
+# drive the browser via {"type":"os_action"} messages. Best-effort, voice-first.
+OS_DIRECTOR_ENABLED = os.environ.get("OS_DIRECTOR_EVENTS", "1") == "1"
+# Blocking budget (seconds) for action turns: "browser kholo" runs the
+# director BEFORE the reply so the tutor can talk about its moves in the
+# SAME answer. Other turns keep the zero-latency background sidecar.
+OS_DIRECTOR_BLOCK_S = float(os.environ.get("OS_DIRECTOR_BLOCK_S", "5") or 5)
 # Diagram planner knobs (env-tunable, no code edits needed):
 # - DIAGRAM_MODEL: blank/ unset = reuse the chat model (default). Groq's
 #   developer tier serves no faster tool-capable model than gpt-oss-20b, so
@@ -654,7 +662,7 @@ def _llm_stream_phrases(
 
 def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop_evt, t0=None,
                  http_client: httpx.Client | None = None, diagram_ctx: dict | None = None,
-                 llm_cfg: dict | None = None):
+                 llm_cfg: dict | None = None, os_ctx: dict | None = None):
     """3-thread pipeline: LLM producer -> text/windowing -> audio synth.
 
     Pipeline (all three run concurrently, so nothing serializes):
@@ -809,6 +817,37 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
         win_q.put({"text": win_text, "steps": steps, "n": n})
         if watch and diagram_ctx:
             threading.Thread(target=_diagram_watch, args=(n, win_text, raw_text), daemon=True).start()
+
+    def _os_director() -> None:
+        """OS Director sidecar: one fast tool-call per turn, fired at turn
+        start so window moves land while the tutor is still speaking. Each
+        validated action streams as ("os_action", {...}); the client executes
+        it against its window manager. Best-effort — never blocks voice."""
+        try:
+            if stop_evt is not None and stop_evt.is_set():
+                return
+            if not os_ctx:
+                return
+            actions = _plan_os(
+                os_ctx["key"], os_ctx.get("text", ""), os_ctx.get("snapshot") or {},
+                stop_evt=stop_evt, client=http_client,
+                url=os_ctx.get("url") or cfg_url,
+                model=os_ctx.get("model") or cfg_diagram_model,
+                thinking=os_ctx.get("thinking"),
+            )
+            for a in actions or []:
+                if stop_evt is not None and stop_evt.is_set():
+                    return
+                out_q.put(("os_action", {
+                    **a, "client_turn_id": os_ctx.get("client_turn_id", ""),
+                }))
+            if actions:
+                log.info("OS director: %d action(s) [%s]",
+                         len(actions), ", ".join(str(x.get("op", "?")) for x in actions))
+        except Exception as e:  # noqa: BLE001 — director must never break voice
+            log.warning("OS director skipped: %s", e)
+
+    threading.Thread(target=_os_director, daemon=True).start()
 
     try:
         window = []          # phrases buffered for the next audio window
@@ -1057,6 +1096,8 @@ def api_config():
         "diagram_enabled": DIAGRAM_ENABLED,
         "diagram_model": DIAGRAM_MODEL,
         "diagram_max_tokens": DIAGRAM_MAX_TOKENS,
+        "os_director_enabled": OS_DIRECTOR_ENABLED,
+        "os_director_block_s": OS_DIRECTOR_BLOCK_S,
         # browser-side conversation behaviour (read by web/ui/src/App.jsx)
         "chat_step": int(os.environ.get("VOICE_CHAT_STEP", "8")),  # nfe_step the UI sends
         "jitter_frames": JITTER_FRAMES,
@@ -1496,9 +1537,72 @@ async def ws_tts(websocket: WebSocket):
                           "diagram_thinking": llm_cfg.get("diagram_thinking")}
                         if should_diagram else None
                     )
+                    # OS Director snapshot: what the tutor sees of the desktop
+                    # (front app, open/minimized/tiled apps, browser URL...).
+                    # Fired even when diagrams are off — browser/notes control
+                    # doesn't need the board.
+                    os_snapshot = _sanitize_os(
+                        data.get("os") if isinstance(data.get("os"), dict) else None
+                    )
+                    os_ctx = None
+                    if OS_DIRECTOR_ENABLED and key and _wants_os_action(text):
+                        # Action turn ("browser kholo"): run the director
+                        # BLOCKING (bounded) and execute its moves BEFORE the
+                        # reply streams, then tell the LLM what it did — so
+                        # the tutor talks about its moves in the SAME answer
+                        # ("open kar diya hai, batao kya search karna hai?").
+                        actions_done = []
+                        try:
+                            loop = asyncio.get_running_loop()
+                            actions_done = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    None,
+                                    lambda: _plan_os(
+                                        key, text, os_snapshot, stop_evt=stop_evt,
+                                        client=llm_client,
+                                        url=llm_cfg.get("url"),
+                                        model=llm_cfg.get("diagram_model"),
+                                        thinking=llm_cfg.get("diagram_thinking"),
+                                    ),
+                                ),
+                                timeout=OS_DIRECTOR_BLOCK_S,
+                            ) or []
+                        except Exception as e:  # noqa: BLE001 — timeout/failure: honest ack, no moves
+                            log.info("OS director blocking call skipped (%s)", e)
+                            actions_done = []
+                        if stop_evt.is_set():
+                            actions_done = []  # turn already dead — nothing to narrate
+                        else:
+                            for a in actions_done:
+                                await websocket.send_text(json.dumps({
+                                    "type": "os_action",
+                                    "action": {**a, "client_turn_id": client_turn_id},
+                                }))
+                            if actions_done:
+                                log.info(
+                                    "OS director (blocking): %d action(s) [%s]",
+                                    len(actions_done),
+                                    ", ".join(str(x.get("op", "?")) for x in actions_done),
+                                )
+                        base = messages[0].get("content", "") if isinstance(messages[0], dict) else ""
+                        messages[0] = {
+                            "role": "system",
+                            "content": base + "\n\n" + _os_ack_block(actions_done),
+                        }
+                    else:
+                        # Zero-latency background sidecar (today's behaviour):
+                        # moves land mid-reply without delaying first audio.
+                        os_ctx = (
+                            {"key": key, "text": text, "snapshot": os_snapshot,
+                              "client_turn_id": client_turn_id,
+                              "model": llm_cfg.get("diagram_model"),
+                              "url": llm_cfg.get("url"),
+                              "thinking": llm_cfg.get("diagram_thinking")}
+                            if (OS_DIRECTOR_ENABLED and key and _should_direct(text)) else None
+                        )
                     threading.Thread(
                         target=_chat_worker,
-                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client, diagram_ctx, llm_cfg),
+                        args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client, diagram_ctx, llm_cfg, os_ctx),
                         daemon=True,
                     ).start()
 
@@ -1517,6 +1621,9 @@ async def ws_tts(websocket: WebSocket):
                         elif kind == "diagram":
                             if not stop_evt.is_set():
                                 await websocket.send_text(json.dumps({"type": "diagram", **payload}))
+                        elif kind == "os_action":
+                            if not stop_evt.is_set():
+                                await websocket.send_text(json.dumps({"type": "os_action", "action": payload}))
                         elif kind == "audio":
                             frames += 1
                             if frames == 1:

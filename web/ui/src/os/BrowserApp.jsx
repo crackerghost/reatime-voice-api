@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   FaArrowLeft, FaArrowRight, FaRotateRight, FaHouse, FaLock,
   FaMagnifyingGlass, FaPlus, FaXmark, FaArrowUpRightFromSquare,
@@ -38,8 +38,10 @@ let tabSeq = 1;
 const makeTab = (url) => ({ id: `t${tabSeq++}`, history: [url || GOOGLE_HOME], idx: 0, reload: 0 });
 
 /* Professional tabbed browser: toolbar, omnibox, tabs, new-tab page.
-   Active-tab URL is shared upward so the tutor sees what you browse. */
-export default function BrowserApp({ url, onNavigate }) {
+   Active-tab URL is shared upward so the tutor sees what you browse.
+   `command` ({cmd, target, tick}) executes imperative moves from the agent
+   (navigate/back/forward/newtab) — each tick runs once. */
+export default function BrowserApp({ url, onNavigate, command }) {
   const [tabs, setTabs] = useState(() => [makeTab(url || GOOGLE_HOME)]);
   const [activeId, setActiveId] = useState(() => "t1");
   const [draft, setDraft] = useState(url || GOOGLE_HOME);
@@ -130,6 +132,19 @@ export default function BrowserApp({ url, onNavigate }) {
     setDraft(u === NEWTAB ? "" : u);
     onNavigate(u);
   };
+
+  // Agent commands: run once per tick (navigate reuses toUrl, so search
+  // words and URLs both work exactly like the omnibox).
+  const lastCmd = useRef(0);
+  useEffect(() => {
+    if (!command || command.tick === lastCmd.current) return;
+    lastCmd.current = command.tick;
+    if (command.cmd === "navigate" && command.target) navigate(command.target);
+    else if (command.cmd === "back") goBack();
+    else if (command.cmd === "forward") goFwd();
+    else if (command.cmd === "newtab") addTab();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [command]);
 
   const submit = (e) => {
     e?.preventDefault();

@@ -84,6 +84,16 @@ if (typeof fetch === "function") {
 let msgId = 0;
 const nextId = () => ++msgId;
 
+/* Agent OS control allowlists (mirror server/llm/os_control.py — the client
+   re-validates every os_action before executing it). */
+const AGENT_APPS = ["whiteboard", "browser", "notes", "code"];
+const AGENT_ZONES = ["left", "right", "tl", "tr", "bl", "br"];
+const AGENT_APP_LABEL = { whiteboard: "Whiteboard", browser: "Browser", notes: "Notes", code: "Code" };
+const AGENT_ZONE_LABEL = {
+  left: "left half", right: "right half",
+  tl: "top-left", tr: "top-right", bl: "bottom-left", br: "bottom-right",
+};
+
 /* Shared tile geometry (px gap + calc tiles). AppWindow renders the same
    boxes for snapped windows; the drag preview below mirrors them so the
    highlight is exactly where the window will land. */
@@ -307,6 +317,10 @@ export default function App() {
   // Fullscreen chrome: hidden until the pointer hits the top edge (or Esc).
   const [topChrome, setTopChrome] = useState(false);
   const [browserUrl, setBrowserUrl] = useState("https://www.google.com/webhp?igu=1");
+  // Imperative browser commands from the agent ({cmd, target, tick}).
+  const [browserCmd, setBrowserCmd] = useState(null);
+  // Transient "agent did X" pill (also briefly reveals the dock).
+  const [agentFlash, setAgentFlash] = useState(null);
   const [notes, setNotes] = useState(() => {
     try {
       const next = JSON.parse(localStorage.getItem("bugos-notes") || "null");
@@ -391,6 +405,7 @@ export default function App() {
   const framesRef = useRef(0);
   const turnStartRef = useRef(0); // browser-side: when the current turn was submitted (first-audio stopwatch)
   const activeTurnIdRef = useRef(0);
+  const acceptedOsTurnRef = useRef(null); // turn id whose pre-start agent moves are valid
   const diagramTurnRef = useRef(null);
   const diagramQueueRef = useRef([]); // staged board deltas for smooth step-by-step draw
   const diagramTimerRef = useRef(0);
@@ -894,6 +909,7 @@ export default function App() {
   /* ---- hard stop: instant audio cut + server cancel (barge-in) ---- */
   const hardStop = useCallback(() => {
     dropRef.current = true; // drop stale frames/text until the next "start"
+    acceptedOsTurnRef.current = null; // pre-start agent moves need a fresh submit
     drainRestartRef.current = false;
     drainStartedRef.current = false;
     if (currentSourceRef.current) {
@@ -1268,6 +1284,9 @@ export default function App() {
       hardStop();
       clearDiagramQueue();
       activeTurnIdRef.current += 1;
+      // This turn's pre-start agent moves (blocking director) are valid even
+      // though dropRef is still true until the server's "start".
+      acceptedOsTurnRef.current = String(activeTurnIdRef.current);
       diagramTurnRef.current = null;
       // Fresh board per explanation: the old lesson stays visible while the
       // tutor thinks, then wipes (smooth fade) the moment the NEW reply's
@@ -1336,11 +1355,13 @@ export default function App() {
       ws.send(chatMessage({
         ...payload,
         screen: payload.screen,
-        // Tutor agent context: which OS app is frontmost + what the learner
-        // is looking at. Server ignores it today; the agent uses it to pull
-        // browser/whiteboard/notes content into the answer when wired.
+        // OS Director context: the full desktop snapshot the agent reasons
+        // over to drive apps/browser/tiles via os_action messages.
         os: {
           app: activeApp,
+          open: openApps,
+          minimized: Object.keys(minApps).filter((k) => minApps[k]),
+          snapped: snaps,
           browserUrl,
           note: (() => {
             const n = notes.find((x) => x.id === (activeNoteId || notes[0]?.id));
@@ -1351,7 +1372,7 @@ export default function App() {
         },
       }));
     },
-    [hardStop, activeApp, browserUrl, notes, activeNoteId, steps.length]
+    [hardStop, activeApp, openApps, minApps, snaps, browserUrl, notes, activeNoteId, steps.length]
   );
 
   /* Push-to-see turn: text + the frame captured during the hold. */
@@ -1363,6 +1384,8 @@ export default function App() {
   apiRef.current = {
     submitChat,
     hardStop,
+    // Agent OS control: validated window moves from the OS Director sidecar.
+    execOsAction: (a) => execOsAction(a),
     // Push-to-see: press starts a capture session, release sends the turn.
     startPush: () => startPushCapture(),
     releasePush: () => releasePush(),
@@ -1526,6 +1549,16 @@ export default function App() {
             }
           } else if (m.type === "diagram_error") {
             if (!dropRef.current) console.info("[diagram] visual explanation unavailable", m.message || "");
+          } else if (m.type === "os_action") {
+            // OS Director moves. Blocking-path moves arrive BEFORE "start"
+            // (so the tutor can narrate them) while dropRef is still true —
+            // accept them only for the current turn; stale/interrupted ones
+            // (barge with no resubmit, old turns) are dropped.
+            const turnId = String(m.action?.client_turn_id || "");
+            if (dropRef.current && turnId !== String(acceptedOsTurnRef.current)) return;
+            try {
+              apiRef.current.execOsAction && apiRef.current.execOsAction(m.action);
+            } catch { /* agent moves must never break voice */ }
           } else if (m.type === "text") {
             if (dropRef.current) return; // stale sentence of an aborted reply
             setTyping(false);
@@ -2458,6 +2491,160 @@ export default function App() {
     setMinApps((p) => (p[id] ? { ...p, [id]: false } : p));
     setMaxed((p) => ({ ...p, [id]: !p[id] }));
   };
+  // ---- Agent OS control: executes validated os_action moves from the OS
+  // Director sidecar (open/focus/arrange apps, drive the browser, notes).
+  // Plain closure (fresh state every render), exposed via apiRef so the
+  // long-lived WS handler always calls the current one. Server allowlists +
+  // bounds everything; the client re-validates (defense in depth).
+  const agentFlashTimer = useRef(0);
+  useEffect(() => () => clearTimeout(agentFlashTimer.current), []);
+  // Resubmits (speculative → final) can deliver the same move twice —
+  // swallow exact duplicates within 8s (note_add must never double-write).
+  const lastAgentSigRef = useRef({ sig: "", ts: 0 });
+  const flashAgent = (label) => {
+    setAgentFlash({ label, tick: Date.now() });
+    pokeDock();
+    clearTimeout(agentFlashTimer.current);
+    agentFlashTimer.current = setTimeout(() => setAgentFlash(null), 2600);
+  };
+  const execOsAction = (action) => {
+    if (!action || typeof action.op !== "string") return false;
+    const sig = JSON.stringify([action.op, action.app || "", action.zone || "",
+      action.target || "", action.title || "", action.body || ""]);
+    const nowTs = Date.now();
+    if (lastAgentSigRef.current.sig === sig && nowTs - lastAgentSigRef.current.ts < 8000) {
+      return true; // duplicate delivery — already executed
+    }
+    lastAgentSigRef.current = { sig, ts: nowTs };
+    const op = action.op;
+    const app = AGENT_APPS.includes(action.app) ? action.app : null;
+    const needApp = () => {
+      if (!app) {
+        console.warn("[agent] action missing valid app:", JSON.stringify(action).slice(0, 120));
+        return false;
+      }
+      return true;
+    };
+    const ensureBrowser = () => {
+      if (!openApps.includes("browser")) openApp("browser");
+    };
+    switch (op) {
+      case "open_app":
+        if (!needApp()) return false;
+        openApp(app);
+        flashAgent(`Opened ${AGENT_APP_LABEL[app]}`);
+        return true;
+      case "focus_app":
+        if (!needApp()) return false;
+        focusApp(app);
+        flashAgent(`${AGENT_APP_LABEL[app]} focused`);
+        return true;
+      case "close_app":
+        if (!needApp()) return false;
+        closeApp(app);
+        flashAgent(`Closed ${AGENT_APP_LABEL[app]}`);
+        return true;
+      case "minimize_app":
+        if (!needApp()) return false;
+        if (!minApps[app]) minimizeApp(app);
+        flashAgent(`Minimized ${AGENT_APP_LABEL[app]}`);
+        return true;
+      case "maximize_app":
+        if (!needApp()) return false;
+        if (!maxed[app]) zoomApp(app);
+        else focusApp(app);
+        flashAgent(`Maximized ${AGENT_APP_LABEL[app]}`);
+        return true;
+      case "restore_app":
+        if (!needApp()) return false;
+        cancelLeave(app);
+        setMinApps((p) => {
+          if (!p[app]) return p;
+          const n = { ...p };
+          delete n[app];
+          return n;
+        });
+        setMaxed((p) => {
+          if (!p[app]) return p;
+          const n = { ...p };
+          delete n[app];
+          return n;
+        });
+        focusApp(app);
+        flashAgent(`Restored ${AGENT_APP_LABEL[app]}`);
+        return true;
+      case "tile_app": {
+        if (!needApp()) return false;
+        const zone = AGENT_ZONES.includes(action.zone) ? action.zone : null;
+        if (!zone) {
+          console.warn("[agent] tile_app missing valid zone");
+          return false;
+        }
+        if (!doSnap(app, zone)) return false; // grid full — deny flash shown
+        flashAgent(`${AGENT_APP_LABEL[app]} → ${AGENT_ZONE_LABEL[zone]}`);
+        return true;
+      }
+      case "tile_grid":
+        tileGrid();
+        flashAgent("Tiled 2×2 grid");
+        return true;
+      case "float_app":
+        if (!needApp()) return false;
+        unsnap(app);
+        flashAgent(`${AGENT_APP_LABEL[app]} floated`);
+        return true;
+      case "browser_navigate": {
+        const target = String(action.target || "").trim().slice(0, 500);
+        if (!target || /^\s*(javascript|data|vbscript|file|blob)\s*:/i.test(target)) {
+          console.warn("[agent] browser_navigate rejected target");
+          return false;
+        }
+        ensureBrowser();
+        setBrowserCmd({ cmd: "navigate", target, tick: Date.now() });
+        flashAgent(`Browser → ${target.slice(0, 42)}`);
+        return true;
+      }
+      case "browser_back":
+        ensureBrowser();
+        setBrowserCmd({ cmd: "back", tick: Date.now() });
+        flashAgent("Browser ← back");
+        return true;
+      case "browser_forward":
+        ensureBrowser();
+        setBrowserCmd({ cmd: "forward", tick: Date.now() });
+        flashAgent("Browser → forward");
+        return true;
+      case "browser_new_tab":
+        ensureBrowser();
+        setBrowserCmd({ cmd: "newtab", tick: Date.now() });
+        flashAgent("Browser new tab");
+        return true;
+      case "note_add": {
+        const n = {
+          id: `n${Date.now()}`,
+          title: String(action.title || "Untitled").trim().slice(0, 80) || "Untitled",
+          body: String(action.body || "").slice(0, 2000),
+        };
+        setNotes((prev) => [n, ...prev]);
+        setActiveNoteId(n.id);
+        focusApp("notes");
+        flashAgent("Note added");
+        return true;
+      }
+      case "clear_board":
+        // Displayed board only — staged/in-flight chalk still lands after,
+        // so a mid-turn clear can't strand the explanation.
+        setDiagram(null);
+        setStepIndex(0);
+        setFollowLive(true);
+        setDiagramFocus(null);
+        flashAgent("Board cleared");
+        return true;
+      default:
+        console.warn("[agent] unknown op:", op);
+        return false;
+    }
+  };
   // Esc leaves fullscreen.
   useEffect(() => {
     const onKey = (e) => {
@@ -2672,7 +2859,7 @@ export default function App() {
             onMax={() => zoomApp("browser")}
           >
             <div className="min-h-0 flex-1 p-3 pt-1">
-              <BrowserApp url={browserUrl} onNavigate={setBrowserUrl} />
+              <BrowserApp url={browserUrl} onNavigate={setBrowserUrl} command={browserCmd} />
             </div>
           </AppWindow>
         )}
@@ -2804,6 +2991,14 @@ export default function App() {
         running={openApps}
         noteCount={notes.length}
       />
+      {/* Agent move indicator: transient pill above the dock. */}
+      {agentFlash && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-20 z-40 flex justify-center" aria-live="polite">
+          <span className="animate-window-in rounded-full bg-black/70 px-3.5 py-1.5 text-xs font-semibold whitespace-nowrap text-white shadow-lg backdrop-blur">
+            ✨ Agent · {agentFlash.label}
+          </span>
+        </div>
+      )}
       {/* hover strip that reveals the auto-hide dock */}
       <div
         className="absolute inset-x-0 bottom-0 z-30 h-6"

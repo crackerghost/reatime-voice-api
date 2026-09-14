@@ -1,0 +1,337 @@
+"""Agent OS control: the tutor drives the desktop (apps, browser, tiles).
+
+Architecture mirrors the diagram watcher: the voice stream stays pure
+(Devanagari-only, no tool calls). A per-turn sidecar planner (the OS
+Director) reads the user text + OS snapshot and emits validated window
+actions that stream to the client as {"type": "os_action"} — best-effort,
+never blocks voice. The client executes them against its window manager.
+
+Safety: allowlisted ops/apps/zones, bounded strings, max 6 actions/turn,
+dangerous URL schemes rejected. The client re-validates everything.
+"""
+
+import json
+import re
+import threading
+
+APPS = ("whiteboard", "browser", "notes", "code")
+ZONES = ("left", "right", "tl", "tr", "bl", "br")
+MAX_ACTIONS = 6
+
+# Ops that need {"app"} / {"app","zone"} / {"target"}.
+_APP_OPS = {
+    "open_app", "focus_app", "close_app", "minimize_app",
+    "maximize_app", "restore_app", "tile_app", "float_app",
+}
+_BROWSER_OPS = {"browser_back", "browser_forward", "browser_new_tab"}
+_NOARG_OPS = {"tile_grid"}
+OPS = _APP_OPS | _BROWSER_OPS | _NOARG_OPS | {"browser_navigate", "note_add", "clear_board"}
+
+_DANGEROUS_SCHEME_RE = re.compile(r"^\s*(javascript|data|vbscript|file|blob)\s*:", re.IGNORECASE)
+
+_OS_SEMAPHORE = threading.Semaphore(2)  # one director call per turn max anyway
+
+OS_CONTROL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "control_os",
+        "description": "Drive the tutoring desktop: open/focus/arrange apps, drive the browser, add notes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "maxItems": MAX_ACTIONS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": sorted(OPS),
+                            },
+                            "app": {"type": "string", "enum": list(APPS)},
+                            "zone": {"type": "string", "enum": list(ZONES)},
+                            "target": {"type": "string", "description": "browser_navigate only: URL or search words."},
+                            "title": {"type": "string", "description": "note_add only: note title."},
+                            "body": {"type": "string", "description": "note_add only: note body."},
+                        },
+                        "required": ["op"],
+                    },
+                },
+            },
+            "required": ["actions"],
+        },
+    },
+}
+
+_DIRECTOR_SYSTEM = (
+    "You are the OS director for a voice-tutored desktop with four apps: "
+    "whiteboard (lesson board), browser (tabbed web), notes, code (editor). "
+    "Read the USER request + OS snapshot, then call control_os with the MINIMAL "
+    "window actions that fulfill it — usually 1-3, never more than 6, in execution "
+    "order. Rules: act ONLY when the user explicitly asks for an app, a website, "
+    "docs, a video, a search, or a note — or names something to show/open. Plain "
+    "teaching questions with no such ask need NO action (the whiteboard appears by "
+    "itself): return no tool call. browser_navigate opens the browser by itself; "
+    "target may be a full URL or plain search words. open_app before acting on a "
+    "closed app. Never close or minimize anything the user didn't ask to close. "
+    "Reply ONLY via the tool call."
+)
+
+
+def should_direct(text: str) -> bool:
+    """Gate: substantive turns only — never greetings/tiny acks."""
+    clean = (text or "").strip()
+    if len(clean) < 8:
+        return False
+    try:
+        from server.llm.diagrams import _GREETING_ONLY_RE
+        if _GREETING_ONLY_RE.search(clean):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+# Blocking path gate: the user is asking FOR a desktop move (open the
+# browser, write a note, search something...). Broad on purpose — the
+# director LLM is the real judge and returns no tool call when nothing fits.
+# Pure "what is X?" definitions are excluded so teaching turns never pay the
+# blocking call's latency.
+_OS_REQUEST_RE = re.compile(
+    r"(ब्राउज़र|नोट|टैब|सर्च|खोज|खोल|बंद\s*कर|टाइल|लिखो?|"
+    r"\bbrowser\b|\bnotes?\b|\btab\b|\bsearch\b|\bopen\b|\bclose\b|"
+    r"side\s*by\s*side|\btile\b|\bgoogle\b|\byoutube\b|\bwebsite\b|\bdocs?\b|\bvideo\b)",
+    re.IGNORECASE,
+)
+_DEFINITION_RE = re.compile(
+    r"(क्या\s*है|कया\s*है|kya\s*hai|मतलब|matlab)\s*[?।.]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def wants_os_action(text: str) -> bool:
+    """True when the turn likely wants a desktop move NOW (blocking director
+    + voice ack), as opposed to the zero-latency background sidecar."""
+    clean = (text or "").strip()
+    if len(clean) < 8:
+        return False
+    if _DEFINITION_RE.search(clean):
+        return False
+    return bool(_OS_REQUEST_RE.search(clean))
+
+
+_APP_NAMES = {
+    "whiteboard": "the Whiteboard",
+    "browser": "the Browser",
+    "notes": "Notes",
+    "code": "the Code editor",
+}
+_ZONE_NAMES = {
+    "left": "the left half", "right": "the right half",
+    "tl": "the top-left quarter", "tr": "the top-right quarter",
+    "bl": "the bottom-left quarter", "br": "the bottom-right quarter",
+}
+
+
+def describe_action(action: dict) -> str:
+    """Human one-liner for an executed action (feeds the voice ack)."""
+    if not isinstance(action, dict):
+        return "did something on the desktop"
+    op = action.get("op", "?")
+    app = _APP_NAMES.get(action.get("app", ""), "")
+    if op == "open_app":
+        return f"opened {app}"
+    if op == "focus_app":
+        return f"focused {app}"
+    if op == "close_app":
+        return f"closed {app}"
+    if op == "minimize_app":
+        return f"minimized {app}"
+    if op == "maximize_app":
+        return f"maximized {app}"
+    if op == "restore_app":
+        return f"restored {app}"
+    if op == "tile_app":
+        return f"tiled {app} to {_ZONE_NAMES.get(action.get('zone', ''), 'a tile')}"
+    if op == "tile_grid":
+        return "tiled a 2x2 grid"
+    if op == "float_app":
+        return f"floated {app}"
+    if op == "browser_navigate":
+        return f"navigated the Browser to '{str(action.get('target', ''))[:80]}'"
+    if op == "browser_back":
+        return "went back in the Browser"
+    if op == "browser_forward":
+        return "went forward in the Browser"
+    if op == "browser_new_tab":
+        return "opened a new browser tab"
+    if op == "note_add":
+        title = str(action.get("title", "")).strip()[:60]
+        return f"added a note{f' {title!r}' if title else ''}"
+    if op == "clear_board":
+        return "cleared the board"
+    return f"ran {op}"
+
+
+def ack_block(actions) -> str:
+    """System-prompt addendum so the tutor talks about its moves in the SAME
+    reply ('open kar diya hai, batao kya search karna hai?') — or stays
+    honest when nothing happened (never claim phantom window moves)."""
+    acts = [a for a in (actions or []) if isinstance(a, dict)]
+    if not acts:
+        return (
+            "OS_ACTIONS_DONE: none — you could not move any window this turn. "
+            "Do NOT claim you opened, closed, searched, or wrote anything. If the "
+            "user asked for a window move, say in one short line that you couldn't "
+            "do it right now and they should do it manually, then answer normally."
+        )
+    lines = "\n".join(f"- {describe_action(a)}" for a in acts)
+    return (
+        "OS_ACTIONS_DONE (already executed on the user's screen — the user SEES "
+        f"them):\n{lines}\nAcknowledge in 1-2 short Hinglish lines in Devanagari "
+        "script only, e.g. 'ओके ब्राउज़र ओपन कर दिया है, बताओ इसमें क्या सर्च "
+        "करना है?' Then continue the answer. Never claim actions not listed here."
+    )
+
+
+def sanitize_os_snapshot(raw) -> dict:
+    """Bound the client OS snapshot (never trust sizes)."""
+    if not isinstance(raw, dict):
+        return {}
+    snap = {}
+    app = str(raw.get("app") or "")[:24]
+    if app in APPS:
+        snap["app"] = app
+    opened = [str(a) for a in (raw.get("open") or []) if str(a) in APPS][:8]
+    if opened:
+        snap["open"] = opened
+    minimized = [str(a) for a in (raw.get("minimized") or []) if str(a) in APPS][:8]
+    if minimized:
+        snap["minimized"] = minimized
+    url = str(raw.get("browserUrl") or "")[:500]
+    if url:
+        snap["browserUrl"] = url
+    try:
+        steps = int(raw.get("whiteboardSteps") or 0)
+    except (TypeError, ValueError):
+        steps = 0
+    if steps > 0:
+        snap["whiteboardSteps"] = min(steps, 999)
+    return snap
+
+
+def sanitize_action(raw) -> dict | None:
+    """Validate one director action; None = drop it."""
+    if not isinstance(raw, dict):
+        return None
+    op = str(raw.get("op") or "").strip()
+    if op not in OPS:
+        return None
+    if op in _NOARG_OPS or op in _BROWSER_OPS or op == "clear_board":
+        return {"op": op}
+    if op in _APP_OPS:
+        app = str(raw.get("app") or "").strip()
+        if app not in APPS:
+            return None
+        action = {"op": op, "app": app}
+        if op == "tile_app":
+            zone = str(raw.get("zone") or "").strip()
+            if zone not in ZONES:
+                return None
+            action["zone"] = zone
+        return action
+    if op == "browser_navigate":
+        target = str(raw.get("target") or "").strip()[:500]
+        if not target or _DANGEROUS_SCHEME_RE.match(target):
+            return None
+        return {"op": op, "target": target}
+    if op == "note_add":
+        title = str(raw.get("title") or "").strip()[:80]
+        body = str(raw.get("body") or "").strip()[:2000]
+        if not title and not body:
+            return None
+        action = {"op": op}
+        if title:
+            action["title"] = title
+        if body:
+            action["body"] = body
+        return action
+    return None
+
+
+def plan_os_actions(
+    key: str,
+    user_text: str,
+    snapshot: dict | None,
+    *,
+    client,
+    url: str,
+    model: str,
+    thinking: dict | None = None,
+    stop_evt=None,
+    max_tokens: int = 400,
+) -> list[dict]:
+    """One fast tool-call: user text + OS snapshot -> validated actions.
+
+    Best-effort: [] means 'no action', never an error. Single attempt, no
+    retry — a dropped director call only skips window moves, never voice.
+    """
+    if not key or not should_direct(user_text):
+        return []
+    if stop_evt is not None and stop_evt.is_set():
+        return []
+    if not _OS_SEMAPHORE.acquire(blocking=False):
+        return []
+    try:
+        import logging as _logging
+        _log = _logging.getLogger("voice_api")
+        snap_json = json.dumps(snapshot or {}, ensure_ascii=False)[:800]
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _DIRECTOR_SYSTEM},
+                {"role": "user", "content": f"USER: {(user_text or '')[:300]}\nOS: {snap_json}"},
+            ],
+            "tools": [OS_CONTROL_TOOL],
+            "tool_choice": "auto",
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        }
+        if thinking is not None:
+            payload["thinking"] = thinking  # DeepSeek V4: disabled = fast tool call
+        try:
+            response = client.post(
+                url,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            response.raise_for_status()
+        except Exception as e:  # noqa: BLE001 — director must never break voice
+            _log.info("OS director skipped (%s)", e)
+            return []
+        choice = (response.json().get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        arguments = None
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if function.get("name") == "control_os":
+                arguments = function.get("arguments")
+                break
+        if not arguments:
+            return []  # director decided: no action this turn
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            return []
+        raw_actions = parsed.get("actions") if isinstance(parsed, dict) else None
+        if not isinstance(raw_actions, list):
+            return []
+        out = []
+        for raw in raw_actions[:MAX_ACTIONS]:
+            action = sanitize_action(raw)
+            if action:
+                out.append(action)
+        return out
+    finally:
+        _OS_SEMAPHORE.release()
