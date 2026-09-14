@@ -83,14 +83,15 @@ export default function NotchHUD({
   return (
     <>
       {/* hover strip: drift to the very top edge and the panel appears;
-          leaving it collapses (moving into the notch/panel re-asserts open) */}
+          leaving it collapses (moving into the notch/panel re-asserts open).
+          z-100: always above windows, dock and menu bar — never hidden. */}
       <div
-        className="absolute inset-x-0 top-0 z-[60] h-8"
+        className="absolute inset-x-0 top-0 z-[100] h-8"
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
         aria-hidden="true"
       />
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-[61] flex flex-col items-center">
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-[101] flex flex-col items-center">
         {/* the notch itself — click pins/unpins the panel */}
         <button
           onClick={() => setPinned((v) => !v)}

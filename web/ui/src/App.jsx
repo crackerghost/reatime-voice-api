@@ -270,7 +270,7 @@ export default function App() {
   const [diagramFocus, setDiagramFocus] = useState(null); // {ids:[...], tick:n} -> whiteboard scrolls here
   const revealQueueRef = useRef([]); // single elements awaiting paced draw
   const revealTimerRef = useRef(0);
-  const REVEAL_MS = 650; // one shape per beat: smooth hand-drawn feel in sync with speech
+  const REVEAL_MS = 1500; // one shape per beat: speech pace, one-by-one and followable
 
   /* Merge one staged board batch into state (id-keyed, capped).
      The cap is generous (500): the board is a persistent lesson timeline
@@ -327,7 +327,10 @@ export default function App() {
   // a missed trigger must never strand a step as a blank page.
   const matchWaiting = (force = false) => {
     if (!waitingRef.current.length) return;
-    const rawCap = assistantTextRef.current || "";
+    // Match triggers against FRESH speech only (last ~160 chars ≈ one spoken
+    // sentence). The old cumulative match fired on words spoken long ago, so
+    // whole steps popped at once instead of one-by-one with the voice.
+    const rawCap = (assistantTextRef.current || "").slice(-160);
     const cap = normCaption(rawCap);
     const now = Date.now();
     const ready = [];
@@ -371,7 +374,9 @@ export default function App() {
     const audioStarted = speakingRef.current || currentWindowRef.current > 0;
     if (!force && !audioStarted) return; // speech hasn't begun — keep staging
     pendingBoardRef.current = null;
-    // Canvas always opens FULLSCREEN — one glanceable lesson surface.
+    // Canvas always opens FULLSCREEN, centered — and cancels desktop spread
+    // (a stuck spread shrinks windows to the top, which reads as "went up").
+    setSpreadTop(false);
     setMaxed((p) => ({ ...p, whiteboard: true }));
     setOpenApps((prev) =>
       prev.includes("whiteboard")
@@ -413,9 +418,9 @@ export default function App() {
     mergeDiagramBatch([el]);
     if (el?.id) setDiagramFocus({ ids: [el.id], tick: Date.now() });
     if (revealQueueRef.current.length > 12) {
-      // Long turn, reveal far behind speech — catch up at a fast beat,
+      // Long turn, reveal far behind speech — catch up at a readable beat,
       // still one shape at a time (never an instant wall of content).
-      revealTimerRef.current = setTimeout(revealNext, 250);
+      revealTimerRef.current = setTimeout(revealNext, 900);
       return;
     }
     if (revealQueueRef.current.length) {

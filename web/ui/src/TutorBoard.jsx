@@ -56,13 +56,15 @@ function StepDiagram({ elements, focusIds }) {
   if (!box) return null;
 
   const toneOf = (s) => T.tones?.[s?.tone] || T.tones.core;
+  // NOTE: pathLength MUST be an attribute — in a style object React emits
+  // `pathLength` (invalid CSS; the valid property is `path-length`), the
+  // dash pattern then applies in user units and every box renders DOTTED.
   const drawStyleFor = (s) => {
     const tone = toneOf(s);
     return {
       fill: tone.fill,
       stroke: tone.stroke,
       strokeWidth: 2,
-      pathLength: 1,
       strokeDasharray: 1,
       strokeDashoffset: 1,
       animation: `tutor-draw ${DRAW_MS}ms ease-out forwards`,
@@ -124,7 +126,7 @@ function StepDiagram({ elements, focusIds }) {
         if (s.type === "ellipse")
           return (
             <g key={s.id}>
-              <ellipse cx={s.x + w / 2} cy={s.y + h / 2} rx={w / 2} ry={h / 2} style={gStyle} />
+              <ellipse cx={s.x + w / 2} cy={s.y + h / 2} rx={w / 2} ry={h / 2} pathLength={1} style={gStyle} />
               {labelEl}
             </g>
           );
@@ -132,14 +134,14 @@ function StepDiagram({ elements, focusIds }) {
           const pts = `${s.x + w / 2},${s.y} ${s.x + w},${s.y + h / 2} ${s.x + w / 2},${s.y + h} ${s.x},${s.y + h / 2}`;
           return (
             <g key={s.id}>
-              <polygon points={pts} style={gStyle} />
+              <polygon points={pts} pathLength={1} style={gStyle} />
               {labelEl}
             </g>
           );
         }
         return (
           <g key={s.id}>
-            <rect x={s.x} y={s.y} width={w} height={h} rx={T.radius} style={gStyle} />
+            <rect x={s.x} y={s.y} width={w} height={h} rx={T.radius} pathLength={1} style={gStyle} />
             {labelEl}
           </g>
         );

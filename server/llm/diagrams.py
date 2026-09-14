@@ -368,6 +368,13 @@ def generate_for_step(
         out = [it for it in out
                if it["type"] != "arrow"
                or (it.get("startNodeId") in keep and it.get("endNodeId") in keep)]
+        # Compare steps: no arrow may cross the VS divider — the model is
+        # told this, but prod logs show it does it anyway. Enforce here.
+        side_of = {it["id"]: it.get("side") for it in out if it["type"] != "arrow"}
+        if any(s == "left" for s in side_of.values()) and any(s == "right" for s in side_of.values()):
+            out = [it for it in out
+                   if it["type"] != "arrow"
+                   or side_of.get(it.get("startNodeId")) == side_of.get(it.get("endNodeId"))]
         if not any(it["type"] in {"rectangle", "ellipse", "diamond", "text", "code", "note"} for it in out):
             return None
         # Deterministic COMPACT layout: model coordinates are NOT trusted
