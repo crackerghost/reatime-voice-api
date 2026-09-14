@@ -110,6 +110,15 @@ export default function App() {
   const [turnActive, setTurnActive] = useState(false); // a reply is owed/playing: steady "Speaking" label
   const [sharing, setSharing] = useState(false); // push-to-see capture active (button held)
   const [diagram, setDiagram] = useState(null);
+  // Fresh board per explanation: first visuals of a new turn wipe the board
+  // with a smooth fade (never draw over the old lesson).
+  const [wiping, setWiping] = useState(false);
+  const wipingRef = useRef(false); // wipe animation in flight (merge guard)
+  const heldDuringWipeRef = useRef([]); // new chalk that arrived mid-wipe
+  const wipeTimerRef = useRef(0);
+  const wipedClientTurnRef = useRef(0); // client turn already wiped for
+  const diagramRef = useRef(null); // mirror of `diagram` for stale closures
+  useEffect(() => { diagramRef.current = diagram; }, [diagram]);
   // ---- LLM provider: groq | deepseek (per-turn toggle, persisted) ----
   const [llmProvider, setLlmProvider] = useState(() => {
     try {
@@ -402,10 +411,16 @@ export default function App() {
   const REVEAL_MS = 750;
 
   /* Merge one staged board batch into state (id-keyed, capped).
-     The cap is generous (500): the board is a persistent lesson timeline
-     that is NEVER erased between turns — only clearChat wipes it. */
+     Fresh board per explanation: the first visuals of a new turn wipe the
+     board first (see maybeWipeBoardForNewVisuals) so the new lesson never
+     draws OVER the old one — and recycled window ids (w1-…) can't collide. */
   const mergeDiagramBatch = useCallback((incoming) => {
-    setDiagram((prev) => {
+    if (wipingRef.current) {
+      // Wipe in flight: hold the new chalk until the board is clean, then
+      // it lands on the fresh board in order (flushed by the wipe timer).
+      heldDuringWipeRef.current.push(...(incoming || []).filter(Boolean));
+      return;
+    }    setDiagram((prev) => {
       const seen = new Set();
       const merged = [];
       for (const el of [...(prev?.elements || []), ...incoming]) {
@@ -438,6 +453,40 @@ export default function App() {
   useEffect(() => {
     if (followLive && steps.length) setStepIndex(steps.length - 1);
   }, [steps.length, followLive]);
+
+  // Fresh board per explanation: the first visuals of a new turn wipe the
+  // old lesson with a smooth fade instead of drawing OVER it. At most once
+  // per client turn; a no-op when the board is already empty. New chalk that
+  // lands mid-wipe is held (see mergeDiagramBatch) and drawn right after.
+  // Plain closure like matchWaiting (refs + stable setters — safe from the
+  // long-lived WS handler).
+  const maybeWipeBoardForNewVisuals = () => {
+    const turn = activeTurnIdRef.current;
+    if (wipedClientTurnRef.current === turn || wipingRef.current) return;
+    wipedClientTurnRef.current = turn;
+    if (!diagramRef.current?.elements?.length) return;
+    wipingRef.current = true;
+    setWiping(true);
+    if (wipeTimerRef.current) clearTimeout(wipeTimerRef.current);
+    wipeTimerRef.current = setTimeout(() => {
+      wipeTimerRef.current = 0;
+      const held = heldDuringWipeRef.current;
+      heldDuringWipeRef.current = [];
+      const seen = new Set();
+      const merged = [];
+      for (const el of held) {
+        if (!el || !el.id || seen.has(el.id)) continue;
+        seen.add(el.id);
+        merged.push(el);
+      }
+      setDiagram(merged.length ? { elements: merged.slice(-500) } : null);
+      setStepIndex(0);
+      setFollowLive(true);
+      setDiagramFocus(null);
+      wipingRef.current = false;
+      setWiping(false);
+    }, 300);
+  };
 
   // Trigger-gated elements: drawn the instant their trigger word is spoken.
   // Bilingual: server sends trigger (English, matches code/raw) + trigger_hi
@@ -654,6 +703,15 @@ export default function App() {
     waitingRef.current = [];
     pendingBoardRef.current = null;
     setDiagramFocus(null);
+    // A new turn interrupts everything: drop mid-wipe chalk, cancel the
+    // pending wipe (the next explanation wipes again when ITS visuals land).
+    heldDuringWipeRef.current = [];
+    if (wipeTimerRef.current) {
+      clearTimeout(wipeTimerRef.current);
+      wipeTimerRef.current = 0;
+    }
+    wipingRef.current = false;
+    setWiping(false);
     if (diagramTimerRef.current) {
       clearTimeout(diagramTimerRef.current);
       diagramTimerRef.current = 0;
@@ -667,6 +725,7 @@ export default function App() {
   useEffect(() => () => {
     if (diagramTimerRef.current) clearTimeout(diagramTimerRef.current);
     if (revealTimerRef.current) clearTimeout(revealTimerRef.current);
+    if (wipeTimerRef.current) clearTimeout(wipeTimerRef.current);
   }, []);
   const openAssistantId = useRef(null);
   const assistantTextRef = useRef("");
@@ -1210,8 +1269,9 @@ export default function App() {
       clearDiagramQueue();
       activeTurnIdRef.current += 1;
       diagramTurnRef.current = null;
-      // Board is NEVER erased between turns: new steps append to the lesson
-      // timeline. Only clearChat wipes it. Resume live-follow for the reply.
+      // Fresh board per explanation: the old lesson stays visible while the
+      // tutor thinks, then wipes (smooth fade) the moment the NEW reply's
+      // first visuals arrive — never drawn over. Resume live-follow.
       setFollowLive(true);
       setMessages((m) => [...m, { id: nextId(), role: "user", text, ts: Date.now() }]);
       pushHistory("user", text);
@@ -1442,6 +1502,11 @@ export default function App() {
             if (isNewVisualTurn) pendingBoardRef.current = m.turn_id;
             console.info(`[diagram] ${m.mode === "append" ? `delta window #${m.window_n ?? "?"}` : "board"}: +${incoming.length} element(s)`);
             if (m.mode === "append" && m.window_n != null) {
+              // New explanation: wipe the old lesson first (smooth fade) so
+              // the new chalk lands on a clean board, never over the old one.
+              if (isNewVisualTurn) {
+                try { maybeWipeBoardForNewVisuals(); } catch { /* noop */ }
+              }
               // Audio-synced staging: draw only when window_n's speech plays.
               const wn = Number(m.window_n);
               const prev = stagedDiagramsRef.current.get(wn) || [];
@@ -1456,6 +1521,7 @@ export default function App() {
               try { flushDiagramsUpTo(currentWindowRef.current); } catch { /* noop */ }
               try { frontBoardIfReady(); } catch { /* noop */ }
             } else {
+              try { maybeWipeBoardForNewVisuals(); } catch { /* noop */ }
               mergeDiagramBatch(incoming);
             }
           } else if (m.type === "diagram_error") {
@@ -2450,6 +2516,45 @@ export default function App() {
     pokeDock();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // Boot to fullscreen: the OS should own the whole screen like a real OS.
+  // Browsers grant fullscreen only on user gesture, so try on load (works
+  // in kiosk/allowlisted contexts) and retry on clicks/keys until entry is
+  // confirmed. Esc exits — and the next press anywhere on the OS goes
+  // fullscreen again.
+  useEffect(() => {
+    let entered = false;
+    const arm = () => {
+      window.addEventListener("pointerdown", enter);
+      window.addEventListener("keydown", enter);
+    };
+    const disarm = () => {
+      window.removeEventListener("pointerdown", enter);
+      window.removeEventListener("keydown", enter);
+    };
+    const onChange = () => {
+      if (document.fullscreenElement) {
+        entered = true;
+        disarm();
+      } else if (entered) {
+        entered = false;
+        arm(); // Esc'd out — re-arm so the next press returns to fullscreen
+      }
+    };
+    const enter = () => {
+      if (document.fullscreenElement) return;
+      try {
+        const p = document.documentElement.requestFullscreen?.();
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      } catch { /* needs a gesture — the next click/key retries */ }
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    arm();
+    enter();
+    return () => {
+      disarm();
+      document.removeEventListener("fullscreenchange", onChange);
+    };
+  }, []);
 
   /* ---------- UI: Bug OS desktop ---------- */
   return (
@@ -2457,8 +2562,14 @@ export default function App() {
       className="os-wallpaper photo relative h-screen overflow-hidden text-slate-900"
       onMouseMove={(e) => {
         if (e.clientY > window.innerHeight - 72) pokeDock();
-        // Fullscreen: top edge reveals menu bar + title bar, moving away hides.
-        if (maximized) setTopChrome(e.clientY < 64);
+        // Fullscreen chrome: reveals ONLY on a true hot-edge push (top ~5px),
+        // hides once the pointer leaves the chrome zone (~96px). The old <64px
+        // reveal popped the menu + traffic bar over app corners (tabs etc.)
+        // the moment you reached for them.
+        if (maximized) {
+          if (e.clientY < 5) setTopChrome(true);
+          else if (e.clientY > 96 && topChrome) setTopChrome(false);
+        }
         else if (topChrome) setTopChrome(false);
       }}
     >
@@ -2520,9 +2631,16 @@ export default function App() {
                 stepIndex={stepIndex}
                 followLive={followLive}
                 caption={latestAssistant}
+                wiping={wiping}
                 onStep={(i) => {
                   setStepIndex(i);
                   setFollowLive(false);
+                }}
+                // Scroll-spy: manual scrolling moves the dots/pager to the
+                // visible step but never steals live-follow (only the Prev /
+                // Next buttons do that). Re-engage with ● Live anytime.
+                onVisibleStep={(i) => {
+                  setStepIndex(i);
                 }}
                 onJumpLive={() => {
                   setFollowLive(true);

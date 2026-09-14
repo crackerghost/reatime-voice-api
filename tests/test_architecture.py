@@ -37,6 +37,31 @@ class ArchitectureTests(unittest.TestCase):
         })
         self.assertEqual([item["id"] for item in diagram["elements"]], ["node"])
 
+    def test_table_and_quiz_normalization_are_bounded(self):
+        diagram = normalize({
+            "elements": [
+                {"id": "t1", "type": "table", "text": "Var vs Let",
+                 "headers": ["a", "b", "c", "d", "e"],
+                 "rows": [["1"], "not-a-row", [], ["1", "2", "3", "4", "5", "6"]]},
+                {"id": "q1", "type": "quiz", "text": "Which tag is biggest?",
+                 "options": ["h1", "h6", "", "h1"],
+                 "answer": 7, "explanation": "h1 is the largest heading."},
+                {"id": "q2", "type": "quiz", "text": "Reflect on this."},
+                {"id": "bad", "type": "mermaid", "text": "x"},
+            ]
+        })
+        by_id = {item["id"]: item for item in diagram["elements"]}
+        self.assertNotIn("bad", by_id)  # unknown types still dropped
+        table = by_id["t1"]
+        self.assertLessEqual(len(table["headers"]), 4)
+        self.assertLessEqual(len(table["rows"]), 6)
+        self.assertTrue(all(len(r) == len(table["headers"]) for r in table["rows"]))
+        quiz = by_id["q1"]
+        self.assertLessEqual(len(quiz["options"]), 4)
+        self.assertIsNone(quiz["answer"])  # out-of-range -> reflection mode
+        self.assertIn("explanation", quiz)
+        self.assertNotIn("q2", by_id)  # quiz without options is dropped
+
 
 if __name__ == "__main__":
     unittest.main()

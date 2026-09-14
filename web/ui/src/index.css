@@ -241,3 +241,24 @@
   border-bottom: 1px solid rgba(255, 255, 255, 0.45);
   box-shadow: inset 0 -1px 0 rgba(15, 23, 42, 0.04);
 }
+
+/* Scrollable without a visible scrollbar (scroll still works). */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Board block entrances (also defined locally in StepDiagram; global copy
+   covers table/quiz-only steps where that SVG never renders). */
+@keyframes tutor-pop {
+  0% { opacity: 0; transform: scale(0.92); }
+  60% { opacity: 1; transform: scale(1.015); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes tutor-fadein {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: none; }
+}

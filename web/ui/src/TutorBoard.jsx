@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FaChevronLeft, FaChevronRight, FaDiagramProject, FaSatelliteDish } from "react-icons/fa6";
 import { BOARD_THEME as T } from "./boardTheme.js";
 
 /* TutorBoard — natural classroom GREEN chalkboard lesson feed.
-   A persistent, never-erased timeline: each part is a section (diagram SVG
-   + code/note/image blocks) revealed progressively AS the tutor speaks it.
+   A fresh board per explanation: when the tutor starts drawing a NEW answer,
+   the old lesson wipes with a smooth fade (App.jsx) so new chalk never lands
+   OVER old chalk. Each part is a section (diagram SVG + code/note/image
+   blocks) revealed progressively AS the tutor speaks it.
 
    Feel rules:
    - Green board, white chalk text, chalk-yellow accents. No step numbers
@@ -255,6 +257,131 @@ function NoteBlock({ block }) {
   );
 }
 
+function TableBlock({ block }) {
+  const headers = (Array.isArray(block.headers) ? block.headers : [])
+    .map((h) => String(h ?? "").trim()).slice(0, 4);
+  const rows = (Array.isArray(block.rows) ? block.rows : []).slice(0, 6)
+    .map((r) => (Array.isArray(r) ? r : [r]).map((c) => String(c ?? "").trim()));
+  const width = Math.min(4, Math.max(headers.length, ...rows.map((r) => r.length), 0));
+  if (!width) return null;
+  const head = (headers.length ? headers : Array(width).fill("")).slice(0, width);
+  const body = rows.map((r) => (r.concat(Array(width).fill(""))).slice(0, width));
+  if (!head.some(Boolean) && !body.some((r) => r.some(Boolean))) return null;
+  return (
+    <div
+      className="overflow-hidden rounded-xl shadow-sm"
+      style={{ background: "rgba(0,0,0,0.16)", border: "1px solid rgba(255,255,255,0.2)", animation: "tutor-pop 350ms ease both" }}
+    >
+      {block.text ? (
+        <p className="px-3.5 pt-2.5 text-[0.8rem] font-bold" style={{ color: T.ink, fontFamily: CHALK_FONT }}>
+          {String(block.text)}
+        </p>
+      ) : null}
+      <table className="w-full border-collapse px-3 text-[0.78rem] leading-6" style={{ color: T.ink }}>
+        <thead>
+          <tr>
+            {head.map((h, i) => (
+              <th
+                key={i}
+                className="px-3 py-2 text-left font-bold"
+                style={{ color: T.primary, fontFamily: CHALK_FONT, borderBottom: "1.5px solid rgba(255,209,102,0.5)" }}
+              >
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((r, i) => (
+            <tr key={i} style={i < body.length - 1 ? { borderBottom: "1px solid rgba(255,255,255,0.14)" } : undefined}>
+              {r.map((c, j) => (
+                <td key={j} className="px-3 py-1.5" style={{ fontFamily: CHALK_FONT }}>{c}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="h-2" />
+    </div>
+  );
+}
+
+function QuizBlock({ block }) {
+  const options = (Array.isArray(block.options) ? block.options : [])
+    .map((o) => String(o ?? "").trim()).filter(Boolean).slice(0, 4);
+  const answer = Number.isInteger(block.answer) ? block.answer : null;
+  const [picked, setPicked] = useState(null);
+  if (!block.text || options.length < 2) return null;
+  const letters = ["A", "B", "C", "D"];
+  const revealed = picked !== null;
+  const correct = answer !== null && picked === answer;
+  const ringOf = (i) => {
+    if (!revealed) return "1px solid rgba(255,255,255,0.25)";
+    if (answer !== null && i === answer) return `2px solid ${T.primary}`;
+    if (i === picked) return "2px solid #ff9e9e";
+    return "1px solid rgba(255,255,255,0.18)";
+  };
+  return (
+    <div
+      className="rounded-xl px-3.5 py-3 shadow-sm"
+      style={{ background: "rgba(255,209,102,0.10)", border: "1.5px dashed rgba(255,209,102,0.55)", animation: "tutor-pop 350ms ease both" }}
+    >
+      <p className="text-[0.85rem] leading-6 font-bold" style={{ color: T.ink, fontFamily: CHALK_FONT }}>
+        <span style={{ color: T.primary }}>✎ Quiz · </span>{String(block.text)}
+      </p>
+      <div className="mt-2 flex flex-col gap-1.5" role="group" aria-label="Quiz options">
+        {options.map((o, i) => (
+          <button
+            key={i}
+            onClick={() => setPicked(i)}
+            disabled={revealed}
+            className="flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[0.8rem] transition disabled:cursor-default"
+            style={{
+              background: revealed && answer !== null && i === answer
+                ? "rgba(255,209,102,0.22)"
+                : revealed && i === picked
+                  ? "rgba(255,158,158,0.16)"
+                  : "rgba(0,0,0,0.18)",
+              border: ringOf(i),
+              color: T.ink,
+              fontFamily: CHALK_FONT,
+            }}
+            aria-label={`Option ${letters[i]}: ${o}`}
+          >
+            <span
+              className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[0.65rem] font-bold"
+              style={{
+                background: revealed && answer !== null && i === answer ? T.primary : "rgba(255,255,255,0.15)",
+                color: revealed && answer !== null && i === answer ? "#143626" : T.ink,
+              }}
+              aria-hidden="true"
+            >
+              {letters[i]}
+            </span>
+            <span className="min-w-0 flex-1">{o}</span>
+            {revealed && answer !== null && i === answer && <span aria-hidden="true">✓</span>}
+            {revealed && answer !== null && i === picked && picked !== answer && <span aria-hidden="true">✗</span>}
+          </button>
+        ))}
+      </div>
+      {revealed && (
+        <p className="mt-2 text-[0.78rem] leading-6" style={{ color: T.muted, fontFamily: CHALK_FONT, animation: "tutor-fadein 400ms ease both" }}>
+          {answer === null
+            ? (block.explanation ? `☞ ${block.explanation}` : "☞ Say your answer out loud — the tutor will respond.")
+            : correct
+              ? `✓ Correct${block.explanation ? ` — ${block.explanation}` : "!" }`
+              : `✗ Not quite — ${letters[answer]} is right${block.explanation ? `: ${block.explanation}` : "."}`}
+        </p>
+      )}
+      {!revealed && (
+        <p className="mt-1.5 text-[0.68rem]" style={{ color: T.muted, fontFamily: CHALK_FONT }}>
+          {answer === null ? "Think it through, then tap to reveal." : "Tap your answer — or say it out loud."}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function ImageBlock({ block }) {
   if (!block.src) {
     return (
@@ -281,15 +408,52 @@ function ImageBlock({ block }) {
 }
 
 export default function TutorBoard({
-  steps, focus, stepIndex, onStep, followLive, onJumpLive, caption,
+  steps, focus, stepIndex, onStep, followLive, onJumpLive, caption, wiping,
+  onVisibleStep,
 }) {
   const scrollRef = useRef(null);
   const penRef = useRef(null);
   const elRefs = useRef(new Map());
+  // Scroll-spy: manual scrolling moves the dots/pager to the visible step.
+  // Programmatic scrolls (Prev/Next, live-follow) suppress the spy briefly
+  // so they never fight the navigation that caused them.
+  const suppressSpyUntil = useRef(0);
+  const stepIndexRef = useRef(stepIndex);
+  useEffect(() => { stepIndexRef.current = stepIndex; }, [stepIndex]);
+  const spyRaf = useRef(0);
+  useEffect(() => () => {
+    if (spyRaf.current) cancelAnimationFrame(spyRaf.current);
+  }, []);
+  const handleScroll = () => {
+    if (spyRaf.current) return;
+    spyRaf.current = requestAnimationFrame(() => {
+      spyRaf.current = 0;
+      if (Date.now() < suppressSpyUntil.current) return;
+      const box = scrollRef.current;
+      if (!box) return;
+      let nodes = null;
+      try {
+        nodes = box.querySelectorAll("[data-step]");
+      } catch { return; }
+      if (!nodes || !nodes.length) return;
+      // Visible step = last section whose top sits above the upper-third
+      // line of the viewport (matches reading position, stable at rest).
+      const point = box.scrollTop + box.clientHeight * 0.35;
+      let vis = 0;
+      for (const node of nodes) {
+        const si = Number(node.getAttribute("data-step"));
+        if (!Number.isFinite(si)) continue;
+        if (node.offsetTop !== undefined && node.offsetTop <= point) vis = si;
+        else break;
+      }
+      if (vis !== stepIndexRef.current) {
+        stepIndexRef.current = vis;
+        onVisibleStep && onVisibleStep(vis);
+      }
+    });
+  };
   const total = steps?.length || 0;
   const cur = Math.max(0, Math.min(stepIndex || 0, Math.max(0, total - 1)));
-  const prevTitle = cur > 0 ? steps[cur - 1]?.title : "";
-  const nextTitle = cur < total - 1 ? steps[cur + 1]?.title : "";
 
   const scrollNodeIntoView = (node, align = "center") => {
     const box = scrollRef.current;
@@ -312,6 +476,7 @@ export default function TutorBoard({
     if (!followLive || !focus?.ids?.length) return;
     const id = focus.ids[0];
     const node = elRefs.current.get(id);
+    suppressSpyUntil.current = Date.now() + 650; // our own glide, not the user
     if (node) scrollNodeIntoView(node, "center");
     const pen = penRef.current, box = scrollRef.current;
     if (pen && box && node) {
@@ -326,6 +491,8 @@ export default function TutorBoard({
 
   const gotoStep = (i) => {
     const clamped = Math.max(0, Math.min(total - 1, i));
+    stepIndexRef.current = clamped;
+    suppressSpyUntil.current = Date.now() + 650;
     onStep && onStep(clamped);
     requestAnimationFrame(() => {
       const node = scrollRef.current?.querySelector?.(`[data-step="${clamped}"]`);
@@ -426,7 +593,11 @@ export default function TutorBoard({
         />
       </div>
 
-      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4">
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className={`no-scrollbar relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 transition-opacity duration-300 ${wiping ? "opacity-0" : "opacity-100"}`}
+      >
         {/* Chalk piece: glides to each freshly drawn element. */}
         <div
           ref={penRef}
@@ -444,8 +615,8 @@ export default function TutorBoard({
           </div>
         )}
         {steps?.map((step, si) => {
-          const shapes = (step.elements || []).filter((e) => e && e.type !== "arrow" && e.type !== "code" && e.type !== "note" && e.type !== "image");
-          const extras = (step.elements || []).filter((e) => e && (e.type === "code" || e.type === "note" || e.type === "image"));
+          const shapes = (step.elements || []).filter((e) => e && e.type !== "arrow" && e.type !== "code" && e.type !== "note" && e.type !== "image" && e.type !== "table" && e.type !== "quiz");
+          const extras = (step.elements || []).filter((e) => e && (e.type === "code" || e.type === "note" || e.type === "image" || e.type === "table" || e.type === "quiz"));
           const arrows = (step.elements || []).filter((e) => e && e.type === "arrow");
           const isLive = si === (steps?.length || 0) - 1;
           const active = si === cur;
@@ -505,6 +676,8 @@ export default function TutorBoard({
                       {b.type === "code" && <CodeBlock block={b} caption={caption} />}
                       {b.type === "note" && <NoteBlock block={b} />}
                       {b.type === "image" && <ImageBlock block={b} />}
+                      {b.type === "table" && <TableBlock block={b} />}
+                      {b.type === "quiz" && <QuizBlock block={b} />}
                     </div>
                   ))}
                 </div>
@@ -514,35 +687,6 @@ export default function TutorBoard({
         })}
         <div className="h-2" />
       </div>
-
-      {/* Bottom natural pager: Prev / Next with neighbour titles, no numbers. */}
-      {total > 1 && (
-        <div
-          className="z-10 flex shrink-0 items-center justify-between gap-2 px-3 py-2"
-          style={{ borderTop: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.25)" }}
-        >
-          <button
-            onClick={() => gotoStep(cur - 1)}
-            disabled={cur <= 0}
-            className="min-w-0 flex-1 truncate rounded-full px-3 py-2 text-left text-[0.72rem] font-bold transition disabled:opacity-30"
-            style={{ background: "rgba(255,255,255,0.12)", color: T.ink }}
-            aria-label="Previous"
-            title={prevTitle || ""}
-          >
-            ← Prev{prevTitle ? ` · ${prevTitle.slice(0, 28)}` : ""}
-          </button>
-          <button
-            onClick={() => gotoStep(cur + 1)}
-            disabled={cur >= total - 1}
-            className="min-w-0 flex-1 truncate rounded-full px-3 py-2 text-right text-[0.72rem] font-bold transition disabled:opacity-30"
-            style={{ background: T.primary, color: "#143626" }}
-            aria-label="Next"
-            title={nextTitle || ""}
-          >
-            {nextTitle ? `${nextTitle.slice(0, 28)} · ` : ""}Next →
-          </button>
-        </div>
-      )}
     </div>
   );
 }

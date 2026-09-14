@@ -23,7 +23,7 @@ DIAGRAM_TOOL = {
     "type": "function",
     "function": {
         "name": "draw_flowchart_or_diagram",
-        "description": "Render concise concept nodes, notes, code snippets, and connecting arrows on the whiteboard.",
+        "description": "Render concise concept nodes, comparison tables, quiz checks, notes, code snippets, and connecting arrows on the whiteboard.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -34,7 +34,7 @@ DIAGRAM_TOOL = {
                         "type": "object",
                         "properties": {
                             "id": {"type": "string"},
-                            "type": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "text", "arrow", "code", "note"]},
+                            "type": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "text", "arrow", "code", "note", "table", "quiz"]},
                             "x": {"type": "number"},
                             "y": {"type": "number"},
                             "width": {"type": "number"},
@@ -52,6 +52,11 @@ DIAGRAM_TOOL = {
                                 "type": "string",
                                 "description": "1-3 exact English words from the STEP that name this element (e.g. 'computer', 'query selector'). The board draws it the moment the tutor speaks them.",
                             },
+                            "headers": {"type": "array", "items": {"type": "string"}, "description": "Table only: 2-4 short column headers."},
+                            "rows": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}, "description": "Table only: up to 6 rows matching the headers, cells 1-4 words."},
+                            "options": {"type": "array", "items": {"type": "string"}, "description": "Quiz only: 2-4 short answer options."},
+                            "answer": {"type": "integer", "description": "Quiz only: 0-based index of the correct option. Omit for a reflection question (no scoring)."},
+                            "explanation": {"type": "string", "description": "Quiz only: one-line why, shown after the learner answers."},
                         },
                         # x/y required only for SHAPES. Arrows are defined by
                         # startNodeId/endNodeId (server computes their geometry),
@@ -125,13 +130,23 @@ def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
                 "3-6 compact nodes with arrows, PLUS at most ONE short code "
                 "snippet (type=code, exact code/tags as-is, max ~10 lines, with "
                 "a language label) when the step shows code, and at most ONE "
-                "one-line takeaway (type=note) for the key insight. Use type=text "
+                "takeaway note (type=note): one line for the key insight — or, "
+                "when the step WRAPS UP or summarizes, 'Takeaways: • a • b • c' "
+                "(max 3 short bullets) with a trigger from the spoken summary "
+                "words. Use type=text "
                 "for free-floating annotations (no box). Labels are SHORT — max "
                 "5-6 words per node (e.g. 'h1-h6: headings, h1 biggest'). "
                 "COMPARISONS (X vs Y, differences, before/after, right/wrong): "
                 "set side=left on every X node and side=right on every Y node, "
                 "with NO arrows crossing sides — the board renders two columns "
-                "with a VS divider. TONE every node: core = the key concept, "
+                "with a VS divider. TABLES: a comparison with 2+ rows of "
+                "parallel facts goes in ONE type=table (headers 2-4 cols, rows "
+                "up to 6, cells 1-4 words, text=short table title) INSTEAD of "
+                "side-by-side nodes. QUIZ: if the STEP asks the learner a "
+                "question, attach ONE type=quiz (text=the question, options=2-4 "
+                "short options, answer=0-based correct index, explanation=one "
+                "line why, trigger=the spoken question words). Max one quiz "
+                "per step. TONE every node: core = the key concept, "
                 "example = an illustration, warn = a common mistake — the board "
                 "colors them coral / teal / amber so importance reads instantly."
                 "Every rectangle/ellipse/diamond MUST carry non-empty "
@@ -147,8 +162,8 @@ def _step_prompt(step_text: str, topic: str, tag: str = "w") -> list[dict]:
                 "'computer'; 'query selector' -> 'query selector'). The board "
                 "draws each element the instant the tutor speaks its trigger, "
                 "so triggers must be words the STEP actually says. Shapes give x/y/width/height; ARROWS give ONLY id, type, "
-                "startNodeId, endNodeId — never x/y on arrows; code/note give "
-                "ONLY id, type, text/code (+language) — never x/y. Shapes: "
+                "startNodeId, endNodeId — never x/y on arrows; code/note/table/quiz give "
+                "ONLY id, type, content fields — never x/y. Shapes: "
                 "rectangle = component/step, ellipse = start/end, "
                 "diamond = decision, text = free annotation, arrow = flow."
             ),
@@ -478,7 +493,7 @@ def _arrow_geometry(item: dict, boxes: dict[str, tuple]) -> None:
 def normalize(raw: object) -> dict | None:
     if not isinstance(raw, dict) or not isinstance(raw.get("elements"), list):
         return None
-    allowed = {"rectangle", "ellipse", "diamond", "text", "arrow", "code", "note"}
+    allowed = {"rectangle", "ellipse", "diamond", "text", "arrow", "code", "note", "table", "quiz"}
     elements = []
     seen = set()
     for item in raw["elements"][:DIAGRAM_MAX_ELEMENTS]:
@@ -500,8 +515,9 @@ def normalize(raw: object) -> dict | None:
                 normalized[key] = max(40, min(600, float(item.get(key, default))))
             except (TypeError, ValueError):
                 normalized[key] = default
-        if item_type in {"rectangle", "ellipse", "diamond", "text", "code", "note"}:
-            cap = 600 if item_type == "code" else (140 if item_type == "note" else DIAGRAM_MAX_TEXT)
+        if item_type in {"rectangle", "ellipse", "diamond", "text", "code", "note", "table", "quiz"}:
+            # Recap notes hold 3 short bullets — roomier cap so takeaways fit.
+            cap = 600 if item_type == "code" else (420 if item_type == "note" else DIAGRAM_MAX_TEXT)
             normalized["text"] = _board_text(item.get("text", ""))[:cap]
             side = str(item.get("side", "")).strip().lower()[:8]
             if side in ("left", "right"):
@@ -518,6 +534,39 @@ def normalize(raw: object) -> dict | None:
                 if lang:
                     normalized["language"] = lang
             trigger = re.sub(r"[^A-Za-z0-9 ]+", "", str(item.get("trigger", ""))).strip()[:60]
+            if item_type == "table":
+                # headers 2-4 cols, rows up to 6, cells short; pad ragged rows.
+                def _cell(v):
+                    return _board_text(v)[:60]
+                headers = [_cell(h) for h in (item.get("headers") or []) if _cell(h)][:4]
+                raw_rows = item.get("rows") or []
+                rows = []
+                for r in raw_rows[:6]:
+                    cells = [_cell(c) for c in (list(r) if isinstance(r, (list, tuple)) else [r])]
+                    if any(cells):
+                        rows.append(cells)
+                width = max([len(headers)] + [len(r) for r in rows] + [1])
+                width = min(width, 4)
+                headers = (headers + [""] * width)[:width]
+                rows = [(r + [""] * width)[:width] for r in rows]
+                if headers or rows:
+                    normalized["headers"] = headers
+                    normalized["rows"] = rows
+            if item_type == "quiz":
+                opts = [_board_text(o)[:60] for o in (item.get("options") or [])]
+                opts = [o for o in opts if o][:4]
+                if opts:
+                    normalized["options"] = opts
+                try:
+                    ans = int(item.get("answer", -1))
+                except (TypeError, ValueError):
+                    ans = -1
+                # Valid index -> scored quiz; missing/invalid -> reflection
+                # question (tap to reveal the explanation, no right/wrong).
+                normalized["answer"] = ans if 0 <= ans < len(opts) else None
+                expl = _board_text(item.get("explanation", ""))[:200]
+                if expl:
+                    normalized["explanation"] = expl
             if trigger:
                 normalized["trigger"] = trigger
                 # Bilingual sync: the client matches triggers against the SPOKEN
@@ -555,6 +604,10 @@ def normalize(raw: object) -> dict | None:
             return item.get("startNodeId") in nodes and item.get("endNodeId") in nodes
         if item["type"] in ("code", "note"):
             return bool(str(item.get("text", "")).strip() or str(item.get("code", "")).strip())
+        if item["type"] == "table":
+            return bool(item.get("headers") or item.get("rows"))
+        if item["type"] == "quiz":
+            return bool(str(item.get("text", "")).strip() and len(item.get("options") or []) >= 2)
         return bool(str(item.get("text", "")).strip())
     elements = [item for item in elements if _kept(item)]
     return {"elements": elements} if elements else None
