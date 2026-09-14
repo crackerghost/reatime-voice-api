@@ -1,26 +1,28 @@
 /* Single source of truth for the tutor board's look.
-   Values mirror the app shell (App.jsx / index.css) so the board always
-   feels like the same product: coral primary, deep-sea ink, teal secondary.
-   Change the theme HERE — never hardcode colors in TutorBoard.jsx. */
+   Natural classroom GREEN chalkboard: deep green slate, white chalk text,
+   chalk-yellow accents. Change the theme HERE — never hardcode colors in
+   TutorBoard.jsx. */
 
 export const BOARD_THEME = {
-  primary: "#ff5a5f", // coral — arrows, active step, pen, accents
-  primarySoft: "#fff1f1", // shape fill tint
-  ink: "#12304a", // node strokes, body text
-  inkSoft: "#34566b", // secondary strokes
-  teal: "#0f766e", // secondary accents, note callouts
-  tealSoft: "#ccfbf1", // note background tint
-  paper: "#ffffff", // board background
-  line: "#e2e8f0", // slate-200 hairlines
-  muted: "#64748b", // slate-500 secondary text
-  faint: "#94a3b8", // slate-400 placeholders
-  codeBg: "#0f172a", // slate-900 code cards
-  codeInk: "#e2e8f0", // code text
-  radius: 12, // px — compact professional nodes
-  // Semantic tones: the planner tags core concept / example / warning.
+  primary: "#ffd166", // chalk yellow — arrows, pen, active glow, accents
+  primarySoft: "rgba(255, 255, 255, 0.08)", // shape fill tint on green
+  ink: "#fdfef7", // chalk white — node strokes, body text
+  inkSoft: "#d7e3d8", // soft chalk — secondary strokes
+  teal: "#ffd166", // secondary accent (kept in chalk family)
+  tealSoft: "rgba(255, 255, 255, 0.10)", // note background tint on green
+  paper: "#1d4e38", // green board
+  paperDeep: "#143626", // green board shadow edge
+  line: "rgba(255, 255, 255, 0.18)", // chalk hairlines / grid dots
+  muted: "#c8d8c8", // muted chalk secondary text
+  faint: "rgba(255, 255, 255, 0.55)", // placeholders
+  codeBg: "#10241b", // chalk-tray dark green-black for code cards
+  codeInk: "#f1f5e9", // code text (chalk white)
+  wood: "#8b5a2b", // wooden frame
+  radius: 10, // px — soft chalk boxes
+  // Semantic tones, all readable on green: white / yellow / soft red chalk.
   tones: {
-    core: { fill: "#fff1f1", stroke: "#ff5a5f" },
-    example: { fill: "#ecfdf5", stroke: "#0f766e" },
-    warn: { fill: "#fffbeb", stroke: "#d97706" },
+    core: { fill: "rgba(255,255,255,0.08)", stroke: "#ffffff" },
+    example: { fill: "rgba(255,209,102,0.14)", stroke: "#ffd166" },
+    warn: { fill: "rgba(255,158,158,0.14)", stroke: "#ff9e9e" },
   },
 };

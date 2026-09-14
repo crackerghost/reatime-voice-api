@@ -2,19 +2,26 @@ import { useEffect, useMemo, useRef } from "react";
 import { FaChevronLeft, FaChevronRight, FaDiagramProject, FaSatelliteDish } from "react-icons/fa6";
 import { BOARD_THEME as T } from "./boardTheme.js";
 
-/* TutorBoard — the lesson feed. A persistent, never-erased step timeline:
-   each step is a section (diagram SVG + code/note/image blocks) revealed
-   progressively as the tutor speaks. Themed strictly from boardTheme.js.
+/* TutorBoard — natural classroom GREEN chalkboard lesson feed.
+   A persistent, never-erased timeline: each part is a section (diagram SVG
+   + code/note/image blocks) revealed progressively AS the tutor speaks it.
+
+   Feel rules:
+   - Green board, white chalk text, chalk-yellow accents. No step numbers
+     anywhere — navigation is natural Prev / Next (+ dots + titles).
+   - Board draws in flow with the voice: elements appear when their spoken
+     word plays (App.jsx stages by TTS window + spoken trigger).
 
    Props:
    - steps: [{ key, title, elements: [revealed...] }] in lesson order.
-   - focus: { stepKey, ids:[...], tick } — latest drawn element; the pen
+   - focus: { stepKey, ids:[...], tick } — latest drawn element; the chalk
      glides there and the viewport follows (when followLive).
-   - stepIndex, onStep(i): controlled step navigation (back/forward).
-   - followLive, onJumpLive(): resume auto-follow at the newest step.
+   - stepIndex, onStep(i): controlled navigation (Prev / Next).
+   - followLive, onJumpLive(): resume auto-follow at the newest part.
 */
 
-const DRAW_MS = 650; // stroke-draw animation per shape
+const DRAW_MS = 650; // chalk-stroke animation per shape
+const CHALK_FONT = `"Segoe Print","Bradley Hand","Kalam","Comic Sans MS",cursive`;
 
 function StepDiagram({ elements, focusIds }) {
   const shapes = useMemo(
@@ -44,7 +51,7 @@ function StepDiagram({ elements, focusIds }) {
 
   const byId = useMemo(() => new Map(shapes.map((s) => [s.id, s])), [shapes]);
   const hot = useMemo(() => new Set(focusIds || []), [focusIds]);
-  // Compare steps (side=left/right): a VS divider between the columns.
+  // Compare parts (side=left/right): a VS divider between the columns.
   const divider = useMemo(() => {
     let lMax = -Infinity, rMin = Infinity;
     for (const s of shapes) {
@@ -56,15 +63,12 @@ function StepDiagram({ elements, focusIds }) {
   if (!box) return null;
 
   const toneOf = (s) => T.tones?.[s?.tone] || T.tones.core;
-  // NOTE: pathLength MUST be an attribute — in a style object React emits
-  // `pathLength` (invalid CSS; the valid property is `path-length`), the
-  // dash pattern then applies in user units and every box renders DOTTED.
   const drawStyleFor = (s) => {
     const tone = toneOf(s);
     return {
       fill: tone.fill,
       stroke: tone.stroke,
-      strokeWidth: 2,
+      strokeWidth: 1.75,
       strokeDasharray: 1,
       strokeDashoffset: 1,
       animation: `tutor-draw ${DRAW_MS}ms ease-out forwards`,
@@ -72,8 +76,8 @@ function StepDiagram({ elements, focusIds }) {
   };
   const hotExtra = {
     stroke: T.primary,
-    strokeWidth: 2.75,
-    filter: `drop-shadow(0 0 7px ${T.primary}66)`,
+    strokeWidth: 2.5,
+    filter: `drop-shadow(0 0 7px ${T.primary}88)`,
   };
 
   return (
@@ -91,15 +95,16 @@ function StepDiagram({ elements, focusIds }) {
         const w = Number(s.width) || 180, h = Number(s.height) || 60;
         const label = String(s.text || "");
         const isHot = hot.has(s.id);
-        // Free-floating annotation: no box, just elegant text (tone-tinted).
+        // Free-floating chalk annotation: no box, just chalk text.
         if (s.type === "text")
           return (
             <g key={s.id} style={{ animation: `tutor-fadein 450ms ease both` }}>
               <text
                 x={s.x} y={s.y + 20}
-                fontSize={14.5} fontWeight={650}
-                fill={s.tone && s.tone !== "core" ? toneOf(s).stroke : T.inkSoft}
-                style={isHot ? { filter: `drop-shadow(0 0 6px ${T.primary}66)` } : undefined}
+                fontSize={15} fontWeight={600} fontFamily={CHALK_FONT}
+                fill={s.tone && s.tone !== "core" ? toneOf(s).stroke : T.ink}
+                opacity={0.96}
+                style={isHot ? { filter: `drop-shadow(0 0 6px ${T.primary}88)` } : undefined}
               >
                 {label}
               </text>
@@ -110,7 +115,8 @@ function StepDiagram({ elements, focusIds }) {
           <text
             x={s.x + w / 2} y={s.y + h / 2}
             textAnchor="middle" dominantBaseline="central"
-            fontSize={fs} fontWeight={600} fill={T.ink}
+            fontSize={fs} fontWeight={600} fontFamily={CHALK_FONT} fill={T.ink}
+            opacity={0.97}
             style={{ animation: `tutor-fadein 400ms ease ${DRAW_MS}ms both` }}
           >
             {label.length > 40 ? label.slice(0, 39) + "…" : label}
@@ -150,11 +156,11 @@ function StepDiagram({ elements, focusIds }) {
         <g aria-hidden="true">
           <line
             x1={divider} y1={box.y + 6} x2={divider} y2={box.y + box.h - 6}
-            stroke={T.faint} strokeWidth={1.5} strokeDasharray="5 5" opacity={0.8}
+            stroke="rgba(255,255,255,0.5)" strokeWidth={1.5} strokeDasharray="5 5" opacity={0.8}
           />
           <g transform={`translate(${divider}, ${box.y + box.h / 2})`}>
-            <rect x={-19} y={-12} width={38} height={24} rx={12} fill={T.ink} />
-            <text textAnchor="middle" dominantBaseline="central" fontSize={11} fontWeight={800} fill="#fff">
+            <rect x={-19} y={-12} width={38} height={24} rx={12} fill="#fdfef7" />
+            <text textAnchor="middle" dominantBaseline="central" fontSize={11} fontWeight={800} fill="#143626">
               VS
             </text>
           </g>
@@ -189,8 +195,7 @@ function CodeBlock({ block, caption }) {
   const code = String(block.code || block.text || "");
   const lines = useMemo(() => code.split("\n"), [code]);
   // Karaoke: the line whose code-ish tokens best match the spoken caption
-  // (what the tutor is explaining RIGHT NOW) glows. Recomputes as the
-  // caption streams in — no protocol change needed.
+  // (what the tutor is explaining RIGHT NOW) glows in chalk yellow.
   const hotLine = useMemo(() => {
     if (!caption) return -1;
     const cap = String(caption).toLowerCase();
@@ -206,10 +211,10 @@ function CodeBlock({ block, caption }) {
     return bestScore > 0 ? best : -1;
   }, [lines, caption]);
   return (
-    <div className="overflow-hidden rounded-xl shadow-sm" style={{ background: T.codeBg }}>
-      <div className="flex items-center gap-2 px-3.5 py-2" style={{ borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
+    <div className="overflow-hidden rounded-xl shadow-sm" style={{ background: T.codeBg, border: "1px solid rgba(255,255,255,0.16)" }}>
+      <div className="flex items-center gap-2 px-3.5 py-2" style={{ borderBottom: "1px solid rgba(255,255,255,0.12)" }}>
         <span className="h-2.5 w-2.5 rounded-full" style={{ background: T.primary }} aria-hidden="true" />
-        <span className="text-[0.68rem] font-bold tracking-[0.1em] uppercase" style={{ color: T.faint }}>
+        <span className="text-[0.68rem] font-bold tracking-[0.1em] uppercase" style={{ color: T.muted }}>
           {block.language || "code"}
         </span>
         {hotLine >= 0 && (
@@ -227,10 +232,10 @@ function CodeBlock({ block, caption }) {
             key={i}
             className="flex whitespace-pre transition-colors duration-300"
             style={i === hotLine
-              ? { background: `${T.primary}22`, boxShadow: `inset 3px 0 0 ${T.primary}` }
+              ? { background: "rgba(255,209,102,0.14)", boxShadow: `inset 3px 0 0 ${T.primary}` }
               : undefined}
           >
-            <span className="w-9 shrink-0 pr-2 text-right select-none" style={{ color: "#475569" }}>{i + 1}</span>
+            <span className="w-9 shrink-0 pr-2 text-right select-none" style={{ color: "rgba(255,255,255,0.35)" }}>{i + 1}</span>
             <span className="pr-3.5">{ln || " "}</span>
           </div>
         ))}
@@ -243,7 +248,7 @@ function NoteBlock({ block }) {
   return (
     <div
       className="rounded-xl px-3.5 py-2.5 text-[0.83rem] leading-6 shadow-sm"
-      style={{ background: T.tealSoft, color: T.ink, borderLeft: `4px solid ${T.teal}` }}
+      style={{ background: "rgba(255,255,255,0.10)", color: T.ink, borderLeft: `4px solid ${T.primary}`, fontFamily: CHALK_FONT }}
     >
       {String(block.text || "")}
     </div>
@@ -255,19 +260,19 @@ function ImageBlock({ block }) {
     return (
       <div
         className="flex h-36 animate-pulse flex-col items-center justify-center gap-2 rounded-xl"
-        style={{ background: "#f1f5f9" }}
+        style={{ background: "rgba(255,255,255,0.08)" }}
         aria-label="Image loading"
       >
         <FaSatelliteDish className="h-5 w-5" style={{ color: T.faint }} />
-        <p className="text-xs font-medium" style={{ color: T.muted }}>Finding a picture…</p>
+        <p className="text-xs font-medium" style={{ color: T.muted, fontFamily: CHALK_FONT }}>Finding a picture…</p>
       </div>
     );
   }
   return (
-    <figure className="overflow-hidden rounded-xl bg-white shadow-sm" style={{ border: `1px solid ${T.line}` }}>
+    <figure className="overflow-hidden rounded-xl shadow-sm" style={{ border: "1px solid rgba(255,255,255,0.2)", background: "rgba(0,0,0,0.2)" }}>
       <img src={block.src} alt={block.alt || "Lesson image"} className="max-h-72 w-full object-cover" loading="lazy" />
       {block.credit && (
-        <figcaption className="px-3 py-1.5 text-[0.65rem]" style={{ color: T.faint }}>
+        <figcaption className="px-3 py-1.5 text-[0.65rem]" style={{ color: T.muted }}>
           📷 {block.credit}
         </figcaption>
       )}
@@ -282,10 +287,10 @@ export default function TutorBoard({
   const penRef = useRef(null);
   const elRefs = useRef(new Map());
   const total = steps?.length || 0;
+  const cur = Math.max(0, Math.min(stepIndex || 0, Math.max(0, total - 1)));
+  const prevTitle = cur > 0 ? steps[cur - 1]?.title : "";
+  const nextTitle = cur < total - 1 ? steps[cur + 1]?.title : "";
 
-  // Viewport follows the freshly drawn element (live mode only).
-  // Container-local scrolling ONLY — scrollIntoView() climbs into the
-  // document and drags the whole page (notch/calendar get cut off).
   const scrollNodeIntoView = (node, align = "center") => {
     const box = scrollRef.current;
     if (!box || !node) return;
@@ -296,7 +301,6 @@ export default function TutorBoard({
           ? node.offsetTop - 8
           : node.offsetTop - box.clientHeight / 2 + node.clientHeight / 2;
       } else {
-        // SVG nodes have no offsetTop — use rect math instead.
         const r = node.getBoundingClientRect(), b = box.getBoundingClientRect();
         target = box.scrollTop + (r.top - b.top)
           - (align === "start" ? 8 : box.clientHeight / 2 - r.height / 2);
@@ -309,7 +313,6 @@ export default function TutorBoard({
     const id = focus.ids[0];
     const node = elRefs.current.get(id);
     if (node) scrollNodeIntoView(node, "center");
-    // Glide the tutor pen to the drawn element.
     const pen = penRef.current, box = scrollRef.current;
     if (pen && box && node) {
       try {
@@ -337,55 +340,94 @@ export default function TutorBoard({
   };
 
   return (
-    <div className="relative flex h-full min-h-[480px] w-full flex-col overflow-hidden bg-white" aria-label="Lesson board">
-      {/* Step navigator: board never erases — walk back and forward. */}
+    <div
+      className="relative flex h-full min-h-[480px] w-full flex-col overflow-hidden"
+      aria-label="Green board"
+      style={{
+        background: `linear-gradient(160deg, ${T.paper} 0%, ${T.paperDeep} 100%)`,
+        border: `10px solid ${T.wood}`,
+        borderRadius: 6,
+        boxShadow: "inset 0 0 60px rgba(0,0,0,0.35)",
+      }}
+    >
+      {/* Chalk-dust texture */}
       <div
-        className="z-10 flex shrink-0 items-center gap-2 border-b px-3 py-2"
-        style={{ borderColor: T.line, background: "rgba(255,255,255,0.92)", backdropFilter: "blur(6px)" }}
+        className="pointer-events-none absolute inset-0"
+        aria-hidden="true"
+        style={{
+          backgroundImage:
+            "repeating-linear-gradient(0deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 5px)",
+          mixBlendMode: "overlay",
+        }}
+      />
+      {/* Top navigator: natural Prev / Next + dots (no numbers). */}
+      <div
+        className="z-10 flex shrink-0 items-center gap-2 px-3 py-2"
+        style={{ borderBottom: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.22)", backdropFilter: "blur(6px)" }}
       >
         <button
-          onClick={() => gotoStep((stepIndex || 0) - 1)}
-          disabled={!total || (stepIndex || 0) <= 0}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 disabled:opacity-30"
-          aria-label="Previous step"
+          onClick={() => gotoStep(cur - 1)}
+          disabled={!total || cur <= 0}
+          className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[0.72rem] font-bold transition disabled:opacity-30"
+          style={{ background: "rgba(255,255,255,0.12)", color: T.ink }}
+          aria-label="Previous"
         >
           <FaChevronLeft className="h-3 w-3" />
+          Prev
         </button>
-        <span className="min-w-0 flex-1 truncate text-center text-[0.72rem] font-bold tracking-wide text-slate-500">
-          {total ? `STEP ${Math.min((stepIndex || 0) + 1, total)} / ${total}` : "BOARD"}
+        <span className="flex min-w-0 flex-1 items-center justify-center gap-1.5" aria-label="Lesson progress">
+          {total > 0 ? steps.map((s, i) => (
+            <button
+              key={s.key || i}
+              onClick={() => gotoStep(i)}
+              aria-label={s.title || `Part ${i + 1}`}
+              title={s.title || ""}
+              className="h-2 rounded-full transition-all"
+              style={{
+                width: i === cur ? 22 : 8,
+                background: i === cur ? T.primary : "rgba(255,255,255,0.35)",
+              }}
+            />
+          )) : (
+            <span className="text-[0.72rem] font-bold tracking-wide" style={{ color: T.muted, fontFamily: CHALK_FONT }}>
+              Green board
+            </span>
+          )}
         </span>
         <button
-          onClick={() => gotoStep((stepIndex || 0) + 1)}
-          disabled={!total || (stepIndex || 0) >= total - 1}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-100 disabled:opacity-30"
-          aria-label="Next step"
+          onClick={() => gotoStep(cur + 1)}
+          disabled={!total || cur >= total - 1}
+          className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[0.72rem] font-bold transition disabled:opacity-30"
+          style={{ background: T.primary, color: "#143626" }}
+          aria-label="Next"
         >
+          Next
           <FaChevronRight className="h-3 w-3" />
         </button>
         {!followLive && total > 0 && (
           <button
             onClick={() => onJumpLive && onJumpLive()}
-            className="rounded-full px-2.5 py-1 text-[0.68rem] font-bold text-white shadow-sm transition hover:brightness-95"
-            style={{ background: T.primary }}
+            className="rounded-full px-2.5 py-1 text-[0.68rem] font-bold shadow-sm transition hover:brightness-95"
+            style={{ background: "#fdfef7", color: "#143626" }}
           >
             ● Live
           </button>
         )}
       </div>
 
-      {/* Progress hairline */}
-      <div className="h-0.5 w-full shrink-0 bg-slate-100" aria-hidden="true">
+      {/* Progress chalk line */}
+      <div className="h-0.5 w-full shrink-0" style={{ background: "rgba(255,255,255,0.12)" }} aria-hidden="true">
         <div
           className="h-full transition-all duration-500"
           style={{
-            width: total ? `${(((stepIndex || 0) + 1) / total) * 100}%` : "0%",
+            width: total ? `${((cur + 1) / total) * 100}%` : "0%",
             background: T.primary,
           }}
         />
       </div>
 
-      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-3">
-        {/* Tutor pen: glides to each freshly drawn element. */}
+      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4">
+        {/* Chalk piece: glides to each freshly drawn element. */}
         <div
           ref={penRef}
           className="pointer-events-none absolute top-0 left-0 z-10 h-3 w-3 rounded-full opacity-0 transition-all duration-700 ease-out"
@@ -394,10 +436,10 @@ export default function TutorBoard({
         />
         {!total && (
           <div className="flex h-full min-h-[320px] flex-col items-center justify-center gap-2 text-center">
-            <FaDiagramProject className="h-8 w-8 text-slate-300" />
-            <p className="text-sm font-semibold text-slate-500">No visual yet</p>
-            <p className="max-w-[220px] text-xs leading-5 text-slate-400">
-              Ask a question and the tutor will draw here in realtime.
+            <FaDiagramProject className="h-8 w-8" style={{ color: "rgba(255,255,255,0.35)" }} />
+            <p className="text-sm font-semibold" style={{ color: T.ink, fontFamily: CHALK_FONT }}>No visual yet</p>
+            <p className="max-w-[240px] text-xs leading-5" style={{ color: T.muted, fontFamily: CHALK_FONT }}>
+              Ask a question and the tutor will draw here while speaking.
             </p>
           </div>
         )}
@@ -406,39 +448,52 @@ export default function TutorBoard({
           const extras = (step.elements || []).filter((e) => e && (e.type === "code" || e.type === "note" || e.type === "image"));
           const arrows = (step.elements || []).filter((e) => e && e.type === "arrow");
           const isLive = si === (steps?.length || 0) - 1;
+          const active = si === cur;
           return (
-            <section key={step.key} data-step={si} className="mb-4 last:mb-1">
-              <div className="mb-1.5 flex items-center gap-2">
-                <span
-                  className="inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-[0.62rem] font-extrabold tracking-wide text-white shadow-sm"
-                  style={{ background: T.primary }}
-                >
-                  {si + 1}
-                </span>
-                <p className="text-[0.66rem] font-bold tracking-[0.14em] uppercase" style={{ color: T.muted }}>
-                  Step {si + 1}{step.title ? ` · ${step.title}` : ""}
-                </p>
-                {isLive && (
-                  <span className="ml-auto inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.6rem] font-bold tracking-wider uppercase" style={{ background: `${T.primary}14`, color: T.primary }}>
+            <section key={step.key} data-step={si} className="mb-5 last:mb-1">
+              {step.title ? (
+                <div className="mb-2 flex items-center gap-2">
+                  <span aria-hidden="true" style={{ color: T.primary }}>✎</span>
+                  <p
+                    className="text-[0.95rem] font-semibold tracking-wide"
+                    style={{ color: T.ink, fontFamily: CHALK_FONT, textShadow: "0 0 1px rgba(255,255,255,0.6)" }}
+                  >
+                    {step.title}
+                  </p>
+                  {isLive && (
+                    <span className="ml-auto inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.6rem] font-bold tracking-wider uppercase" style={{ background: "rgba(255,209,102,0.16)", color: T.primary }}>
+                      <span className="relative flex h-1.5 w-1.5">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-60" style={{ background: T.primary }} />
+                        <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ background: T.primary }} />
+                      </span>
+                      Live
+                    </span>
+                  )}
+                </div>
+              ) : isLive ? (
+                <div className="mb-2 flex justify-end">
+                  <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.6rem] font-bold tracking-wider uppercase" style={{ background: "rgba(255,209,102,0.16)", color: T.primary }}>
                     <span className="relative flex h-1.5 w-1.5">
                       <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-60" style={{ background: T.primary }} />
                       <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ background: T.primary }} />
                     </span>
                     Live
                   </span>
-                )}
-              </div>
+                </div>
+              ) : null}
               {(shapes.length > 0 || arrows.length > 0) && (
                 <div
                   ref={shapes[0] ? setElRef(shapes[0].id) : undefined}
-                  className="rounded-2xl bg-white p-2 shadow-[0_2px_14px_rgba(18,48,74,0.07)]"
+                  className="rounded-xl p-2"
                   style={{
-                    border: `1px solid ${T.line}`,
-                    backgroundImage: `radial-gradient(circle, ${T.line} 1px, transparent 1px)`,
+                    border: active ? `1.5px solid ${T.primary}88` : "1px solid rgba(255,255,255,0.18)",
+                    background: "rgba(0,0,0,0.14)",
+                    backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.22) 1px, transparent 1px)`,
                     backgroundSize: "22px 22px",
+                    boxShadow: active ? `0 0 0 1px ${T.primary}44, 0 4px 18px rgba(0,0,0,0.3)` : "0 2px 14px rgba(0,0,0,0.25)",
                   }}
                 >
-                  <div className="rounded-xl bg-white/85 px-1 py-1" style={{ border: `1px solid ${T.line}66` }}>
+                  <div className="rounded-lg px-1 py-1">
                     <StepDiagram elements={[...shapes, ...arrows]} focusIds={focus?.ids} />
                   </div>
                 </div>
@@ -457,7 +512,37 @@ export default function TutorBoard({
             </section>
           );
         })}
+        <div className="h-2" />
       </div>
+
+      {/* Bottom natural pager: Prev / Next with neighbour titles, no numbers. */}
+      {total > 1 && (
+        <div
+          className="z-10 flex shrink-0 items-center justify-between gap-2 px-3 py-2"
+          style={{ borderTop: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.25)" }}
+        >
+          <button
+            onClick={() => gotoStep(cur - 1)}
+            disabled={cur <= 0}
+            className="min-w-0 flex-1 truncate rounded-full px-3 py-2 text-left text-[0.72rem] font-bold transition disabled:opacity-30"
+            style={{ background: "rgba(255,255,255,0.12)", color: T.ink }}
+            aria-label="Previous"
+            title={prevTitle || ""}
+          >
+            ← Prev{prevTitle ? ` · ${prevTitle.slice(0, 28)}` : ""}
+          </button>
+          <button
+            onClick={() => gotoStep(cur + 1)}
+            disabled={cur >= total - 1}
+            className="min-w-0 flex-1 truncate rounded-full px-3 py-2 text-right text-[0.72rem] font-bold transition disabled:opacity-30"
+            style={{ background: T.primary, color: "#143626" }}
+            aria-label="Next"
+            title={nextTitle || ""}
+          >
+            {nextTitle ? `${nextTitle.slice(0, 28)} · ` : ""}Next →
+          </button>
+        </div>
+      )}
     </div>
   );
 }

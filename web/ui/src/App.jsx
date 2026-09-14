@@ -270,7 +270,10 @@ export default function App() {
   const [diagramFocus, setDiagramFocus] = useState(null); // {ids:[...], tick:n} -> whiteboard scrolls here
   const revealQueueRef = useRef([]); // single elements awaiting paced draw
   const revealTimerRef = useRef(0);
-  const REVEAL_MS = 1500; // one shape per beat: speech pace, one-by-one and followable
+  // Chalk pace: one shape per short beat so the board grows WITH the speech
+  // (one audio window ≈ 1.5-3s holds 2-4 shapes). Must stay well under the
+  // spoken duration or the board lags behind the voice.
+  const REVEAL_MS = 750;
 
   /* Merge one staged board batch into state (id-keyed, capped).
      The cap is generous (500): the board is a persistent lesson timeline
@@ -313,7 +316,8 @@ export default function App() {
   // Trigger-gated elements: drawn the instant their trigger word is spoken.
   // Bilingual: server sends trigger (English, matches code/raw) + trigger_hi
   // (Devanagari spoken form, matches the live Hindi caption). Either hit
-  // draws now; 8s deadline backstop so a missed trigger never strands content.
+  // draws now; 4s deadline backstop so a missed trigger never strands content
+  // far behind the voice (board must track speech, not trail it).
   const waitingRef = useRef([]); // [{el, stagedAt}]
   const normCaption = (s) => (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ");
   // Whiteboard entrance: the board must NEVER pop before the tutor speaks.
@@ -334,8 +338,8 @@ export default function App() {
     const cap = normCaption(rawCap);
     const now = Date.now();
     // Speech-progress release: if the paced queue already drained, the voice
-    // has moved past these elements — release aged waits (>2.5s) in staged
-    // order so the board tracks speech instead of dumping at the 8s clock.
+    // has moved past these elements — release aged waits (>1.2s) in staged
+    // order so the board tracks speech instead of dumping late.
     const queueEmpty = revealQueueRef.current.length === 0;
     const ready = [];
     waitingRef.current = waitingRef.current.filter((w) => {
@@ -344,7 +348,7 @@ export default function App() {
       const hitEn = t && cap && cap.includes(t);
       const hitHi = th && rawCap && rawCap.includes(th);
       const age = now - w.stagedAt;
-      if (force || !t && !th || hitEn || hitHi || age > 8000 || (queueEmpty && age > 2500)) {
+      if (force || !t && !th || hitEn || hitHi || age > 4000 || (queueEmpty && age > 1200)) {
         ready.push(w.el);
         return false;
       }
@@ -354,11 +358,11 @@ export default function App() {
       revealQueueRef.current.push(...ready);
       if (!revealTimerRef.current) revealNext();
     }
-    // Backstop: items still waiting have a future 2.5s speech-progress
+    // Backstop: items still waiting have a future 1.2s speech-progress
     // release but no timer is running to enforce it — schedule a sweep.
     if (waitingRef.current.length && !revealTimerRef.current) {
       const oldest = Math.min(...waitingRef.current.map((w) => w.stagedAt));
-      const delay = Math.max(400, Math.min(2500 - (Date.now() - oldest), 2500));
+      const delay = Math.max(300, Math.min(1200 - (Date.now() - oldest), 1200));
       revealTimerRef.current = setTimeout(revealNext, delay);
     }
   };
@@ -397,12 +401,12 @@ export default function App() {
      viewport focus as it appears. Backlog (>12) catches up at a fast beat —
      still stepwise, never an instant dump. */
   const revealNext = useCallback(() => {
-    // Sweep expired trigger-waits first (deadline backstop).
+    // Sweep expired trigger-waits first (deadline backstop: 4s).
     if (waitingRef.current.length) {
       const now = Date.now();
       const due = [];
       waitingRef.current = waitingRef.current.filter((w) => {
-        if (now - w.stagedAt > 8000) { due.push(w.el); return false; }
+        if (now - w.stagedAt > 4000) { due.push(w.el); return false; }
         return true;
       });
       if (due.length) revealQueueRef.current.push(...due);
@@ -410,13 +414,13 @@ export default function App() {
     const el = revealQueueRef.current.shift();
     if (!el) {
       // Queue drained but trigger-waits remain: speech has moved past them —
-      // release aged waits (>2.5s) in order so the board tracks the voice
-      // instead of stranding as a blank page or dumping at the 8s clock.
+      // release aged waits (>1.2s) in order so the board tracks the voice
+      // instead of stranding as a blank page or dumping late.
       if (waitingRef.current.length) {
         const now = Date.now();
         const due = [];
         waitingRef.current = waitingRef.current.filter((w) => {
-          if (now - w.stagedAt > 2500) { due.push(w.el); return false; }
+          if (now - w.stagedAt > 1200) { due.push(w.el); return false; }
           return true;
         });
         if (due.length) {
@@ -424,7 +428,7 @@ export default function App() {
           revealTimerRef.current = setTimeout(revealNext, REVEAL_MS);
         } else {
           const oldest = Math.min(...waitingRef.current.map((w) => w.stagedAt));
-          const delay = Math.max(400, Math.min(2500 - (Date.now() - oldest), 2500));
+          const delay = Math.max(300, Math.min(1200 - (Date.now() - oldest), 1200));
           revealTimerRef.current = setTimeout(revealNext, delay);
         }
       } else {
@@ -437,7 +441,7 @@ export default function App() {
     if (revealQueueRef.current.length > 12) {
       // Long turn, reveal far behind speech — catch up at a readable beat,
       // still one shape at a time (never an instant wall of content).
-      revealTimerRef.current = setTimeout(revealNext, 900);
+      revealTimerRef.current = setTimeout(revealNext, 700);
       return;
     }
     if (revealQueueRef.current.length) {
@@ -2322,7 +2326,7 @@ export default function App() {
           >
         {winId === "whiteboard" && (
           <AppWindow
-            title={`Whiteboard${steps.length ? ` · ${steps.length} step${steps.length > 1 ? "s" : ""}` : ""}`}
+            title="Green Board"
             geom={geomFor("whiteboard")}
             onGeom={setGeomFor("whiteboard")}
             maximized={!!maxed.whiteboard}
@@ -2336,13 +2340,13 @@ export default function App() {
             onMin={() => minimizeApp("whiteboard")}
             onMax={() => zoomApp("whiteboard")}
           >
-            <div className="min-h-0 flex-1 overflow-hidden rounded-b-[18px] bg-white/70">
+            <div className="min-h-0 flex-1 overflow-hidden rounded-b-[18px] bg-[#143626]">
               <TutorBoard
                 steps={steps}
                 focus={diagramFocus}
                 stepIndex={stepIndex}
                 followLive={followLive}
-                caption={assistantTextRef.current}
+                caption={latestAssistant}
                 onStep={(i) => {
                   setStepIndex(i);
                   setFollowLive(false);
