@@ -234,6 +234,7 @@ def generate_for_step(
     reasoning_effort: str = "",
     max_tokens: int = 700,
     id_prefix: str = "w",
+    thinking: dict | None = None,
 ) -> dict | None:
     """Watcher planner: one small board delta for ONE spoken window.
 
@@ -266,6 +267,8 @@ def generate_for_step(
             "temperature": 0,
             "max_tokens": max_tokens,
         }
+        if thinking is not None:
+            payload["thinking"] = thinking  # DeepSeek V4: disabled = fast tool call
         # Deliberately no reasoning_effort: see docstring.
         response = None
         try:

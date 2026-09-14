@@ -246,6 +246,13 @@ if LLM_PROVIDER_DEFAULT not in ("groq", "deepseek"):
 DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions").strip() or "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
 DEEPSEEK_DIAGRAM_MODEL = os.environ.get("DEEPSEEK_DIAGRAM_MODEL", "").strip() or DEEPSEEK_MODEL
+# DeepSeek V4 thinks by default (reasoning_content streams before content —
+# deadly for realtime voice). "disabled" opts into the fast non-thinking path.
+# Effort only matters when thinking is enabled; empty = omit (server default).
+_DEEPSEEK_THINKING_RAW = os.environ.get("DEEPSEEK_THINKING", "disabled").strip().lower()
+DEEPSEEK_THINKING = _DEEPSEEK_THINKING_RAW if _DEEPSEEK_THINKING_RAW in ("enabled", "disabled") else "disabled"
+_DEEPSEEK_EFFORT_RAW = os.environ.get("DEEPSEEK_REASONING_EFFORT", "").strip().lower()
+DEEPSEEK_REASONING_EFFORT = _DEEPSEEK_EFFORT_RAW if _DEEPSEEK_EFFORT_RAW in ("low", "medium", "high", "xhigh", "max") else ""
 LLM_STREAM_TIMEOUT = float(os.environ.get("VOICE_LLM_TIMEOUT", "120.0"))  # httpx stream read timeout (s)
 VISION_TIMEOUT = float(os.environ.get("VOICE_VISION_TIMEOUT", "90.0"))
 # Extra attempts for TRANSIENT LLM failures (429 rate-limit, 5xx, network
@@ -494,10 +501,11 @@ def _resolve_llm(provider: str | None) -> dict:
         name = LLM_PROVIDER_DEFAULT
     if name == "deepseek":
         model = DEEPSEEK_MODEL
-        reasoning = ""  # DeepSeek has no reasoning_effort param; reasoner models think on their own
         return {"name": name, "key": _deepseek_api_key(), "url": DEEPSEEK_URL,
-                "model": model, "reasoning_effort": reasoning,
-                "diagram_model": DEEPSEEK_DIAGRAM_MODEL}
+                "model": model, "reasoning_effort": DEEPSEEK_REASONING_EFFORT,
+                "thinking": {"type": DEEPSEEK_THINKING},
+                "diagram_model": DEEPSEEK_DIAGRAM_MODEL,
+                "diagram_thinking": {"type": "disabled"}}
     reasoning = LLM_REASONING_EFFORT if "gpt-oss" in LLM_MODEL else ""
     return {"name": name, "key": _llm_api_key("groq"), "url": MISTRAL_URL,
             "model": LLM_MODEL, "reasoning_effort": reasoning,
@@ -531,6 +539,7 @@ def _llm_stream_phrases(
     model: str | None = None,
     url: str | None = None,
     reasoning_effort: str | None = None,
+    thinking: dict | None = None,
 ):
     """Stream LLM tokens and yield speakable phrases as soon as they're ready.
 
@@ -551,6 +560,7 @@ def _llm_stream_phrases(
     use_model = model or LLM_MODEL
     use_url = url or MISTRAL_URL
     use_reasoning = reasoning_effort if reasoning_effort is not None else LLM_REASONING_EFFORT
+    use_thinking = thinking  # DeepSeek V4 toggle; None = omit (Groq path)
     while True:
         payload = {
             "model": use_model,
@@ -559,8 +569,10 @@ def _llm_stream_phrases(
             "max_tokens": tok_budget,
             "stream": True,
         }
-        if use_reasoning and "gpt-oss" in use_model:
+        if use_reasoning and ("gpt-oss" in use_model or use_thinking is not None):
             payload["reasoning_effort"] = use_reasoning  # cap thinking time
+        if use_thinking is not None:
+            payload["thinking"] = use_thinking  # {"type": "disabled"} = realtime path
         buf = ""
         yielded = False
         retry_wait = 0.8
@@ -695,6 +707,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
             for raw, complete in _llm_stream_phrases(
                 key, messages, temperature, http_client,
                 model=cfg_model, url=cfg_url, reasoning_effort=cfg_reasoning,
+                thinking=cfg.get("thinking"),
             ):
                 if stop_evt is not None and stop_evt.is_set():
                     return
@@ -773,6 +786,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 diagram_ctx["key"], raw_text or win_text, diagram_ctx.get("topic", ""),
                 stop_evt, client=http_client, url=diagram_ctx.get("diagram_url") or cfg_url,
                 model=diagram_ctx.get("diagram_model") or cfg_diagram_model, max_tokens=DIAGRAM_MAX_TOKENS,
+                thinking=diagram_ctx.get("diagram_thinking"),
                 id_prefix=f"w{n}",
             )
             if not d or (stop_evt is not None and stop_evt.is_set()):
@@ -1037,6 +1051,8 @@ def api_config():
         "llm_provider": LLM_PROVIDER_DEFAULT,
         "llm_providers": _llm_providers_available(),
         "llm_models": {"groq": LLM_MODEL, "deepseek": DEEPSEEK_MODEL},
+        "deepseek_thinking": DEEPSEEK_THINKING,
+        "deepseek_reasoning_effort": DEEPSEEK_REASONING_EFFORT or "",
         "diagram_enabled": DIAGRAM_ENABLED,
         "diagram_model": DIAGRAM_MODEL,
         "diagram_max_tokens": DIAGRAM_MAX_TOKENS,
@@ -1475,7 +1491,8 @@ async def ws_tts(websocket: WebSocket):
                         {"key": key, "topic": text, "turn_id": turn_id,
                           "client_turn_id": client_turn_id,
                           "diagram_model": llm_cfg.get("diagram_model"),
-                          "diagram_url": llm_cfg.get("url")}
+                          "diagram_url": llm_cfg.get("url"),
+                          "diagram_thinking": llm_cfg.get("diagram_thinking")}
                         if should_diagram else None
                     )
                     threading.Thread(
@@ -2062,8 +2079,10 @@ def chat(req: ChatRequest, request: Request):
             "temperature": req.temperature,
             "max_tokens": LLM_MAX_TOKENS,
         }
-        if llm_cfg["reasoning_effort"] and "gpt-oss" in llm_cfg["model"]:
+        if llm_cfg["reasoning_effort"] and ("gpt-oss" in llm_cfg["model"] or llm_cfg.get("thinking") is not None):
             payload["reasoning_effort"] = llm_cfg["reasoning_effort"]  # cap thinking time
+        if llm_cfg.get("thinking") is not None:
+            payload["thinking"] = llm_cfg["thinking"]
         try:
             r = http_client.post(
                 llm_cfg["url"],
