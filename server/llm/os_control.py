@@ -25,7 +25,11 @@ _APP_OPS = {
 }
 _BROWSER_OPS = {"browser_back", "browser_forward", "browser_new_tab", "browser_reload", "browser_close_tab"}
 _NOARG_OPS = {"tile_grid"}
-OPS = _APP_OPS | _BROWSER_OPS | _NOARG_OPS | {"browser_navigate", "note_add", "clear_board"}
+_CODE_OPS = {"code_create", "code_write", "code_edit"}
+OPS = _APP_OPS | _BROWSER_OPS | _NOARG_OPS | {"browser_navigate", "note_add", "clear_board"} | _CODE_OPS
+# Code payloads ride the same tool call as window moves — give those turns a
+# bigger token budget (a teaching-sized file dwarfs the usual 400).
+CODE_DIRECTOR_TOKENS = 1500
 
 _DANGEROUS_SCHEME_RE = re.compile(r"^\s*(javascript|data|vbscript|file|blob)\s*:", re.IGNORECASE)
 
@@ -35,7 +39,7 @@ OS_CONTROL_TOOL = {
     "type": "function",
     "function": {
         "name": "control_os",
-        "description": "Drive the tutoring desktop: open/focus/arrange apps, drive the browser, add notes.",
+        "description": "Drive the tutoring desktop: open/focus/arrange apps, drive the browser, add notes, write code (create/write/edit files).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -54,6 +58,11 @@ OS_CONTROL_TOOL = {
                             "target": {"type": "string", "description": "browser_navigate only: URL or search words."},
                             "title": {"type": "string", "description": "note_add only: note title."},
                             "body": {"type": "string", "description": "note_add only: note body."},
+                            "path": {"type": "string", "description": "code_create/write/edit only: relative file path like index.html or js/app.js."},
+                            "content": {"type": "string", "description": "code_create/write only: full file content (create) or replacement/appended code (write). Keep teaching-sized."},
+                            "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "code_write only: replace the file (default) or append to it."},
+                            "find": {"type": "string", "description": "code_edit only: exact existing snippet to replace (first match)."},
+                            "replace": {"type": "string", "description": "code_edit only: replacement snippet."},
                         },
                         "required": ["op"],
                     },
@@ -67,7 +76,7 @@ OS_CONTROL_TOOL = {
 _DIRECTOR_SYSTEM = (
     "You are the OS director for a voice-tutored desktop with six apps: "
     "tutor (course list + Start teaching), "
-    "whiteboard (lesson board), browser (tabbed web), notes, code (editor), "
+    "whiteboard (green board, lesson board), browser (tabbed web), notes, code (editor), "
     "help (help center with every command and how-to). "
     "Read the USER request + OS snapshot, then call control_os with the MINIMAL "
     "window actions that fulfill it — usually 1-3, never more than 6, in execution "
@@ -79,7 +88,23 @@ _DIRECTOR_SYSTEM = (
     "target may be a full URL or plain search words. browser_navigate reuses "
     "the CURRENT tab (it opens the browser by itself); browser_new_tab ONLY "
     "when the user explicitly asks for a new tab — never open one just to "
-    "visit a site. open_app before acting on a "
+    "visit a site. COMPOUND requests finish in ONE call: 'open browser and "
+    "search youtube' / 'browser kholo aur youtube dikhao' means browser_navigate "
+    "to youtube NOW (it opens the browser by itself — no separate open_app "
+    "needed). The named site or search words ARE the target — use them verbatim "
+    "as browser_navigate target. NEVER open an empty browser and leave the "
+    "search for later, and NEVER split one request across turns. CODE moves "
+    "drive the Code editor and open it by themselves: code_create makes a NEW "
+    "file (path like index.html or js/app.js + full content, then it opens in "
+    "the editor), code_write replaces (or appends to) a file's content, "
+    "code_edit swaps ONE exact snippet (find -> replace, first match wins). "
+    "Keep code teaching-sized and runnable in a plain browser preview (HTML/CSS/"
+    "vanilla JS — no imports, no build step). After code moves, the tutor "
+    "should point the learner at the preview. The OS snapshot may name the "
+    "open code file (code.file with its language): when the user says 'this "
+    "code', 'this file', or 'it' without naming a path, use that file for "
+    "code_write/code_edit. lesson is the active curriculum lesson id — "
+    "context only, never an action. open_app before acting on a "
     "closed app. Never close or minimize anything the user didn't ask to close. "
     "Reply ONLY via the tool call."
 )
@@ -127,7 +152,17 @@ _OS_REQUEST_RE = re.compile(
     r"\bfechar\b|\bfeche\b|"
     r"\bhelp\s*cent(re|er)\b|\bopen\s*help\b|"
     r"\breload\b|\brefresh\b|"
-    r"side\s*by\s*side|\btile\b|\bgoogle\b|\byoutube\b|\bwebsite\b|\bdocs?\b|\bvideo\b)",
+    r"side\s*by\s*side|\btile\b|\bgoogle\b|\byoutube\b|\bwebsite\b|\bdocs?\b|\bvideo\b|"
+    # Explicit code-write imperatives (verb + code/file noun, either order).
+    # Bare "code" is deliberately NOT here: "explain this code / ye code kya
+    # karta hai" are teaching/screen questions, not desktop moves.
+    r"कोड.{0,20}(लिख|बना|एडिट|ठीक)|फाइल.{0,20}(बना|लिख|खोल)|"
+    r"\bcode\b.{0,20}\b(write|create|edit|fix|bana|likh|khol|dikha)\b|"
+    r"\b(bana|likh)\b.{0,20}\b(code|files?)\b|"
+    r"\bwrite\b.{0,30}\bcode\b|"
+    r"\bedit\b.{0,30}\b(code|files?)\b|"
+    r"\bcreate\b.{0,30}\b(files?|code)\b|\b(files?|code)\b.{0,30}\b(create|edit)\b|"
+    r"\bfix\b.{0,30}\bcode\b)",
     re.IGNORECASE,
 )
 _DEFINITION_RE = re.compile(
@@ -147,9 +182,31 @@ def wants_os_action(text: str) -> bool:
     return bool(_OS_REQUEST_RE.search(clean))
 
 
+# Subset gate: the turn wants the agent to WRITE code (bigger director token
+# budget + same blocking narration as other desktop moves).
+_CODE_WRITE_RE = re.compile(
+    r"(कोड.{0,20}(लिख|बना|एडिट|ठीक)|फाइल.{0,20}(बना|लिख)|"
+    r"\bcode\b.{0,20}\b(write|create|edit|fix|bana|likh|khol|dikha)\b|"
+    r"\b(bana|likh)\b.{0,20}\b(code|files?)\b|"
+    r"\bwrite\b.{0,30}\bcode\b|"
+    r"\bedit\b.{0,30}\b(code|files?)\b|"
+    r"\bcreate\b.{0,30}\b(files?|code)\b|\b(files?|code)\b.{0,30}\b(create|edit)\b|"
+    r"\bfix\b.{0,30}\bcode\b)",
+    re.IGNORECASE,
+)
+
+
+def wants_code_action(text: str) -> bool:
+    """True when the turn explicitly asks the tutor to write/create/edit code."""
+    clean = (text or "").strip()
+    if len(clean) < 8:
+        return False
+    return bool(_CODE_WRITE_RE.search(clean))
+
+
 _APP_NAMES = {
     "tutor": "the Tutor courses",
-    "whiteboard": "the Whiteboard",
+    "whiteboard": "the Green Board",
     "browser": "the Browser",
     "notes": "Notes",
     "code": "the Code editor",
@@ -201,6 +258,13 @@ def describe_action(action: dict) -> str:
     if op == "note_add":
         title = str(action.get("title", "")).strip()[:60]
         return f"added a note{f' {title!r}' if title else ''}"
+    if op == "code_create":
+        return f"created file '{action.get('path', '')}'"
+    if op == "code_write":
+        how = "appended code to" if action.get("mode") == "append" else "wrote code into"
+        return f"{how} '{action.get('path', '')}'"
+    if op == "code_edit":
+        return f"edited '{action.get('path', '')}'"
     if op == "clear_board":
         return "cleared the board"
     return f"ran {op}"
@@ -208,8 +272,13 @@ def describe_action(action: dict) -> str:
 
 def ack_block(actions) -> str:
     """System-prompt addendum so the tutor talks about its moves in the SAME
-    reply ('open kar diya hai, batao kya search karna hai?') — or stays
-    honest when nothing happened (never claim phantom window moves)."""
+    reply — naming exactly what happened — or stays honest when nothing
+    happened (never claim phantom window moves).
+
+    No verbatim examples: the tutor used to parrot 'batao isme kya search
+    karna hai?' even when the search had already run. The follow-up is now
+    conditional on what actually executed.
+    """
     acts = [a for a in (actions or []) if isinstance(a, dict)]
     if not acts:
         return (
@@ -219,11 +288,29 @@ def ack_block(actions) -> str:
             "do it right now and they should do it manually, then answer normally."
         )
     lines = "\n".join(f"- {describe_action(a)}" for a in acts)
+    targets = [
+        str(a.get("target", "")).strip()[:80]
+        for a in acts
+        if a.get("op") == "browser_navigate" and str(a.get("target", "")).strip()
+    ]
+    if targets:
+        follow = (
+            f"The Browser ALREADY shows '{targets[0]}' — name it in the ack "
+            "(e.g. say youtube is open) and NEVER ask what to search or open. "
+            "Then continue the answer."
+        )
+    else:
+        follow = (
+            "If the user named a site/search and it is NOT listed above, it did "
+            "NOT happen — never claim it opened. Ask ONE short follow-up only "
+            "when the user gave no target at all (bare 'open browser'). "
+            "Then continue the answer."
+        )
     return (
         "OS_ACTIONS_DONE (already executed on the user's screen — the user SEES "
-        f"them):\n{lines}\nAcknowledge in 1-2 short Hinglish lines in Devanagari "
-        "script only, e.g. 'ओके ब्राउज़र ओपन कर दिया है, बताओ इसमें क्या सर्च "
-        "करना है?' Then continue the answer. Never claim actions not listed here."
+        f"them):\n{lines}\nAcknowledge ONLY the listed moves by name, in 1-2 "
+        f"short Hinglish lines in Devanagari script only. {follow} "
+        "Never claim actions not listed here."
     )
 
 
@@ -256,6 +343,20 @@ def sanitize_os_snapshot(raw) -> dict:
         steps = 0
     if steps > 0:
         snap["whiteboardSteps"] = min(steps, 999)
+    # Open code file (what the learner looks at) + active curriculum lesson.
+    # The director uses code.file to resolve "this code / this file / it"
+    # without demanding a path; lesson is context only, never an action.
+    code = raw.get("code")
+    if isinstance(code, dict):
+        path = _clean_code_path(code.get("file"))
+        lang = re.sub(r"[^A-Za-z#+_-]", "", str(code.get("lang") or ""))[:24]
+        if path:
+            snap["code"] = {"file": path, **({"lang": lang} if lang else {})}
+    lesson = raw.get("lesson")
+    if isinstance(lesson, dict):
+        lid = str(lesson.get("id") or "").strip()[:80]
+        if lid:
+            snap["lesson"] = {"id": lid}
     return snap
 
 
@@ -295,7 +396,44 @@ def sanitize_action(raw) -> dict | None:
         if body:
             action["body"] = body
         return action
+    if op in _CODE_OPS:
+        path = _clean_code_path(raw.get("path"))
+        if not path:
+            return None
+        if op == "code_create":
+            content = str(raw.get("content") or "")[:6000]
+            action = {"op": op, "path": path}
+            if content.strip():
+                action["content"] = content
+            return action
+        if op == "code_write":
+            content = str(raw.get("content") or "")[:6000]
+            if not content.strip():
+                return None
+            mode = str(raw.get("mode") or "overwrite").strip().lower()
+            return {"op": op, "path": path, "content": content,
+                    "mode": "append" if mode == "append" else "overwrite"}
+        if op == "code_edit":
+            find = str(raw.get("find") or "")[:2000]
+            replace = str(raw.get("replace") or "")[:6000]
+            if not find.strip():
+                return None
+            return {"op": op, "path": path, "find": find, "replace": replace}
     return None
+
+
+_VALID_CODE_PATH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-/]{0,119}$")
+
+
+def _clean_code_path(raw) -> str | None:
+    """Relative in-project paths only (index.html, js/app.js). Rejects
+    absolute paths, parent escapes, and overlong names."""
+    p = str(raw or "").replace("\\", "/").strip().strip("/")[:120]
+    if not p or p.endswith("/") or ".." in p.split("/"):
+        return None
+    if not _VALID_CODE_PATH_RE.match(p):
+        return None
+    return p
 
 
 def plan_os_actions(

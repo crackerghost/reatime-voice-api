@@ -7,15 +7,6 @@ import {
 const GOOGLE_HOME = "https://www.google.com/webhp?igu=1";
 const NEWTAB = "bugos:newtab";
 
-const QUICK = [
-  { name: "Google", domain: "google.com", url: "https://www.google.com/webhp?igu=1" },
-  { name: "YouTube", domain: "youtube.com", url: "https://www.youtube.com" },
-  { name: "Wikipedia", domain: "wikipedia.org", url: "https://en.wikipedia.org" },
-  { name: "GitHub", domain: "github.com", url: "https://github.com" },
-  { name: "MDN", domain: "developer.mozilla.org", url: "https://developer.mozilla.org" },
-  { name: "Stack Overflow", domain: "stackoverflow.com", url: "https://stackoverflow.com" },
-];
-
 const favicon = (domain) => `https://www.google.com/s2/favicons?sz=64&domain=${domain}`;
 
 function toUrl(raw) {
@@ -32,6 +23,25 @@ function hostOf(url) {
   } catch {
     return "New tab";
   }
+}
+
+/* Search-only browser: this window is a Google search surface. Hosts that
+ * forbid embedding (YouTube home/search/channels send
+ * `X-Frame-Options: SAMEORIGIN`) can never render in an <iframe>, so they
+ * get a graceful fallback (open externally) instead of a blank page. */
+function blockedHost(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "").replace(/^m\./, "").toLowerCase();
+    if (host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtu.be") {
+      return host;
+    }
+  } catch { /* not a URL */ }
+  return null;
+}
+
+function frameTarget(url) {
+  if (blockedHost(url)) return { blocked: true };
+  return { src: url };
 }
 
 let tabSeq = 1;
@@ -170,6 +180,7 @@ export default function BrowserApp({ url, onNavigate, queue, onAck }) {
   const current = active.history[active.idx];
   const canBack = active.idx > 0;
   const canFwd = active.idx < active.history.length - 1;
+  const frame = current === NEWTAB ? null : frameTarget(current);
 
   const submit = (e) => {
     e?.preventDefault();
@@ -299,39 +310,51 @@ export default function BrowserApp({ url, onNavigate, queue, onAck }) {
                 className="min-w-0 flex-1 bg-transparent text-sm text-slate-800 outline-none"
               />
             </form>
-            <div className="grid w-full max-w-md grid-cols-3 gap-2">
-              {QUICK.map((q) => (
-                <button
-                  key={q.domain}
-                  onClick={() => navigate(q.url)}
-                  className="flex flex-col items-center gap-1.5 rounded-2xl border border-slate-100 bg-white px-2 py-3 shadow-sm transition hover:shadow-md"
-                >
-                  <img
-                    src={favicon(q.domain)}
-                    alt=""
-                    className="h-6 w-6 rounded-md"
-                    onError={(e) => {
-                      e.currentTarget.style.display = "none";
-                    }}
-                  />
-                  <span className="text-xs font-medium text-slate-600">{q.name}</span>
-                </button>
-              ))}
+            <p className="max-w-md text-center text-xs leading-5 text-slate-400">
+              Search-only browser — results open here. A page that refuses to load
+              can be opened externally with ↗.
+            </p>
+          </div>
+        ) : frame?.blocked ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 bg-slate-50 p-6 text-center">
+            <p className="text-sm font-bold text-slate-900">This site blocks embedding</p>
+            <p className="max-w-sm text-xs leading-5 text-slate-500">
+              This page refuses to load inside the search browser — open it in a
+              real tab instead.
+            </p>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <a
+                href={current}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-1.5 rounded-xl bg-[#ff5a5f] px-4 py-2 text-xs font-bold text-white shadow-sm transition hover:brightness-95"
+              >
+                Open externally <FaArrowUpRightFromSquare className="h-3 w-3" />
+              </a>
+              <button
+                onClick={goBack}
+                disabled={!canBack}
+                className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-600 transition hover:border-slate-300 disabled:opacity-40"
+              >
+                Go back
+              </button>
             </div>
           </div>
         ) : (
           <iframe
             key={`${active.id}-${active.idx}-${active.reload}`}
-            src={current}
+            src={frame.src}
             title="Browser"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation"
             className="h-full w-full border-0 bg-white"
           />
         )}
       </div>
       <p className="mt-1 truncate px-1 text-[11px] text-slate-500">
         {current === NEWTAB
-          ? "New tab — search above or pick a site."
+          ? "New tab — type above to search."
           : (
             <>
               Tutor sees: <span className="font-medium text-slate-700">{current}</span>

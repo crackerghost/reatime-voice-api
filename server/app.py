@@ -46,7 +46,8 @@ from server.runtime import VoiceRuntime
 from server.settings import Settings
 
 from server.llm.diagrams import generate_for_step as _generate_step, should_generate as _should_generate_diagram
-from server.llm.os_control import plan_os_actions as _plan_os, sanitize_os_snapshot as _sanitize_os, should_direct as _should_direct, wants_os_action as _wants_os_action, ack_block as _os_ack_block
+from server.llm.os_control import plan_os_actions as _plan_os, sanitize_os_snapshot as _sanitize_os, should_direct as _should_direct, wants_os_action as _wants_os_action, wants_code_action as _wants_code_action, ack_block as _os_ack_block
+from server.llm.os_control import CODE_DIRECTOR_TOKENS as _CODE_DIRECTOR_TOKENS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("voice_api")
@@ -135,7 +136,7 @@ OMNIVOICE_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
 SAMPLE_RATE = int(os.environ.get("VOICE_SAMPLE_RATE", "24000"))  # OmniVoice always outputs 24 kHz
 NUM_STEP = int(os.environ.get("VOICE_NUM_STEP", "8"))            # diffusion steps; lower = faster (8 ≈ realtime)
 TEMPERATURE = float(os.environ.get("VOICE_TEMPERATURE", "0.3"))  # Kaggle demo default
-DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.0"))      # rate when a request omits speed
+DEFAULT_SPEED = float(os.environ.get("VOICE_SPEED", "1.2"))      # rate when a request omits speed
 # Allowed diffusion-step range and the first-window / greeting caps below are
 # all env-tunable (used by /tts, the WebSocket, and TTSRequest validation).
 STEP_MIN = int(os.environ.get("VOICE_STEP_MIN", "4"))
@@ -208,7 +209,7 @@ SPEED_MIN = float(os.environ.get("VOICE_SPEED_MIN", "0.3"))
 SPEED_MAX = float(os.environ.get("VOICE_SPEED_MAX", "2.0"))
 
 
-def _pick_speed(sent: str, base: float = 1.0) -> float:
+def _pick_speed(sent: str, base: float = 1.2) -> float:
     """Per-sentence pace: excited lines speed up, thoughtful lines slow down.
 
     Combined with the LLM's punctuation/expression cues ('!', '...', 'वाह!')
@@ -796,7 +797,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 stop_evt, client=http_client, url=diagram_ctx.get("diagram_url") or cfg_url,
                 model=diagram_ctx.get("diagram_model") or cfg_diagram_model, max_tokens=DIAGRAM_MAX_TOKENS,
                 thinking=diagram_ctx.get("diagram_thinking"),
-                id_prefix=f"w{n}",
+                id_prefix=f"w{n}", turn_id=diagram_ctx.get("turn_id", ""),
             )
             if not d or (stop_evt is not None and stop_evt.is_set()):
                 return
@@ -834,6 +835,7 @@ def _chat_worker(state, key, messages, temperature, num_step, speed, out_q, stop
                 url=os_ctx.get("url") or cfg_url,
                 model=os_ctx.get("model") or cfg_diagram_model,
                 thinking=os_ctx.get("thinking"),
+                max_tokens=os_ctx.get("max_tokens") or 400,
             )
             for a in actions or []:
                 if stop_evt is not None and stop_evt.is_set():
@@ -1519,39 +1521,29 @@ async def ws_tts(websocket: WebSocket):
                 start = time.perf_counter()
                 turn_id = uuid.uuid4().hex
                 client_turn_id = str(data.get("client_turn_id", ""))[:80]
-                should_diagram = _should_generate_diagram(text, history, DIAGRAM_ENABLED)
-                log.info("WS chat request [%s/%s]: %s%s", llm_cfg["name"], llm_cfg["model"], text[:50], " [diagram candidate]" if should_diagram else "")
                 busy[0] = True
                 # _screen_paused pauses background screen warm-ups until this
                 # reply finishes streaming (covers disconnects/exceptions too)
                 async with state.gen_lock, _screen_paused():
                     out_q: queue.Queue = queue.Queue()
                     llm_client = state.runtime.provider_clients.llm()
-                    # Watcher sidecar: per-window board deltas stream via out_q
-                    # ("diagram") alongside voice — voice never waits for them.
-                    diagram_ctx = (
-                        {"key": key, "topic": text, "turn_id": turn_id,
-                          "client_turn_id": client_turn_id,
-                          "diagram_model": llm_cfg.get("diagram_model"),
-                          "diagram_url": llm_cfg.get("url"),
-                          "diagram_thinking": llm_cfg.get("diagram_thinking")}
-                        if should_diagram else None
-                    )
                     # OS Director snapshot: what the tutor sees of the desktop
                     # (front app, open/minimized/tiled apps, browser URL...).
-                    # Fired even when diagrams are off — browser/notes control
-                    # doesn't need the board.
+                    # The BLOCKING director runs BEFORE the diagram gate so a
+                    # desktop move ("open notes") suppresses the board: the
+                    # ack reply is narration, not a lesson, and must not yank
+                    # the green board over the app the user asked for.
                     os_snapshot = _sanitize_os(
                         data.get("os") if isinstance(data.get("os"), dict) else None
                     )
                     os_ctx = None
+                    actions_done: list = []
                     if OS_DIRECTOR_ENABLED and key and _wants_os_action(text):
                         # Action turn ("browser kholo"): run the director
                         # BLOCKING (bounded) and execute its moves BEFORE the
                         # reply streams, then tell the LLM what it did — so
                         # the tutor talks about its moves in the SAME answer
                         # ("open kar diya hai, batao kya search karna hai?").
-                        actions_done = []
                         try:
                             loop = asyncio.get_running_loop()
                             actions_done = await asyncio.wait_for(
@@ -1563,6 +1555,7 @@ async def ws_tts(websocket: WebSocket):
                                         url=llm_cfg.get("url"),
                                         model=llm_cfg.get("diagram_model"),
                                         thinking=llm_cfg.get("diagram_thinking"),
+                                        max_tokens=_CODE_DIRECTOR_TOKENS if _wants_code_action(text) else 400,
                                     ),
                                 ),
                                 timeout=OS_DIRECTOR_BLOCK_S,
@@ -1597,9 +1590,27 @@ async def ws_tts(websocket: WebSocket):
                               "client_turn_id": client_turn_id,
                               "model": llm_cfg.get("diagram_model"),
                               "url": llm_cfg.get("url"),
-                              "thinking": llm_cfg.get("diagram_thinking")}
+                              "thinking": llm_cfg.get("diagram_thinking"),
+                              "max_tokens": _CODE_DIRECTOR_TOKENS if _wants_code_action(text) else 400}
                             if (OS_DIRECTOR_ENABLED and key and _should_direct(text)) else None
                         )
+                    # Diagram gate runs AFTER the blocking director: any turn
+                    # that moved a window skips the board entirely.
+                    should_diagram = (
+                        not actions_done
+                        and _should_generate_diagram(text, history, DIAGRAM_ENABLED)
+                    )
+                    log.info("WS chat request [%s/%s]: %s%s", llm_cfg["name"], llm_cfg["model"], text[:50], " [diagram candidate]" if should_diagram else "")
+                    # Watcher sidecar: per-window board deltas stream via out_q
+                    # ("diagram") alongside voice — voice never waits for them.
+                    diagram_ctx = (
+                        {"key": key, "topic": text, "turn_id": turn_id,
+                          "client_turn_id": client_turn_id,
+                          "diagram_model": llm_cfg.get("diagram_model"),
+                          "diagram_url": llm_cfg.get("url"),
+                          "diagram_thinking": llm_cfg.get("diagram_thinking")}
+                        if should_diagram else None
+                    )
                     threading.Thread(
                         target=_chat_worker,
                         args=(state, key, messages, temperature, num_step, speed, out_q, stop_evt, start, llm_client, diagram_ctx, llm_cfg, os_ctx),

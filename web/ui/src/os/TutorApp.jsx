@@ -1,30 +1,32 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  FaBookOpen, FaCheck, FaChevronDown, FaChevronRight, FaCirclePlay,
-  FaClock, FaGraduationCap, FaListUl, FaMagnifyingGlass, FaArrowRight, FaArrowLeft, FaCircleCheck,
+  FaBookOpen, FaCheck, FaCirclePlay,
+  FaClock, FaGraduationCap, FaMagnifyingGlass, FaArrowRight, FaArrowLeft, FaCircleCheck,
 } from "react-icons/fa6";
 import { getProgressPercent } from "../data/courseData.js";
 
-/* Tutor — professional course browser.
- * Left: searchable curriculum (course → module → lesson).
- * Right: lesson overview card + sticky start action.
+/* Tutor — Learnify-pattern course home in a black frame.
+ * Dashboard: cream canvas, search + pills, pastel course cards with
+ * progress + red Continue, numbered "My next lessons", red promo card.
+ * Detail: lesson overview (objective, key terms, board plan, quiz) with
+ * sticky start action + prev/next + mark complete.
  * Same props/API as before so App.jsx wiring is untouched. */
 
 const KIND_STYLE = {
-  coding: "bg-violet-50 text-violet-700 ring-violet-200",
-  project: "bg-amber-50 text-amber-800 ring-amber-200",
-  theory: "bg-sky-50 text-sky-700 ring-sky-200",
-  video: "bg-rose-50 text-rose-700 ring-rose-200",
-  quiz: "bg-emerald-50 text-emerald-700 ring-emerald-200",
+  coding: "bg-violet-100 text-violet-800",
+  project: "bg-amber-100 text-amber-800",
+  theory: "bg-sky-100 text-sky-800",
+  video: "bg-rose-100 text-rose-800",
+  quiz: "bg-emerald-100 text-emerald-800",
 };
 const KIND_LABEL = { theory: "Theory", coding: "Hands-on", video: "Video", quiz: "Quiz", project: "Project" };
 
-const COVER = [
-  "from-[#ff5a5f] via-[#f43f5e] to-[#be123c]",
-  "from-[#fb7185] via-[#ff5a5f] to-[#9f1239]",
-];
-
+const NAVY = "#1b2547";
 const RED = "#ff5a5f";
+const RED_DEEP = "#c81e3a";
+const CREAM = "#f6f1e7";
+const PASTELS = ["#fdf3d7", "#ffe7d3", "#e2ebfd", "#e2f3e7", "#ece4fa"];
+const FACE_BG = ["#1b2547", "#ff5a5f", "#2e9e6b", "#7c5cbf", "#c2410c"];
 
 function initials(title = "") {
   return title.split(/[\s—–-]+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase();
@@ -34,6 +36,23 @@ function flatLessons(course) {
   const out = [];
   for (const m of course?.modules || []) for (const l of m.lessons || []) out.push({ courseId: course.id, moduleId: m.id, moduleTitle: m.title, ...l });
   return out;
+}
+
+function faces(names) {
+  return (
+    <span className="flex items-center">
+      {(names || []).slice(0, 4).map((n, i) => (
+        <span
+          key={i}
+          className="flex h-6 w-6 items-center justify-center rounded-full text-[9px] font-black text-white ring-2"
+          style={{ background: FACE_BG[i % FACE_BG.length], marginLeft: i ? -8 : 0, ["--tw-ring-color"]: "rgba(255,255,255,0.9)" }}
+          aria-hidden="true"
+        >
+          {initials(n)}
+        </span>
+      ))}
+    </span>
+  );
 }
 
 export default function TutorApp({
@@ -47,12 +66,14 @@ export default function TutorApp({
   onCompleteLesson,
 }) {
   const [q, setQ] = useState("");
-  const [openCourses, setOpenCourses] = useState(() => ({ [activeCourseId]: true }));
-  const [openModules, setOpenModules] = useState(() => {
-    const m = {};
-    for (const c of courses || []) for (const mod of c.modules || []) m[`${c.id}:${mod.id}`] = selected?.courseId === c.id && selected?.moduleId === mod.id;
-    return m;
-  });
+  const [pill, setPill] = useState("all"); // module filter for next lessons
+  const [home, setHome] = useState(true); // dashboard vs lesson detail
+  const selRef = useRef(null); // selected lesson row — scrolled into view
+  useEffect(() => {
+    try {
+      selRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch { /* noop */ }
+  }, [selected?.lessonId, pill, home]);
 
   const needle = q.trim().toLowerCase();
   const filtered = useMemo(() => {
@@ -79,7 +100,7 @@ export default function TutorApp({
   const selLesson = selModule?.lessons?.find((l) => l.id === selected?.lessonId) || selModule?.lessons?.[0] || null;
 
   const all = useMemo(() => (selCourse ? flatLessons(selCourse) : []), [selCourse]);
-  const idx = all.findIndex((l) => l.lessonId === undefined ? false : l.id === selLesson?.id);
+  const idx = all.findIndex((l) => (l.lessonId === undefined ? false : l.id === selLesson?.id));
   const prev = idx > 0 ? all[idx - 1] : null;
   const next = idx >= 0 && idx < all.length - 1 ? all[idx + 1] : null;
   const totalMins = all.reduce((s, l) => s + (l.durationMin || 0), 0);
@@ -87,193 +108,250 @@ export default function TutorApp({
   const doneIds = new Set(progress?.completedLessonIds || []);
   const statusOf = (id) => (id === activeLessonId ? "current" : doneIds.has(id) ? "done" : "todo");
 
+  // ---- dashboard data ----
+  const pillCourse = (courses || []).find((c) => flatLessons(c).some((l) => l.id === activeLessonId)) || (courses || [])[0] || null;
+  const pillLessons = useMemo(() => {
+    if (!pillCourse) return [];
+    const list = flatLessons(pillCourse);
+    return pill === "all" ? list : list.filter((l) => l.moduleId === pill);
+  }, [pillCourse, pill]);
+  const nextLessons = pillLessons; // full module list — inner scroll shows all
+  const searchHits = useMemo(() => {
+    if (!needle) return [];
+    const out = [];
+    for (const c of filtered) for (const m of c.modules || []) for (const l of m.lessons || []) {
+      out.push({ courseId: c.id, moduleId: m.id, moduleTitle: m.title, ...l });
+      if (out.length >= 12) return out;
+    }
+    return out;
+  }, [filtered, needle]);
+  const activeAcross = useMemo(() => {
+    for (const c of courses || []) {
+      const hit = flatLessons(c).find((l) => l.id === activeLessonId);
+      if (hit) return { course: c, lesson: hit };
+    }
+    return { course: (courses || [])[0] || null, lesson: null };
+  }, [courses, activeLessonId]);
+
+  const goDetail = (courseId, moduleId, lessonId) => {
+    onSelect && onSelect(courseId, moduleId, lessonId);
+    setHome(false);
+  };
+  const startLesson = (courseId, moduleId, lessonId) => {
+    onSelect && onSelect(courseId, moduleId, lessonId);
+    onStartLesson && onStartLesson(courseId, moduleId, lessonId);
+  };
+  const continueCourse = (course) => {
+    const list = flatLessons(course);
+    const target = list.find((l) => l.id === activeLessonId) || list.find((l) => !doneIds.has(l.id)) || list[0];
+    if (target) startLesson(course.id, target.moduleId, target.id);
+  };
+
   return (
-    <div className="flex h-full min-h-0 overflow-hidden rounded-2xl border border-slate-200/80 bg-white text-slate-900">
-      {/* ── Sidebar ─────────────────────────────── */}
-      <aside className="flex w-72 shrink-0 flex-col border-r border-slate-200/80 bg-slate-50/60">
-        <div className="border-b border-slate-200/70 px-4 pt-4 pb-3">
-          <div className="flex items-center gap-2">
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-[#ff5a5f] text-white shadow-[0_6px_16px_rgba(255,90,95,0.4)]">
+    <div className="h-full min-h-0 overflow-y-auto" style={{ background: CREAM }}>
+      {home ? (
+        <div className="px-5 py-4 sm:px-8">
+          {/* header */}
+          <div className="flex items-center gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold text-slate-500">Welcome back,</p>
+              <h1 className="text-xl font-black tracking-tight" style={{ color: NAVY }}>My courses</h1>
+            </div>
+            <div className="flex w-44 items-center gap-2 rounded-full bg-white px-3 py-1.5 shadow-sm ring-1 ring-black/10 sm:w-56">
+              <FaMagnifyingGlass className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+              <input
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                aria-label="Search courses and topics"
+                placeholder="Search"
+                className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-slate-400"
+              />
+            </div>
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-white" style={{ background: NAVY }} title="Learner">
               <FaGraduationCap className="h-4 w-4" />
             </span>
-            <div className="min-w-0">
-              <p className="text-[13px] font-bold tracking-tight">Catalog</p>
-              <p className="text-[11px] text-slate-500">{courses.length} course{courses.length === 1 ? "" : "s"} · {all.length} lessons</p>
-            </div>
           </div>
-          <div className="mt-3 flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm transition focus-within:border-[#ff5a5f] focus-within:ring-2 focus-within:ring-[#ff5a5f]/15">
-            <FaMagnifyingGlass className="h-3.5 w-3.5 shrink-0 text-slate-400" />
-            <input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              aria-label="Search courses and topics"
-              placeholder="Search lessons, topics…"
-              className="min-w-0 flex-1 bg-transparent text-[13px] outline-none placeholder:text-slate-400"
-            />
-            {q && (
-              <button onClick={() => setQ("")} aria-label="Clear search" className="text-[11px] font-semibold text-slate-400 hover:text-slate-700">Clear</button>
-            )}
-          </div>
-        </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-          {filtered.length === 0 && (
-            <div className="rounded-xl border border-dashed border-slate-200 bg-white px-3 py-6 text-center">
-              <p className="text-[13px] font-semibold">No matches</p>
-              <p className="mt-1 text-xs text-slate-500">Try “react”, “flexbox”, or “mongo”.</p>
-            </div>
-          )}
-          {filtered.map((c, ci) => {
-            const open = needle ? true : !!openCourses[c.id];
-            const cpct = getProgressPercent(c, progress);
-            return (
-              <div key={c.id} className="mb-1.5 overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-[0_1px_2px_rgba(15,23,42,0.05)]">
+          {/* pills */}
+          <div className="mt-3 flex flex-wrap gap-1.5">
+            {[{ id: "all", title: "All lessons" }, ...((pillCourse?.modules || []).map((m) => ({ id: m.id, title: m.title })))].map((p) => {
+              const on = pill === p.id;
+              return (
                 <button
-                  onClick={() => setOpenCourses((p) => ({ ...p, [c.id]: !p[c.id] }))}
-                  aria-expanded={open}
-                  className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left transition hover:bg-slate-50"
+                  key={p.id}
+                  onClick={() => setPill(p.id)}
+                  className={`rounded-full px-3 py-1.5 text-xs font-bold transition ${on ? "text-white shadow-sm" : "bg-white text-slate-600 ring-1 ring-black/10 hover:ring-black/25"}`}
+                  style={on ? { background: RED } : undefined}
                 >
-                  <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br text-[11px] font-black text-white ${COVER[ci % COVER.length]}`}>
-                    {initials(c.title)}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-[13px] font-bold tracking-tight">{c.title}</span>
-                    <span className="mt-0.5 flex items-center gap-2">
-                      <span className="h-1 w-20 overflow-hidden rounded-full bg-slate-100">
-                        <span className="block h-full rounded-full bg-[#ff5a5f]" style={{ width: `${cpct}%` }} />
-                      </span>
-                      <span className="text-[11px] font-semibold text-slate-500 tabular-nums">{cpct}%</span>
-                    </span>
-                  </span>
-                  {open ? <FaChevronDown className="h-3 w-3 text-slate-400" /> : <FaChevronRight className="h-3 w-3 text-slate-400" />}
+                  {p.title}
                 </button>
-
-                {open && (
-                  <div className="border-t border-slate-100 px-1.5 py-1.5">
-                    {(c.modules || []).map((m) => {
-                      const key = `${c.id}:${m.id}`;
-                      const mOpen = needle ? true : !!openModules[key];
-                      const doneCount = (m.lessons || []).filter((l) => doneIds.has(l.id)).length;
-                      return (
-                        <div key={key} className="mb-0.5">
-                          <button
-                            onClick={() => setOpenModules((p) => ({ ...p, [key]: !p[key] }))}
-                            aria-expanded={mOpen}
-                            className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition hover:bg-slate-50"
-                          >
-                            {mOpen ? <FaChevronDown className="h-2.5 w-2.5 text-slate-400" /> : <FaChevronRight className="h-2.5 w-2.5 text-slate-400" />}
-                            <span className="min-w-0 flex-1 truncate text-xs font-bold text-slate-700">{m.title}</span>
-                            <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-bold text-slate-500 tabular-nums">{doneCount}/{m.lessons.length}</span>
-                          </button>
-                          {mOpen && (
-                            <ul className="mt-0.5 mb-1 ml-3.5 space-y-0.5 border-l border-slate-200 pl-2">
-                              {(m.lessons || []).map((l) => {
-                                const st = statusOf(l.id);
-                                const sel = selected?.lessonId === l.id && selected?.courseId === c.id;
-                                return (
-                                  <li key={l.id}>
-                                    <button
-                                      onClick={() => onSelect && onSelect(c.id, m.id, l.id)}
-                                      title={l.title}
-                                      aria-current={sel}
-                                      className={`group flex w-full items-center gap-2 rounded-lg px-2 py-[7px] text-left transition ${
-                                        sel ? "bg-[#ff5a5f] text-white shadow-[0_6px_16px_rgba(255,90,95,0.35)]" : "hover:bg-red-50"
-                                      }`}
-                                    >
-                                      <span className={`flex h-4.5 w-4.5 h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full border text-[10px] ${
-                                        st === "done"
-                                          ? sel ? "border-emerald-300 bg-emerald-400/20 text-emerald-200" : "border-emerald-500 bg-emerald-500 text-white"
-                                          : st === "current"
-                                            ? sel ? "border-white/60 text-white" : "border-[#ff5a5f] text-[#ff5a5f]"
-                                            : sel ? "border-white/30 text-white/70" : "border-slate-300 text-transparent"
-                                      }`}>
-                                        {st === "done" ? <FaCheck className="h-2.5 w-2.5" /> : st === "current" ? <FaCirclePlay className="h-2.5 w-2.5" /> : <span className="h-1 w-1 rounded-full bg-current" />}
-                                      </span>
-                                      <span className={`min-w-0 flex-1 truncate text-[13px] ${sel ? "font-bold" : st === "done" ? "text-slate-500 line-through decoration-slate-300" : "font-medium text-slate-700"}`}>
-                                        {l.title}
-                                      </span>
-                                      <span className={`shrink-0 text-[10px] font-semibold tabular-nums ${sel ? "text-white/60" : "text-slate-400"}`}>{l.durationMin}m</span>
-                                    </button>
-                                  </li>
-                                );
-                              })}
-                            </ul>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-        <div className="border-t border-slate-200/70 px-4 py-2.5 text-[11px] text-slate-500">
-          Voice + whiteboard learning · interrupt anytime
-        </div>
-      </aside>
-
-      {/* ── Detail ──────────────────────────────── */}
-      <section className="flex min-w-0 flex-1 flex-col bg-white">
-        {!selLesson ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
-            <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100"><FaBookOpen className="h-5 w-5 text-slate-400" /></span>
-            <p className="text-sm font-bold">Select a lesson</p>
-            <p className="max-w-60 text-xs leading-5 text-slate-500">Choose a course, module, and lesson on the left to see the overview.</p>
+              );
+            })}
           </div>
-        ) : (
-          <>
-            {/* hero — light, red accent, no black */}
-            <div className="shrink-0 border-b border-red-100 bg-gradient-to-br from-red-50 via-white to-white px-6 pt-5 pb-4">
-              <p className="text-[11px] font-bold tracking-[0.14em] text-[#ff5a5f] uppercase">
-                {selCourse?.title} <span className="mx-1 text-slate-300">/</span> <span className="text-slate-500">{selModule?.title}</span>
-              </p>
-              <h1 className="mt-1 text-xl font-bold tracking-tight text-slate-900">{selLesson.title}</h1>
-              <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[11px]">
-                <span className={`rounded-full px-2.5 py-1 font-bold ring-1 ${KIND_STYLE[selLesson.kind] || KIND_STYLE.theory}`}>{KIND_LABEL[selLesson.kind] || selLesson.kind}</span>
-                {selLesson.durationMin && (
-                  <span className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 font-semibold text-slate-600">
-                    <FaClock className="h-3 w-3 text-[#ff5a5f]" /> {selLesson.durationMin} min
-                  </span>
-                )}
-                <span className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 font-semibold text-slate-600">
-                  <FaListUl className="h-3 w-3 text-[#ff5a5f]" /> Lesson {(idx >= 0 ? idx + 1 : 1)} of {all.length} · {totalMins} min total
-                </span>
-                {selLesson.id === activeLessonId && (
-                  <span className="rounded-full bg-red-50 px-2.5 py-1 font-bold text-[#ff5a5f] ring-1 ring-red-200">● In progress</span>
-                )}
-              </div>
-              <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-red-100">
-                <div className="h-full rounded-full bg-[#ff5a5f] transition-all" style={{ width: `${pct}%` }} />
-              </div>
-              <p className="mt-1.5 text-[11px] font-semibold text-slate-500 tabular-nums">{pct}% of course complete</p>
-            </div>
 
-            {/* body */}
-            <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
-              <div className="grid gap-3">
-                <div className="rounded-xl border border-slate-200/80 p-4 shadow-[0_1px_2px_rgba(15,23,42,0.05)]">
-                  <p className="text-[11px] font-bold tracking-[0.12em] text-slate-400 uppercase">Objective</p>
+          {/* course cards */}
+          <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {(courses || []).map((c, ci) => {
+              const list = flatLessons(c);
+              const done = list.filter((l) => doneIds.has(l.id)).length;
+              const cpct = getProgressPercent(c, progress);
+              return (
+                <div key={c.id} className="flex flex-col rounded-2xl border border-black/15 p-4 shadow-[0_2px_10px_rgba(27,37,71,0.06)]" style={{ background: PASTELS[ci % PASTELS.length] }}>
+                  <span className="inline-flex w-fit rounded-full bg-white/70 px-2.5 py-1 text-[10px] font-black tracking-wide uppercase ring-1 ring-black/10" style={{ color: NAVY }}>
+                    {c.level || "Course"}
+                  </span>
+                  <p className="mt-2 min-h-10 text-[15px] leading-5 font-black tracking-tight" style={{ color: NAVY }}>{c.title}</p>
+                  <div className="mt-2 flex items-center gap-2">
+                    {faces(list.slice(0, 4).map((l) => l.title))}
+                    <span className="ml-auto text-[11px] font-bold text-slate-500 tabular-nums">{done}/{list.length} lessons</span>
+                  </div>
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-black/10 ring-1 ring-black/10">
+                    <div className="h-full rounded-full bg-gradient-to-r from-[#ff5a5f] to-[#c81e3a]" style={{ width: `${cpct}%` }} />
+                  </div>
+                  <div className="mt-3 flex items-center">
+                    <span className="text-[11px] font-bold text-slate-500 tabular-nums">{cpct}% done</span>
+                    <button
+                      onClick={() => continueCourse(c)}
+                      className="ml-auto rounded-full px-5 py-1.5 text-xs font-bold text-white shadow-[0_6px_16px_rgba(255,90,95,0.4)] transition hover:brightness-110 active:scale-[0.98]"
+                      style={{ background: RED }}
+                    >
+                      {cpct > 0 ? "Continue" : "Start"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* next lessons + promo */}
+          <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-5">
+            <div className="rounded-2xl border border-black/15 bg-white p-4 shadow-[0_2px_10px_rgba(27,37,71,0.06)] xl:col-span-3">
+              <div className="flex items-baseline">
+                <h2 className="text-[15px] font-black tracking-tight" style={{ color: NAVY }}>
+                  {needle ? `Results (${searchHits.length})` : "My next lessons"}
+                </h2>
+                {!needle && <span className="ml-auto text-[11px] font-semibold text-slate-400">tap a lesson to open it</span>}
+              </div>
+              <ul className="mt-2 max-h-[380px] divide-y divide-slate-100 overflow-y-auto pr-1">
+                {(needle ? searchHits : nextLessons).map((l, i) => {
+                  const st = statusOf(l.id);
+                  const n = String(needle ? i + 1 : pillLessons.findIndex((x) => x.id === l.id) + 1).padStart(2, "0");
+                  const isSel = selected?.lessonId === l.id && selected?.courseId === l.courseId;
+                  return (
+                    <li key={l.id} ref={isSel ? selRef : null}>
+                      <button onClick={() => goDetail(l.courseId, l.moduleId, l.id)} className={`flex w-full items-center gap-3 px-2 py-2 text-left transition hover:bg-slate-50 ${isSel ? "rounded-lg bg-red-50 ring-1 ring-[#ff5a5f]/30" : ""}`}>
+                        <span className="text-xs font-black text-slate-300 tabular-nums">{n}</span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[13px] font-bold text-slate-800">{l.title}</span>
+                          <span className="block truncate text-[11px] text-slate-400">{l.moduleTitle}</span>
+                        </span>
+                        {st === "done"
+                          ? <FaCircleCheck className="h-4 w-4 shrink-0 text-emerald-500" />
+                          : st === "current"
+                            ? <FaCirclePlay className="h-4 w-4 shrink-0" style={{ color: RED }} />
+                            : null}
+                        <span className="flex shrink-0 items-center gap-1 text-[11px] font-semibold text-slate-400 tabular-nums">
+                          <FaClock className="h-3 w-3" /> {l.durationMin}m
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+                {(needle ? searchHits : nextLessons).length === 0 && (
+                  <li className="py-4 text-center text-xs text-slate-400">
+                    {needle ? "No matches — try “react”, “flexbox”, or “mongo”." : "No lessons in this view."}
+                  </li>
+                )}
+              </ul>
+            </div>
+            <div className="flex flex-col rounded-2xl border border-black/30 p-5 text-white shadow-[0_8px_24px_rgba(255,90,95,0.35)] xl:col-span-2" style={{ background: `linear-gradient(135deg, ${RED} 0%, ${RED_DEEP} 100%)` }}>
+              <p className="text-[11px] font-bold tracking-wide text-white/70 uppercase">Pick up where you left off</p>
+              <p className="mt-1.5 text-[15px] leading-6 font-black">
+                {activeAcross.lesson ? activeAcross.lesson.title : "Start your first lesson"}
+              </p>
+              <p className="mt-1 text-[11px] font-semibold text-white/70">
+                {activeAcross.course ? `${getProgressPercent(activeAcross.course, progress)}% of ${activeAcross.course.title}` : ""}
+              </p>
+              <div className="mt-2 flex items-center gap-2">
+                {faces((activeAcross.course ? flatLessons(activeAcross.course).slice(0, 4).map((l) => l.title) : []))}
+              </div>
+              <div className="mt-auto pt-4">
+              <button
+                onClick={() => {
+                  if (activeAcross.lesson) goDetail(activeAcross.lesson.courseId, activeAcross.lesson.moduleId, activeAcross.lesson.id);
+                  else if (activeAcross.course) continueCourse(activeAcross.course);
+                }}
+                className="w-full rounded-full bg-white px-4 py-2.5 text-xs font-black transition hover:brightness-95 active:scale-[0.98]"
+                style={{ color: RED_DEEP }}
+              >
+                {activeAcross.lesson ? "Open lesson" : "Browse courses"}
+              </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        /* ── Detail ── */
+        <div className="px-5 py-4 sm:px-8">
+          <button onClick={() => setHome(true)} className="flex items-center gap-1.5 text-xs font-bold text-slate-500 transition hover:text-slate-800">
+            <FaArrowLeft className="h-3 w-3" /> All courses
+          </button>
+          {!selLesson ? (
+            <div className="mt-3 flex flex-col items-center justify-center gap-2 rounded-2xl border border-black/15 bg-white p-8 text-center shadow-sm">
+              <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-100"><FaBookOpen className="h-5 w-5 text-slate-400" /></span>
+              <p className="text-sm font-bold" style={{ color: NAVY }}>Select a lesson</p>
+              <p className="max-w-60 text-xs leading-5 text-slate-500">Choose a lesson from My next lessons to see the overview.</p>
+            </div>
+          ) : (
+            <>
+              <div className="mt-2 rounded-2xl border border-black/15 bg-white p-5 shadow-[0_2px_10px_rgba(27,37,71,0.06)]" style={{ borderTop: `4px solid ${RED}` }}>
+                <p className="text-[11px] font-bold tracking-[0.14em] uppercase" style={{ color: RED }}>
+                  {selCourse?.title} <span className="mx-1 text-slate-300">/</span> <span className="text-slate-500">{selModule?.title}</span>
+                </p>
+                <h1 className="mt-1 text-xl font-black tracking-tight" style={{ color: NAVY }}>{selLesson.title}</h1>
+                <div className="mt-2.5 flex flex-wrap items-center gap-2 text-[11px]">
+                  <span className={`rounded-full px-2.5 py-1 font-bold ${KIND_STYLE[selLesson.kind] || KIND_STYLE.theory}`}>{KIND_LABEL[selLesson.kind] || selLesson.kind}</span>
+                  {selLesson.durationMin && (
+                    <span className="flex items-center gap-1.5 rounded-full bg-slate-100 px-2.5 py-1 font-semibold text-slate-600">
+                      <FaClock className="h-3 w-3" style={{ color: RED }} /> {selLesson.durationMin} min
+                    </span>
+                  )}
+                  <span className="rounded-full bg-slate-100 px-2.5 py-1 font-semibold text-slate-600">
+                    Lesson {(idx >= 0 ? idx + 1 : 1)} of {all.length} · {totalMins} min total
+                  </span>
+                  {selLesson.id === activeLessonId && (
+                    <span className="rounded-full px-2.5 py-1 font-bold text-white shadow-[0_4px_12px_rgba(255,90,95,0.4)]" style={{ background: RED }}>● In progress</span>
+                  )}
+                </div>
+                <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100 ring-1 ring-black/10">
+                  <div className="h-full rounded-full bg-gradient-to-r from-[#ff5a5f] to-[#c81e3a]" style={{ width: `${pct}%` }} />
+                </div>
+                <p className="mt-1.5 text-[11px] font-semibold text-slate-500 tabular-nums">{pct}% of course complete</p>
+              </div>
+
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                <div className="rounded-2xl border border-black/15 bg-white p-4 shadow-[0_2px_10px_rgba(27,37,71,0.06)]">
+                  <p className="text-[11px] font-black tracking-[0.12em] text-slate-400 uppercase">Objective</p>
                   <p className="mt-1 text-[13px] leading-6 text-slate-700">{selLesson.objective}</p>
                 </div>
-                <div className="rounded-xl border border-slate-200/80 p-4 shadow-[0_1px_2px_rgba(15,23,42,0.05)]">
-                  <p className="text-[11px] font-bold tracking-[0.12em] text-slate-400 uppercase">What you will learn</p>
+                <div className="rounded-2xl border border-black/15 bg-white p-4 shadow-[0_2px_10px_rgba(27,37,71,0.06)]">
+                  <p className="text-[11px] font-black tracking-[0.12em] text-slate-400 uppercase">What you will learn</p>
                   <p className="mt-1 text-[13px] leading-6 text-slate-700">{selLesson.summary}</p>
                   {(selLesson.keyTerms?.length > 0) && (
                     <div className="mt-2.5 flex flex-wrap gap-1.5 border-t border-slate-100 pt-2.5">
                       {selLesson.keyTerms.map((k) => (
-                        <span key={k} className="rounded-md border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-[11px] font-semibold text-slate-600">{k}</span>
+                        <span key={k} className="rounded-md bg-slate-100 px-2 py-1 font-mono text-[11px] font-semibold text-slate-600">{k}</span>
                       ))}
                     </div>
                   )}
                 </div>
                 {(selLesson.boardOutline?.length > 0) && (
-                  <div className="rounded-xl border border-slate-200/80 p-4 shadow-[0_1px_2px_rgba(15,23,42,0.05)]">
-                    <p className="text-[11px] font-bold tracking-[0.12em] text-slate-400 uppercase">Whiteboard plan</p>
+                  <div className="rounded-2xl border border-black/15 bg-white p-4 shadow-[0_2px_10px_rgba(27,37,71,0.06)]">
+                    <p className="text-[11px] font-black tracking-[0.12em] text-slate-400 uppercase">Green board plan</p>
                     <ol className="mt-2 space-y-1.5">
                       {selLesson.boardOutline.map((s, i) => (
                         <li key={i} className="flex items-start gap-2.5 text-[13px] text-slate-700">
-                          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#ff5a5f] text-[10px] font-black text-white tabular-nums">{i + 1}</span>
+                          <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-black text-white tabular-nums" style={{ background: RED }}>{i + 1}</span>
                           <span className="leading-5">{s}</span>
                         </li>
                       ))}
@@ -281,71 +359,71 @@ export default function TutorApp({
                   </div>
                 )}
                 {selLesson.quiz && (
-                  <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4">
-                    <p className="text-[11px] font-bold tracking-[0.12em] text-amber-700 uppercase">Checkpoint quiz</p>
+                  <div className="rounded-2xl border border-amber-200 bg-amber-50/70 p-4">
+                    <p className="text-[11px] font-black tracking-[0.12em] text-amber-700 uppercase">Checkpoint quiz</p>
                     <p className="mt-1 text-[13px] font-bold text-slate-900">{selLesson.quiz.q}</p>
                     <p className="mt-1 text-xs text-slate-500">{(selLesson.quiz.options || []).length} options · answered on the board after the lesson</p>
                   </div>
                 )}
               </div>
-            </div>
 
-            {/* footer */}
-            <div className="shrink-0 border-t border-slate-200/80 bg-slate-50/70 px-6 py-3">
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => prev && onSelect && onSelect(prev.courseId, prev.moduleId, prev.id)}
-                  disabled={!prev}
-                  className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 transition hover:border-[#ff5a5f] hover:text-[#ff5a5f] disabled:opacity-30"
-                  aria-label="Previous lesson"
-                  title={prev ? `Previous: ${prev.title}` : "No previous lesson"}
-                >
-                  <FaArrowLeft className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  onClick={() => onStartLesson && onStartLesson(selCourse.id, selModule.id, selLesson.id)}
-                  title={selLesson.id === activeLessonId ? "Resume this lesson with voice + whiteboard" : `Start learning: ${selLesson.title}`}
-                  className="flex h-10 flex-1 items-center justify-center gap-2 rounded-xl bg-[#ff5a5f] px-4 text-[13px] font-bold text-white shadow-[0_8px_20px_rgba(255,90,95,0.35)] transition hover:brightness-95 active:scale-[0.99]"
-                >
-                  <FaCirclePlay className="h-4 w-4" />
-                  {selLesson.id === activeLessonId ? "Continue learning" : "Start learning"}
-                </button>
-                <button
-                  onClick={() => next && onSelect && onSelect(next.courseId, next.moduleId, next.id)}
-                  disabled={!next}
-                  className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 transition hover:border-[#ff5a5f] hover:text-[#ff5a5f] disabled:opacity-30"
-                  aria-label="Next lesson"
-                  title={next ? `Next: ${next.title}` : "No next lesson"}
-                >
-                  <FaArrowRight className="h-3.5 w-3.5" />
-                </button>
-              </div>
-              <div className="mt-2 flex items-center justify-center">
-                {doneIds.has(selLesson.id) ? (
-                  <span className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-600">
-                    <FaCircleCheck className="h-3.5 w-3.5" /> Completed
-                    {next && onCompleteLesson && (
-                      <button
-                        onClick={() => onCompleteLesson && onCompleteLesson(selCourse.id, selModule.id, selLesson.id, true)}
-                        className="font-semibold text-slate-500 underline underline-offset-2 hover:text-[#ff5a5f]"
-                      >
-                        Continue to next
-                      </button>
-                    )}
-                  </span>
-                ) : (
+              <div className="mt-3 rounded-2xl border border-black/15 bg-white p-3 shadow-[0_2px_10px_rgba(27,37,71,0.06)]">
+                <div className="flex items-center gap-2">
                   <button
-                    onClick={() => onCompleteLesson && onCompleteLesson(selCourse.id, selModule.id, selLesson.id, false)}
-                    className="text-[11px] font-semibold text-slate-500 underline underline-offset-2 transition hover:text-[#ff5a5f]"
+                    onClick={() => prev && goDetail(prev.courseId, prev.moduleId, prev.id)}
+                    disabled={!prev}
+                    className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 text-slate-600 transition hover:brightness-95 disabled:opacity-30"
+                    aria-label="Previous lesson"
+                    title={prev ? `Previous: ${prev.title}` : "No previous lesson"}
                   >
-                    Mark complete & continue
+                    <FaArrowLeft className="h-3.5 w-3.5" />
                   </button>
-                )}
+                  <button
+                    onClick={() => startLesson(selCourse.id, selModule.id, selLesson.id)}
+                    title={selLesson.id === activeLessonId ? "Resume this lesson with voice + green board" : `Start learning: ${selLesson.title}`}
+                    className="flex h-10 flex-1 items-center justify-center gap-2 rounded-xl px-4 text-[13px] font-bold text-white shadow-[0_8px_20px_rgba(255,90,95,0.35)] transition hover:brightness-110 active:scale-[0.99]"
+                    style={{ background: `linear-gradient(135deg, ${RED} 0%, ${RED_DEEP} 100%)` }}
+                  >
+                    <FaCirclePlay className="h-4 w-4" />
+                    {selLesson.id === activeLessonId ? "Continue learning" : "Start learning"}
+                  </button>
+                  <button
+                    onClick={() => next && goDetail(next.courseId, next.moduleId, next.id)}
+                    disabled={!next}
+                    className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 text-slate-600 transition hover:brightness-95 disabled:opacity-30"
+                    aria-label="Next lesson"
+                    title={next ? `Next: ${next.title}` : "No next lesson"}
+                  >
+                    <FaArrowRight className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+                <div className="mt-2 flex items-center justify-center">
+                  {doneIds.has(selLesson.id) ? (
+                    <span className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-600">
+                      <FaCircleCheck className="h-3.5 w-3.5" /> Completed
+                      {next && onCompleteLesson && (
+                        <button
+                          onClick={() => onCompleteLesson && onCompleteLesson(selCourse.id, selModule.id, selLesson.id, true)}
+                          className="font-semibold text-slate-500 underline underline-offset-2 hover:text-slate-800"
+                        >
+                          Continue to next
+                        </button>
+                      )}
+                    </span>
+                  ) : (
+                    <button
+                      onClick={() => onCompleteLesson && onCompleteLesson(selCourse.id, selModule.id, selLesson.id, false)}
+                      className="text-[11px] font-semibold text-slate-500 underline underline-offset-2 transition hover:text-slate-800"
+                    >
+                      Mark complete & continue
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
-          </>
-        )}
-      </section>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }

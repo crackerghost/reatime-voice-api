@@ -43,7 +43,7 @@ class Settings:
             model_name=os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice"),
             sample_rate=int(os.environ.get("VOICE_SAMPLE_RATE", "24000")),
             temperature=float(os.environ.get("VOICE_TEMPERATURE", "0.3")),
-            default_speed=float(os.environ.get("VOICE_SPEED", "1.0")),
+            default_speed=float(os.environ.get("VOICE_SPEED", "1.2")),
             device=os.environ.get("VOICE_API_DEVICE", "").strip().lower(),
             llm_model=os.environ.get("LLM_MODEL", "openai/gpt-oss-20b"),
             llm_url=os.environ.get(

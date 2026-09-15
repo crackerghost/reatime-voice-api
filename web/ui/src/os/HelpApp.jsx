@@ -27,8 +27,9 @@ const COMMANDS = [
   { say: "reload the page", does: "Reloads the current page", cat: "voice" },
   { say: "close the tab", does: "Closes the current browser tab", cat: "voice" },
   { say: "open notes / write this in notes", does: "Opens Notes / writes a note for you", cat: "voice" },
-  { say: "open whiteboard / clear the board", does: "Opens / clears the lesson board", cat: "voice" },
+  { say: "open green board / clear the board", does: "Opens / clears the lesson board", cat: "voice" },
   { say: "open code", does: "Opens the Code editor", cat: "voice" },
+  { say: "write code / create a file / edit the code", does: "Tutor writes code into the editor + previews it", cat: "voice" },
   { say: "open help center", does: "Opens this Help Center", cat: "voice" },
   { say: "show side by side / make a grid", does: "Tiles windows (2 halves / 2x2 grid)", cat: "voice" },
   { say: "close / minimize / maximize it", does: "Close / minimize / fullscreen the front app", cat: "voice" },
@@ -42,9 +43,9 @@ const SECTIONS = {
     body: [
       ["1. Ask anything", "Press the mic and speak, or type below and hit Enter. The tutor answers in Hinglish voice and draws on the board as it speaks."],
       ["2. Show your screen", "PRESS AND HOLD the screen button (or X) for 1–2 seconds, then release — the tutor answers looking at your screen. Errors, code, websites — all work."],
-      ["2b. Start a course", "Open Tutor from the dock, pick course → module → lesson, hit Start course — the agent opens Whiteboard/Code/Browser and starts teaching by voice realtime."],
+      ["2b. Start a course", "Open Tutor from the dock, pick course → module → lesson, hit Start course — the agent opens Green Board/Code/Browser and starts teaching by voice realtime."],
       ["3. Interrupt anytime", "Just start speaking while the tutor is talking — it stops immediately (barge-in). No need to ask again."],
-      ["4. Learn with apps", "While teaching, the tutor opens and arranges the Browser, Notes, Code and Whiteboard itself. You can also open them from the dock."],
+      ["4. Learn with apps", "While teaching, the tutor opens and arranges the Browser, Notes, Code and Green Board itself. You can also open them from the dock."],
       ["5. Any language", "Commands work in Hindi, English, Hinglish plus Spanish, French, German, Portuguese, Tamil, Telugu, Kannada, Malayalam, Bengali and Marathi — just speak naturally. Replies stay in Hinglish voice."],
     ],
   },
@@ -52,9 +53,9 @@ const SECTIONS = {
     title: "Apps guide",
     icon: <FaDesktop />,
     body: [
-      ["Whiteboard — lesson board", "Diagrams appear in chalk as the tutor speaks. Use Prev / Next to step through, ● Live to jump back to live. “Clear the board” wipes it clean."],
+      ["Green Board — lesson board", "Diagrams appear in chalk as the tutor speaks. Use Prev / Next to step through, ● Live to jump back to live. “Clear the board” wipes it clean."],
       ["Tutor — courses", "Left sidebar lists all courses → modules → lessons with search. Select any lesson to preview, Start learning for voice + board + quiz."],
-      ["Browser — tabbed web", "Tabs, back/forward, reload plus a Google-search omnibox. Some sites block embedding — if you see a blank page, open it in a real tab with ↗."],
+      ["Browser — web search", "Search-only browser: tabs, back/forward, reload plus a Google-search omnibox. Pages that block embedding show a fallback — open them in a real tab with ↗."],
       ["Notes — auto-saved", "Every note saves instantly. Say “write this in notes” and the tutor creates the note for you."],
       ["Code — editor + live preview", "Monaco editor with folders, a Run button, and Preview + Console on the right. Edits refresh the preview live; console output lands below."],
       ["Help Center — this app", "Every command and trick lives here. Say “open help center” and the tutor opens it."],
@@ -94,7 +95,7 @@ const SECTIONS = {
 };
 
 const APP_ICON = {
-  Whiteboard: <FaChalkboardUser className="text-amber-600" />,
+  "Green Board": <FaChalkboardUser className="text-amber-600" />,
   Browser: <FaGlobe className="text-blue-600" />,
   Notes: <FaNoteSticky className="text-yellow-600" />,
   Code: <FaCode className="text-violet-600" />,

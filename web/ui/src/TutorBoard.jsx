@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { FaChevronLeft, FaChevronRight, FaDiagramProject, FaSatelliteDish } from "react-icons/fa6";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FaDiagramProject, FaExpand, FaMinus, FaPlus, FaSatelliteDish } from "react-icons/fa6";
 import { BOARD_THEME as T } from "./boardTheme.js";
 
 /* TutorBoard — natural classroom GREEN chalkboard lesson feed.
@@ -25,7 +25,7 @@ import { BOARD_THEME as T } from "./boardTheme.js";
 const DRAW_MS = 650; // chalk-stroke animation per shape
 const CHALK_FONT = `"Segoe Print","Bradley Hand","Kalam","Comic Sans MS",cursive`;
 
-function StepDiagram({ elements, focusIds }) {
+function StepDiagram({ elements, focusIds, viewBox, svgRef }) {
   const shapes = useMemo(
     () => (elements || []).filter((e) => e && e.type !== "arrow" && (e.text || "").trim()),
     [elements],
@@ -84,7 +84,8 @@ function StepDiagram({ elements, focusIds }) {
 
   return (
     <svg
-      viewBox={`${box.x} ${box.y} ${box.w} ${box.h}`}
+      ref={svgRef}
+      viewBox={viewBox || `${box.x} ${box.y} ${box.w} ${box.h}`}
       className="h-auto w-full"
       role="img"
       aria-label="Lesson diagram"
@@ -170,8 +171,12 @@ function StepDiagram({ elements, focusIds }) {
       )}
       {arrows.map((a) => {
         if (!byId.get(String(a.startNodeId || "")) || !byId.get(String(a.endNodeId || ""))) return null;
-        const [[x1, y1], [x2, y2]] = a.points;
+        const pts = Array.isArray(a.points) ? a.points : [];
+        if (pts.length < 2) return null;
         const id = `ah-${String(a.id).replace(/[^a-zA-Z0-9_-]/g, "")}`;
+        // Full polyline: the server routes orthogonal elbows (3-4 points)
+        // through row gaps — render every point, not just the endpoints.
+        const line = pts.map(([px, py]) => `${a.x + px},${a.y + py}`).join(" ");
         return (
           <g key={a.id}>
             <defs>
@@ -180,7 +185,7 @@ function StepDiagram({ elements, focusIds }) {
               </marker>
             </defs>
             <polyline
-              points={`${a.x + x1},${a.y + y1} ${a.x + x2},${a.y + y2}`}
+              points={line}
               fill="none" stroke={T.primary} strokeWidth={2.25}
               markerEnd={`url(#${id})`}
               pathLength={1} strokeDasharray="0.06 0.045" strokeDashoffset={1}
@@ -382,6 +387,28 @@ function QuizBlock({ block }) {
   );
 }
 
+function HtmlBlock({ block }) {
+  const height = Math.max(120, Math.min(420, Number(block.height) || 220));
+  const src = String(block.html || "");
+  if (!src) return null;
+  // Scriptless sandbox: no scripts, forms, or popups can ever run inside.
+  return (
+    <div
+      className="overflow-hidden rounded-xl shadow-sm"
+      style={{ border: "1px solid rgba(255,255,255,0.2)", background: "#ffffff", animation: "tutor-pop 350ms ease both" }}
+    >
+      <iframe
+        title={block.text || "Visual explanation"}
+        sandbox=""
+        srcDoc={src}
+        loading="lazy"
+        scrolling="no"
+        style={{ width: "100%", height, border: 0, display: "block", background: "#ffffff" }}
+      />
+    </div>
+  );
+}
+
 function ImageBlock({ block }) {
   if (!block.src) {
     return (
@@ -408,102 +435,226 @@ function ImageBlock({ block }) {
 }
 
 export default function TutorBoard({
-  steps, focus, stepIndex, onStep, followLive, onJumpLive, caption, wiping,
-  onVisibleStep,
+  elements, focus, followLive, onFollowChange, caption, wiping,
 }) {
   const scrollRef = useRef(null);
+  const svgRef = useRef(null);
   const penRef = useRef(null);
   const elRefs = useRef(new Map());
-  // Scroll-spy: manual scrolling moves the dots/pager to the visible step.
-  // Programmatic scrolls (Prev/Next, live-follow) suppress the spy briefly
-  // so they never fight the navigation that caused them.
-  const suppressSpyUntil = useRef(0);
-  const stepIndexRef = useRef(stepIndex);
-  useEffect(() => { stepIndexRef.current = stepIndex; }, [stepIndex]);
-  const spyRaf = useRef(0);
-  useEffect(() => () => {
-    if (spyRaf.current) cancelAnimationFrame(spyRaf.current);
-  }, []);
-  const handleScroll = () => {
-    if (spyRaf.current) return;
-    spyRaf.current = requestAnimationFrame(() => {
-      spyRaf.current = 0;
-      if (Date.now() < suppressSpyUntil.current) return;
-      const box = scrollRef.current;
-      if (!box) return;
-      let nodes = null;
-      try {
-        nodes = box.querySelectorAll("[data-step]");
-      } catch { return; }
-      if (!nodes || !nodes.length) return;
-      // Visible step = last section whose top sits above the upper-third
-      // line of the viewport (matches reading position, stable at rest).
-      const point = box.scrollTop + box.clientHeight * 0.35;
-      let vis = 0;
-      for (const node of nodes) {
-        const si = Number(node.getAttribute("data-step"));
-        if (!Number.isFinite(si)) continue;
-        if (node.offsetTop !== undefined && node.offsetTop <= point) vis = si;
-        else break;
-      }
-      if (vis !== stepIndexRef.current) {
-        stepIndexRef.current = vis;
-        onVisibleStep && onVisibleStep(vis);
-      }
-    });
-  };
-  const total = steps?.length || 0;
-  const cur = Math.max(0, Math.min(stepIndex || 0, Math.max(0, total - 1)));
+  const vbRef = useRef(null); // current camera viewBox {x,y,w,h}
+  const animRef = useRef(0);
+  const [zoomPct, setZoomPct] = useState(100);
 
-  const scrollNodeIntoView = (node, align = "center") => {
+  const shapes = useMemo(
+    () => (elements || []).filter((e) => e && (e.type === "rectangle" || e.type === "ellipse" || e.type === "diamond" || e.type === "text")),
+    [elements],
+  );
+  const arrows = useMemo(
+    () => (elements || []).filter((e) => e && e.type === "arrow" && Array.isArray(e.points)),
+    [elements],
+  );
+  const extras = useMemo(
+    () => (elements || []).filter((e) => e && (e.type === "code" || e.type === "note" || e.type === "image" || e.type === "table" || e.type === "quiz" || e.type === "html")),
+    [elements],
+  );
+  const byId = useMemo(() => new Map(shapes.map((s) => [s.id, s])), [shapes]);
+
+  // Full-board bounds (mirrors StepDiagram's box math + padding).
+  const full = useMemo(() => {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const e of [...shapes, ...arrows]) {
+      const w = Number(e.width) || 180, h = Number(e.height) || 60;
+      minX = Math.min(minX, Number(e.x) || 0);
+      minY = Math.min(minY, Number(e.y) || 0);
+      maxX = Math.max(maxX, (Number(e.x) || 0) + w);
+      maxY = Math.max(maxY, (Number(e.y) || 0) + h);
+    }
+    if (!isFinite(minX)) return null;
+    const pad = 36;
+    return { x: minX - pad, y: minY - pad, w: maxX - minX + pad * 2, h: maxY - minY + pad * 2 };
+  }, [shapes, arrows]);
+  const fullRef = useRef(null);
+  useEffect(() => { fullRef.current = full; }, [full]);
+  // Camera: fly the viewBox (direct DOM write = 60fps, no re-renders).
+  const applyVb = (vb) => {
+    vbRef.current = vb;
+    try {
+      svgRef.current?.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+    } catch { /* noop */ }
+  };
+  const flyTo = useCallback((target, dur = 450) => {
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+    animRef.current = 0;
+    const from = vbRef.current || target;
+    if (!svgRef.current) {
+      applyVb(target);
+      return;
+    }
+    if (dur <= 0) {
+      applyVb(target);
+      const f = fullRef.current;
+      if (f) setZoomPct(Math.max(10, Math.min(400, Math.round((f.w / target.w) * 100))));
+      return;
+    }
+    const t0 = performance.now();
+    const stepFn = (t) => {
+      const k = Math.min(1, (t - t0) / dur);
+      const e = k < 0.5 ? 4 * k * k * k : 1 - ((-2 * k + 2) ** 3) / 2;
+      const vb = {
+        x: from.x + (target.x - from.x) * e,
+        y: from.y + (target.y - from.y) * e,
+        w: from.w + (target.w - from.w) * e,
+        h: from.h + (target.h - from.h) * e,
+      };
+      applyVb(vb);
+      if (k < 1) {
+        animRef.current = requestAnimationFrame(stepFn);
+      } else {
+        animRef.current = 0;
+        const f = fullRef.current;
+        if (f) setZoomPct(Math.max(10, Math.min(400, Math.round((f.w / target.w) * 100))));
+      }
+    };
+    animRef.current = requestAnimationFrame(stepFn);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => () => {
+    if (animRef.current) cancelAnimationFrame(animRef.current);
+  }, []);
+
+  // First paint / board reset: frame the whole canvas instantly.
+  const hadContent = useRef(false);
+  useEffect(() => {
+    if (full && !vbRef.current) {
+      applyVb(full);
+      setZoomPct(100);
+      hadContent.current = true;
+    } else if (!full && hadContent.current) {
+      vbRef.current = null;
+      setZoomPct(100);
+      hadContent.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [full]);
+  const scrollExtraIntoView = (node) => {
     const box = scrollRef.current;
     if (!box || !node) return;
     try {
-      let target;
-      if (node.offsetTop !== undefined && node.offsetParent !== null) {
-        target = align === "start"
-          ? node.offsetTop - 8
-          : node.offsetTop - box.clientHeight / 2 + node.clientHeight / 2;
-      } else {
-        const r = node.getBoundingClientRect(), b = box.getBoundingClientRect();
-        target = box.scrollTop + (r.top - b.top)
-          - (align === "start" ? 8 : box.clientHeight / 2 - r.height / 2);
-      }
+      const r = node.getBoundingClientRect(), b = box.getBoundingClientRect();
+      const target = box.scrollTop + (r.top - b.top) - box.clientHeight / 2 + r.height / 2;
       if (Number.isFinite(target)) box.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
     } catch { /* noop */ }
   };
+
+  // Follow: fly the camera to each freshly drawn element, glide the chalk.
+  // A hand on the board wins: skip while the user is dragging.
   useEffect(() => {
-    if (!followLive || !focus?.ids?.length) return;
+    if (!followLive || !focus?.ids?.length || dragRef.current) return;
     const id = focus.ids[0];
-    const node = elRefs.current.get(id);
-    suppressSpyUntil.current = Date.now() + 650; // our own glide, not the user
-    if (node) scrollNodeIntoView(node, "center");
-    const pen = penRef.current, box = scrollRef.current;
-    if (pen && box && node) {
-      try {
-        const r = node.getBoundingClientRect(), b = box.getBoundingClientRect();
-        pen.style.opacity = "1";
-        pen.style.transform = `translate(${r.left - b.left + r.width / 2}px, ${r.top - b.top - 6}px)`;
-      } catch { /* noop */ }
+    const shape = byId.get(id);
+    if (shape) {
+      // Zoom to the focused area with context around it (min window so a
+      // tiny node still shows its neighbors and connecting arrows).
+      const sw = Number(shape.width) || 220, sh = Number(shape.height) || 64;
+      const w = Math.max(460, sw + 160);
+      const h = Math.max(340, sh + 160);
+      const cx = (Number(shape.x) || 0) + sw / 2;
+      const cy = (Number(shape.y) || 0) + sh / 2;
+      flyTo({ x: cx - w / 2, y: cy - h / 2, w, h });
+      // Chalk piece: map board coords to screen coords under the camera.
+      const pen = penRef.current, svg = svgRef.current;
+      const vb = vbRef.current;
+      if (pen && svg && vb) {
+        try {
+          const r = svg.getBoundingClientRect();
+          const px = (((Number(shape.x) || 0) + sw / 2) - vb.x) / vb.w * r.width;
+          const py = ((Number(shape.y) || 0) - vb.y) / vb.h * r.height;
+          pen.style.opacity = "1";
+          pen.style.transform = `translate(${px}px, ${py - 6}px)`;
+        } catch { /* noop */ }
+      }
+    } else {
+      const node = elRefs.current.get(id);
+      if (node) scrollExtraIntoView(node);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focus?.tick]);
 
-  const gotoStep = (i) => {
-    const clamped = Math.max(0, Math.min(total - 1, i));
-    stepIndexRef.current = clamped;
-    suppressSpyUntil.current = Date.now() + 650;
-    onStep && onStep(clamped);
-    requestAnimationFrame(() => {
-      const node = scrollRef.current?.querySelector?.(`[data-step="${clamped}"]`);
-      if (node) scrollNodeIntoView(node, "start");
-    });
+  const zoomBy = (f) => {
+    const base = vbRef.current || fullRef.current;
+    const fbox = fullRef.current;
+    if (!base || !fbox) return;
+    const w = Math.max(220, Math.min(fbox.w, base.w * f));
+    const h = (w / base.w) * base.h;
+    const cx = base.x + base.w / 2, cy = base.y + base.h / 2;
+    const x = Math.max(fbox.x - 40, Math.min(cx - w / 2, fbox.x + fbox.w + 40 - w));
+    const y = Math.max(fbox.y - 40, Math.min(cy - h / 2, fbox.y + fbox.h + 40 - h));
+    onFollowChange && onFollowChange(false);
+    flyTo({ x, y, w, h }, 250);
+  };
+  const fitAll = () => {
+    const fbox = fullRef.current;
+    if (!fbox) return;
+    onFollowChange && onFollowChange(false);
+    flyTo({ ...fbox }, 350);
+  };
+  const jumpLive = () => {
+    onFollowChange && onFollowChange(true);
+    const ids = focus?.ids;
+    const shape = ids?.length && byId.get(ids[0]);
+    if (shape) {
+      const sw = Number(shape.width) || 220, sh = Number(shape.height) || 64;
+      const w = Math.max(460, sw + 160);
+      const h = Math.max(340, sh + 160);
+      const cx = (Number(shape.x) || 0) + sw / 2;
+      const cy = (Number(shape.y) || 0) + sh / 2;
+      flyTo({ x: cx - w / 2, y: cy - h / 2, w, h });
+    } else if (fullRef.current) {
+      flyTo({ ...fullRef.current });
+    }
   };
 
   const setElRef = (id) => (node) => {
     if (!id) return;
     if (node) elRefs.current.set(id, node);
     else elRefs.current.delete(id);
+  };
+
+  // Real-canvas pan: press-hold anywhere on the chalk area and slide to move
+  // the board under a fixed viewport (direct viewBox write = 60fps, no
+  // re-renders). Manual pan drops live-follow so the camera stops fighting
+  // your hand; the ● Live button resumes it.
+  const dragRef = useRef(null); // {x, y, vb} while a pan is in flight
+  const onBoardPointerDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    const base = vbRef.current || fullRef.current;
+    if (!base) return;
+    if (animRef.current) {
+      cancelAnimationFrame(animRef.current);
+      animRef.current = 0;
+    }
+    onFollowChange && onFollowChange(false);
+    dragRef.current = { x: e.clientX, y: e.clientY, vb: { ...base } };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch { /* noop */ }
+  };
+  const onBoardPointerMove = (e) => {
+    const d = dragRef.current;
+    const svg = svgRef.current;
+    if (!d || !d.vb || !svg) return;
+    const r = svg.getBoundingClientRect();
+    if (!r || !r.width || !r.height) return;
+    // viewBox units per screen px (aspect is locked, so both axes agree).
+    const s = d.vb.w / r.width;
+    applyVb({
+      ...d.vb,
+      x: d.vb.x - (e.clientX - d.x) * s,
+      y: d.vb.y - (e.clientY - d.y) * s,
+    });
+  };
+  const onBoardPointerUp = () => {
+    dragRef.current = null;
   };
 
   return (
@@ -527,75 +678,65 @@ export default function TutorBoard({
           mixBlendMode: "overlay",
         }}
       />
-      {/* Top navigator: natural Prev / Next + dots (no numbers). */}
+      {/* Camera bar: zoom controls + live-follow. No steps — one board. */}
       <div
         className="z-10 flex shrink-0 items-center gap-2 px-3 py-2"
         style={{ borderBottom: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.22)", backdropFilter: "blur(6px)" }}
       >
-        <button
-          onClick={() => gotoStep(cur - 1)}
-          disabled={!total || cur <= 0}
-          className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[0.72rem] font-bold transition disabled:opacity-30"
-          style={{ background: "rgba(255,255,255,0.12)", color: T.ink }}
-          aria-label="Previous"
-        >
-          <FaChevronLeft className="h-3 w-3" />
-          Prev
-        </button>
-        <span className="flex min-w-0 flex-1 items-center justify-center gap-1.5" aria-label="Lesson progress">
-          {total > 0 ? steps.map((s, i) => (
-            <button
-              key={s.key || i}
-              onClick={() => gotoStep(i)}
-              aria-label={s.title || `Part ${i + 1}`}
-              title={s.title || ""}
-              className="h-2 rounded-full transition-all"
-              style={{
-                width: i === cur ? 22 : 8,
-                background: i === cur ? T.primary : "rgba(255,255,255,0.35)",
-              }}
-            />
-          )) : (
-            <span className="text-[0.72rem] font-bold tracking-wide" style={{ color: T.muted, fontFamily: CHALK_FONT }}>
-              Green board
-            </span>
-          )}
+        <span className="text-[0.72rem] font-bold tracking-wide" style={{ color: T.muted, fontFamily: CHALK_FONT }}>
+          Green board
+        </span>
+        <span className="ml-auto flex items-center gap-1.5">
+          <button
+            onClick={() => zoomBy(1.35)}
+            disabled={!full}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-full transition disabled:opacity-30"
+            style={{ background: "rgba(255,255,255,0.12)", color: T.ink }}
+            aria-label="Zoom out"
+            title="Zoom out"
+          >
+            <FaMinus className="h-3 w-3" />
+          </button>
+          <span className="min-w-11 text-center text-[0.7rem] font-bold tabular-nums" style={{ color: T.muted }}>
+            {zoomPct}%
+          </span>
+          <button
+            onClick={() => zoomBy(0.74)}
+            disabled={!full}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-full transition disabled:opacity-30"
+            style={{ background: "rgba(255,255,255,0.12)", color: T.ink }}
+            aria-label="Zoom in"
+            title="Zoom in"
+          >
+            <FaPlus className="h-3 w-3" />
+          </button>
+          <button
+            onClick={fitAll}
+            disabled={!full}
+            className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[0.72rem] font-bold transition disabled:opacity-30"
+            style={{ background: "rgba(255,255,255,0.12)", color: T.ink }}
+            aria-label="Fit whole board"
+            title="Fit whole board"
+          >
+            <FaExpand className="h-3 w-3" />
+            Fit
+          </button>
         </span>
         <button
-          onClick={() => gotoStep(cur + 1)}
-          disabled={!total || cur >= total - 1}
-          className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[0.72rem] font-bold transition disabled:opacity-30"
-          style={{ background: T.primary, color: "#143626" }}
-          aria-label="Next"
+          onClick={jumpLive}
+          className="rounded-full px-2.5 py-1 text-[0.68rem] font-bold shadow-sm transition hover:brightness-95"
+          style={followLive
+            ? { background: "rgba(255,209,102,0.16)", color: T.primary }
+            : { background: "#fdfef7", color: "#143626" }}
+          aria-label="Follow live drawing"
+          title="Follow live drawing"
         >
-          Next
-          <FaChevronRight className="h-3 w-3" />
+          ● Live
         </button>
-        {!followLive && total > 0 && (
-          <button
-            onClick={() => onJumpLive && onJumpLive()}
-            className="rounded-full px-2.5 py-1 text-[0.68rem] font-bold shadow-sm transition hover:brightness-95"
-            style={{ background: "#fdfef7", color: "#143626" }}
-          >
-            ● Live
-          </button>
-        )}
-      </div>
-
-      {/* Progress chalk line */}
-      <div className="h-0.5 w-full shrink-0" style={{ background: "rgba(255,255,255,0.12)" }} aria-hidden="true">
-        <div
-          className="h-full transition-all duration-500"
-          style={{
-            width: total ? `${((cur + 1) / total) * 100}%` : "0%",
-            background: T.primary,
-          }}
-        />
       </div>
 
       <div
         ref={scrollRef}
-        onScroll={handleScroll}
         className={`no-scrollbar relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-4 transition-opacity duration-300 ${wiping ? "opacity-0" : "opacity-100"}`}
       >
         {/* Chalk piece: glides to each freshly drawn element. */}
@@ -605,7 +746,7 @@ export default function TutorBoard({
           style={{ background: T.primary, boxShadow: `0 0 0 4px ${T.primary}33, 0 0 12px ${T.primary}` }}
           aria-hidden="true"
         />
-        {!total && (
+        {!shapes.length && !extras.length && (
           <div className="flex h-full min-h-[320px] flex-col items-center justify-center gap-2 text-center">
             <FaDiagramProject className="h-8 w-8" style={{ color: "rgba(255,255,255,0.35)" }} />
             <p className="text-sm font-semibold" style={{ color: T.ink, fontFamily: CHALK_FONT }}>No visual yet</p>
@@ -614,77 +755,45 @@ export default function TutorBoard({
             </p>
           </div>
         )}
-        {steps?.map((step, si) => {
-          const shapes = (step.elements || []).filter((e) => e && e.type !== "arrow" && e.type !== "code" && e.type !== "note" && e.type !== "image" && e.type !== "table" && e.type !== "quiz");
-          const extras = (step.elements || []).filter((e) => e && (e.type === "code" || e.type === "note" || e.type === "image" || e.type === "table" || e.type === "quiz"));
-          const arrows = (step.elements || []).filter((e) => e && e.type === "arrow");
-          const isLive = si === (steps?.length || 0) - 1;
-          const active = si === cur;
-          return (
-            <section key={step.key} data-step={si} className="mb-5 last:mb-1">
-              {step.title ? (
-                <div className="mb-2 flex items-center gap-2">
-                  <span aria-hidden="true" style={{ color: T.primary }}>✎</span>
-                  <p
-                    className="text-[0.95rem] font-semibold tracking-wide"
-                    style={{ color: T.ink, fontFamily: CHALK_FONT, textShadow: "0 0 1px rgba(255,255,255,0.6)" }}
-                  >
-                    {step.title}
-                  </p>
-                  {isLive && (
-                    <span className="ml-auto inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.6rem] font-bold tracking-wider uppercase" style={{ background: "rgba(255,209,102,0.16)", color: T.primary }}>
-                      <span className="relative flex h-1.5 w-1.5">
-                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-60" style={{ background: T.primary }} />
-                        <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ background: T.primary }} />
-                      </span>
-                      Live
-                    </span>
-                  )}
-                </div>
-              ) : isLive ? (
-                <div className="mb-2 flex justify-end">
-                  <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.6rem] font-bold tracking-wider uppercase" style={{ background: "rgba(255,209,102,0.16)", color: T.primary }}>
-                    <span className="relative flex h-1.5 w-1.5">
-                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-60" style={{ background: T.primary }} />
-                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ background: T.primary }} />
-                    </span>
-                    Live
-                  </span>
-                </div>
-              ) : null}
-              {(shapes.length > 0 || arrows.length > 0) && (
-                <div
-                  ref={shapes[0] ? setElRef(shapes[0].id) : undefined}
-                  className="rounded-xl p-2"
-                  style={{
-                    border: active ? `1.5px solid ${T.primary}88` : "1px solid rgba(255,255,255,0.18)",
-                    background: "rgba(0,0,0,0.14)",
-                    backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.22) 1px, transparent 1px)`,
-                    backgroundSize: "22px 22px",
-                    boxShadow: active ? `0 0 0 1px ${T.primary}44, 0 4px 18px rgba(0,0,0,0.3)` : "0 2px 14px rgba(0,0,0,0.25)",
-                  }}
-                >
-                  <div className="rounded-lg px-1 py-1">
-                    <StepDiagram elements={[...shapes, ...arrows]} focusIds={focus?.ids} />
-                  </div>
-                </div>
-              )}
-              {!!extras.length && (
-                <div className="mt-2 flex flex-col gap-2">
-                  {extras.map((b) => (
-                    <div key={b.id} ref={setElRef(b.id)}>
-                      {b.type === "code" && <CodeBlock block={b} caption={caption} />}
-                      {b.type === "note" && <NoteBlock block={b} />}
-                      {b.type === "image" && <ImageBlock block={b} />}
-                      {b.type === "table" && <TableBlock block={b} />}
-                      {b.type === "quiz" && <QuizBlock block={b} />}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
-          );
-        })}
+        {/* Chalk draws DIRECTLY on the green board — no inner card, no inner
+            border. The wood frame on the outer box is the only border, so the
+            canvas always reads as one complete board. Hold and slide anywhere
+            here to pan it like a real canvas. */}
+        {(shapes.length > 0 || arrows.length > 0) && (
+          <div
+            className="w-full cursor-grab touch-none select-none active:cursor-grabbing"
+            style={{
+              backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.20) 1px, transparent 1px)`,
+              backgroundSize: "22px 22px",
+            }}
+            onPointerDown={onBoardPointerDown}
+            onPointerMove={onBoardPointerMove}
+            onPointerUp={onBoardPointerUp}
+            onPointerCancel={onBoardPointerUp}
+            title="Hold and slide to move the board"
+          >
+            <StepDiagram
+              elements={[...shapes, ...arrows]}
+              focusIds={focus?.ids}
+              svgRef={svgRef}
+              viewBox={vbRef.current ? `${vbRef.current.x} ${vbRef.current.y} ${vbRef.current.w} ${vbRef.current.h}` : undefined}
+            />
+          </div>
+        )}
+        {!!extras.length && (
+          <div className="mt-2 flex flex-col gap-2">
+            {extras.map((b) => (
+              <div key={b.id} ref={setElRef(b.id)}>
+                {b.type === "code" && <CodeBlock block={b} caption={caption} />}
+                {b.type === "note" && <NoteBlock block={b} />}
+                {b.type === "image" && <ImageBlock block={b} />}
+                {b.type === "table" && <TableBlock block={b} />}
+                {b.type === "quiz" && <QuizBlock block={b} />}
+                {b.type === "html" && <HtmlBlock block={b} />}
+              </div>
+            ))}
+          </div>
+        )}
         <div className="h-2" />
       </div>
     </div>

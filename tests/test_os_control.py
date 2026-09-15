@@ -7,6 +7,7 @@ from server.llm.os_control import (
     sanitize_action,
     sanitize_os_snapshot,
     should_direct,
+    wants_code_action,
     wants_os_action,
 )
 
@@ -138,6 +139,53 @@ class OsControlTests(unittest.TestCase):
         self.assertFalse(wants_os_action("browser kya hai?"))
         self.assertFalse(wants_os_action("ye kya hai"))
         self.assertFalse(wants_os_action("hi"))
+        # teaching/screen questions about code stay OFF the blocking path
+        self.assertFalse(wants_os_action("explain this code"))
+        self.assertFalse(wants_os_action("ye code kya karta hai?"))
+        self.assertFalse(wants_os_action("what does this code do?"))
+        # explicit code-write imperatives take the blocking path + narration
+        self.assertTrue(wants_os_action("write code for a counter"))
+        self.assertTrue(wants_os_action("create a file app.js"))
+        self.assertTrue(wants_os_action("code me counter bana do"))
+        self.assertTrue(wants_os_action("edit the code to add a button"))
+        self.assertTrue(wants_os_action("fix the code"))
+        self.assertTrue(wants_code_action("write code for a counter"))
+        self.assertTrue(wants_code_action("code likh do"))
+        self.assertFalse(wants_code_action("open browser"))
+        self.assertFalse(wants_code_action("explain this code"))
+
+    def test_code_actions_sanitized(self):
+        self.assertEqual(
+            sanitize_action({"op": "code_create", "path": "js/app.js", "content": "let x = 1;"}),
+            {"op": "code_create", "path": "js/app.js", "content": "let x = 1;"},
+        )
+        self.assertEqual(
+            sanitize_action({"op": "code_write", "path": "index.html", "content": "<h1>hi</h1>", "mode": "append"}),
+            {"op": "code_write", "path": "index.html", "content": "<h1>hi</h1>", "mode": "append"},
+        )
+        self.assertEqual(
+            sanitize_action({"op": "code_write", "path": "a.js", "content": "x"}),
+            {"op": "code_write", "path": "a.js", "content": "x", "mode": "overwrite"},
+        )
+        self.assertEqual(
+            sanitize_action({"op": "code_edit", "path": "a.js", "find": "let x", "replace": "const x"}),
+            {"op": "code_edit", "path": "a.js", "find": "let x", "replace": "const x"},
+        )
+        # traversal rejected; absolute paths are normalized to relative
+        self.assertIsNone(sanitize_action({"op": "code_write", "path": "../evil.js", "content": "x"}))
+        self.assertEqual(
+            sanitize_action({"op": "code_create", "path": "/abs.js"}),
+            {"op": "code_create", "path": "abs.js"},
+        )
+        self.assertIsNone(sanitize_action({"op": "code_write", "path": "a.js", "content": "  "}))
+        self.assertIsNone(sanitize_action({"op": "code_edit", "path": "a.js", "find": "  ", "replace": "y"}))
+        self.assertEqual(describe_action({"op": "code_create", "path": "a.js"}), "created file 'a.js'")
+        self.assertEqual(describe_action({"op": "code_write", "path": "a.js", "mode": "append"}), "appended code to 'a.js'")
+        self.assertEqual(describe_action({"op": "code_edit", "path": "a.js"}), "edited 'a.js'")
+        ops = OS_CONTROL_TOOL["function"]["parameters"]["properties"]["actions"]["items"]["properties"]["op"]["enum"]
+        self.assertIn("code_create", ops)
+        self.assertIn("code_write", ops)
+        self.assertIn("code_edit", ops)
 
     def test_ack_block(self):
         acts = [

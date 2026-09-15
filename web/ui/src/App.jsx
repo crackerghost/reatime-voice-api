@@ -11,6 +11,7 @@ import NotesApp from "./os/NotesApp.jsx";
 import TutorApp from "./os/TutorApp.jsx";
 import NotchHUD from "./os/NotchHUD.jsx";
 import AppWindow from "./os/AppWindow.jsx";
+import ErrorBoundary from "./os/ErrorBoundary.jsx";
 import { engine } from "./audioEngine.js";
 import { chatMessage, pingMessage, stopMessage } from "./services/ttsProtocol.js";
 import { STUDENT, COURSE, COURSES, INITIAL_PROGRESS, getLessonById, getCourseById, appsForLesson } from "./data/courseData.js";
@@ -91,7 +92,7 @@ const nextId = () => ++msgId;
    re-validates every os_action before executing it). */
 const AGENT_APPS = ["whiteboard", "browser", "notes", "code", "help", "tutor"];
 const AGENT_ZONES = ["left", "right", "tl", "tr", "bl", "br"];
-const AGENT_APP_LABEL = { whiteboard: "Whiteboard", browser: "Browser", notes: "Notes", code: "Code", help: "Help Center", tutor: "Tutor" };
+const AGENT_APP_LABEL = { whiteboard: "Green Board", browser: "Browser", notes: "Notes", code: "Code", help: "Help Center", tutor: "Tutor" };
 const AGENT_ZONE_LABEL = {
   left: "left half", right: "right half",
   tl: "top-left", tr: "top-right", bl: "bottom-left", br: "bottom-right",
@@ -117,7 +118,7 @@ export default function App() {
   const BOOT_STAGES = useMemo(() => [
     { label: "Starting Bug OS", apps: [] },
     { label: "Loading Tutor", apps: ["tutor"] },
-    { label: "Preparing Whiteboard + Browser", apps: ["tutor", "whiteboard", "browser"] },
+    { label: "Preparing Green Board + Browser", apps: ["tutor", "whiteboard", "browser"] },
     { label: "Warming voice engine", apps: ["tutor", "whiteboard", "browser", "code", "notes"] },
     { label: "Ready", apps: ["tutor", "whiteboard", "browser", "code", "notes"] },
   ], []);
@@ -353,6 +354,24 @@ export default function App() {
     setBrowserQueue((q) => [...q.slice(-11), { cmd, ...(target !== undefined ? { target } : {}), seq: ++browserSeq.current }]);
   const ackBrowser = useCallback((seq) => {
     setBrowserQueue((q) => (q.some((c) => c.seq === seq) ? q.filter((c) => c.seq !== seq) : q));
+  }, []);
+  // Imperative code moves from the agent ([{cmd, path, content, mode, find,
+  // replace, seq}]) drained by CodeApp — same ordered-queue pattern as the
+  // browser so 2+ moves in one turn never collapse into one.
+  const [codeQueue, setCodeQueue] = useState([]);
+  const codeSeq = useRef(0);
+  const agentCode = (cmd, a) =>
+    setCodeQueue((q) => [...q.slice(-11), {
+      cmd,
+      ...(a.path !== undefined ? { path: a.path } : {}),
+      ...(a.content !== undefined ? { content: a.content } : {}),
+      ...(a.mode !== undefined ? { mode: a.mode } : {}),
+      ...(a.find !== undefined ? { find: a.find } : {}),
+      ...(a.replace !== undefined ? { replace: a.replace } : {}),
+      seq: ++codeSeq.current,
+    }]);
+  const ackCode = useCallback((seq) => {
+    setCodeQueue((q) => (q.some((c) => c.seq === seq) ? q.filter((c) => c.seq !== seq) : q));
   }, []);
   const onBrowserNavigate = useCallback((u, meta) => {
     setBrowserUrl(u);
@@ -2734,6 +2753,21 @@ export default function App() {
         agentBrowser("closetab");
         flashAgent("Browser tab closed");
         return true;
+      case "code_create":
+      case "code_write":
+      case "code_edit": {
+        const path = String(action.path || "").trim();
+        if (!path) {
+          console.warn("[agent] code action missing path");
+          return false;
+        }
+        openApp("code");
+        agentCode(op, action);
+        flashAgent(op === "code_create" ? `File ${path.slice(0, 32)} created`
+          : op === "code_write" ? `Code → ${path.slice(0, 32)}`
+          : `Edited ${path.slice(0, 32)}`);
+        return true;
+      }
       case "note_add": {
         const n = {
           id: `n${Date.now()}`,
@@ -2988,28 +3022,18 @@ export default function App() {
             onMax={() => zoomApp("whiteboard")}
           >
             <div className="min-h-0 flex-1 overflow-hidden rounded-b-[18px] bg-[#143626]">
+              {/* Single continuous board: flat revealed elements; the camera
+                  follows new drawing while Live, manual zoom keeps your view. */}
+              <ErrorBoundary appName="Green Board" onClose={() => closeApp("whiteboard")}>
               <TutorBoard
-                steps={steps}
+                elements={diagram?.elements || []}
                 focus={diagramFocus}
-                stepIndex={stepIndex}
                 followLive={followLive}
+                onFollowChange={setFollowLive}
                 caption={latestAssistant}
                 wiping={wiping}
-                onStep={(i) => {
-                  setStepIndex(i);
-                  setFollowLive(false);
-                }}
-                // Scroll-spy: manual scrolling moves the dots/pager to the
-                // visible step but never steals live-follow (only the Prev /
-                // Next buttons do that). Re-engage with ● Live anytime.
-                onVisibleStep={(i) => {
-                  setStepIndex(i);
-                }}
-                onJumpLive={() => {
-                  setFollowLive(true);
-                  setStepIndex(Math.max(0, steps.length - 1));
-                }}
               />
+              </ErrorBoundary>
             </div>
           </AppWindow>
         )}
@@ -3035,7 +3059,9 @@ export default function App() {
             onMax={() => zoomApp("browser")}
           >
             <div className="min-h-0 flex-1 p-3 pt-1">
+              <ErrorBoundary appName="Browser" onClose={() => closeApp("browser")}>
               <BrowserApp url={browserUrl} onNavigate={onBrowserNavigate} queue={browserQueue} onAck={ackBrowser} />
+              </ErrorBoundary>
             </div>
           </AppWindow>
         )}
@@ -3061,6 +3087,7 @@ export default function App() {
             onMax={() => zoomApp("notes")}
           >
             <div className="min-h-0 flex-1 p-3 pt-1">
+              <ErrorBoundary appName="Notes" onClose={() => closeApp("notes")}>
               <NotesApp
                 notes={notes}
                 activeId={activeNoteId || notes[0]?.id}
@@ -3069,6 +3096,7 @@ export default function App() {
                 onAdd={addNote}
                 onDelete={deleteNote}
               />
+              </ErrorBoundary>
             </div>
           </AppWindow>
         )}
@@ -3093,11 +3121,15 @@ export default function App() {
             onMax={() => zoomApp("code")}
           >
             <div className="min-h-0 flex-1">
+              <ErrorBoundary appName="Code" onClose={() => closeApp("code")}>
               <CodeApp
                 onContext={(c) => {
                   codeCtxRef.current = c;
                 }}
+                queue={codeQueue}
+                onAck={ackCode}
               />
+              </ErrorBoundary>
             </div>
           </AppWindow>
         )}
@@ -3122,7 +3154,9 @@ export default function App() {
             onMax={() => zoomApp("help")}
           >
             <div className="min-h-0 flex-1 p-3 pt-1">
+              <ErrorBoundary appName="Help Center" onClose={() => closeApp("help")}>
               <HelpApp />
+              </ErrorBoundary>
             </div>
           </AppWindow>
         )}
@@ -3147,6 +3181,7 @@ export default function App() {
             onMax={() => zoomApp("tutor")}
           >
             <div className="min-h-0 flex-1 p-3 pt-1">
+              <ErrorBoundary appName="Tutor" onClose={() => closeApp("tutor")}>
               <TutorApp
                 courses={COURSES}
                 progress={courseProgress}
@@ -3157,6 +3192,7 @@ export default function App() {
                 onStartLesson={startLesson}
                 onCompleteLesson={completeLesson}
               />
+              </ErrorBoundary>
             </div>
           </AppWindow>
         )}
@@ -3279,7 +3315,7 @@ export default function App() {
                   }`}
                 >
                   <span className={`h-1.5 w-1.5 rounded-full ${ready ? "bg-[#ff5a5f]" : "bg-slate-300"}`} />
-                  {a === "tutor" ? "Tutor" : a === "whiteboard" ? "Board" : a[0].toUpperCase() + a.slice(1)}
+                  {a === "tutor" ? "Tutor" : a === "whiteboard" ? "Green Board" : a[0].toUpperCase() + a.slice(1)}
                 </span>
               );
             })}

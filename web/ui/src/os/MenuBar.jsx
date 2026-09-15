@@ -3,7 +3,7 @@ import { FaWifi, FaBatteryFull } from "react-icons/fa6";
 
 const APP_META = {
   tutor: { name: "Tutor" },
-  whiteboard: { name: "Whiteboard" },
+  whiteboard: { name: "Green Board" },
   code: { name: "Code" },
   browser: { name: "Browser" },
   notes: { name: "Notes" },
@@ -22,7 +22,7 @@ const ACTION_LABEL = {
   "close-window": "Close Window",
   "clear-chat": "Clear Chat",
   "open-tutor": "Open Tutor",
-  "open-whiteboard": "Open Whiteboard",
+  "open-whiteboard": "Open Green Board",
   "open-browser": "Open Browser",
   "open-notes": "Open Notes",
   "open-code": "Open Code",
@@ -129,7 +129,7 @@ export default function MenuBar({ activeApp, connected, speaking, listening, typ
             <p className="mt-2 text-lg font-bold text-slate-900">Bug OS</p>
             <p className="mt-1 text-xs leading-5 text-slate-500">
               Hindi voice tutor desktop.
-              <br />Tutor · Whiteboard · Browser · Notes.
+              <br />Tutor · Green Board · Browser · Notes.
             </p>
             <button
               onClick={() => setShowAbout(false)}
